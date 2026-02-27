@@ -415,19 +415,39 @@ runtime_exception_handler(EXCEPTION_POINTERS *exce_info)
 }
 #endif /* end of BH_PLATFORM_WINDOWS */
 
+#ifdef BH_PLATFORM_WINDOWS
+static PVOID runtime_exception_handler_handle = NULL;
+static int32 runtime_exception_handler_ref_count = 0;
+static korp_mutex runtime_exception_handler_lock = NULL;
+#endif
+
 static bool
 runtime_signal_init()
 {
 #ifndef BH_PLATFORM_WINDOWS
     return os_thread_signal_init(runtime_signal_handler) == 0 ? true : false;
 #else
-    if (os_thread_signal_init() != 0)
-        return false;
+    os_mutex_lock(&runtime_exception_handler_lock);
 
-    if (!AddVectoredExceptionHandler(1, runtime_exception_handler)) {
-        os_thread_signal_destroy();
+    if (os_thread_signal_init() != 0) {
+        os_mutex_unlock(&runtime_exception_handler_lock);
         return false;
     }
+
+    if (runtime_exception_handler_ref_count == 0) {
+        runtime_exception_handler_handle =
+            AddVectoredExceptionHandler(1, runtime_exception_handler);
+    }
+
+    if (!runtime_exception_handler_handle) {
+        os_thread_signal_destroy();
+        os_mutex_unlock(&runtime_exception_handler_lock);
+        return false;
+    }
+
+    runtime_exception_handler_ref_count++;
+
+    os_mutex_unlock(&runtime_exception_handler_lock);
 #endif
     return true;
 }
@@ -436,7 +456,25 @@ static void
 runtime_signal_destroy()
 {
 #ifdef BH_PLATFORM_WINDOWS
-    RemoveVectoredExceptionHandler(runtime_exception_handler);
+    os_mutex_lock(&runtime_exception_handler_lock);
+
+    if (runtime_exception_handler_ref_count > 0) {
+        runtime_exception_handler_ref_count--;
+    }
+
+    if (runtime_exception_handler_ref_count == 0
+        && runtime_exception_handler_handle) {
+        if (RemoveVectoredExceptionHandler(runtime_exception_handler_handle)) {
+            runtime_exception_handler_handle = NULL;
+        }
+        else {
+            /* Keep the handle so future init/destroy cycles can retry remove.
+             * Clearing it here may leave a live callback registered forever. */
+            runtime_exception_handler_ref_count = 1;
+        }
+    }
+
+    os_mutex_unlock(&runtime_exception_handler_lock);
 #endif
     os_thread_signal_destroy();
 }
