@@ -1782,12 +1782,57 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
             }
         }
 
+#if WASM_LINMEM_RESERVATION_CACHE_ENABLED
+        {
+            /* If this mapping came from the linear-memory cache,
+             * its mmap reservation is already at or above the
+             * pre-grow cap and the new committed size fits inside
+             * it — just commit more PROT_READ|WRITE pages and
+             * update the slot's high-water mark. No `os_mremap`,
+             * no relocate, no first-touch fault on existing
+             * pages.
+             *
+             * If the cache lookup misses (the slot was evicted or
+             * the alloc bypassed the cache), fall through to the
+             * upstream `wasm_mremap_linear_memory` path. */
+            bool in_cache = false;
+            uint32 i;
+            uint64 cached_reservation = 0;
+            pthread_mutex_lock(&g_linmem_cache_lock);
+            for (i = 0; i < WASM_LINMEM_CACHE_SLOTS; i++) {
+                if (g_linmem_cache[i].valid && g_linmem_cache[i].in_use
+                    && g_linmem_cache[i].base == memory_data_old) {
+                    cached_reservation = g_linmem_cache[i].reservation;
+                    if (total_size_new <= cached_reservation) {
+                        if (total_size_new
+                            > g_linmem_cache[i].high_water_committed)
+                            g_linmem_cache[i].high_water_committed =
+                                total_size_new;
+                        in_cache = true;
+                    }
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_linmem_cache_lock);
+
+            if (in_cache) {
+                memory_data_new = memory_data_old;
+            }
+            else if (!(memory_data_new = wasm_mremap_linear_memory(
+                           memory_data_old, total_size_old, total_size_new,
+                           total_size_new))) {
+                ret = false;
+                goto return_func;
+            }
+        }
+#else
         if (!(memory_data_new =
                   wasm_mremap_linear_memory(memory_data_old, total_size_old,
                                             total_size_new, total_size_new))) {
             ret = false;
             goto return_func;
         }
+#endif
 
         if (heap_size > 0) {
             if (mem_allocator_migrate(memory->heap_handle,
@@ -2049,12 +2094,196 @@ wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
 #endif
               memory_inst->memory_data);
 #else
+#if WASM_LINMEM_RESERVATION_CACHE_ENABLED
+    /* Return the mapping to the cache (madvise(MADV_FREE) keeps
+     * the virtual mapping alive but lets the kernel reclaim
+     * pages). If the cache doesn't recognize this base — e.g. the
+     * mmap happened from a code path that bypassed our acquire,
+     * or the cache slot was reaped — fall through to a normal
+     * `os_munmap`. */
+    if (!linmem_cache_release((void *)memory_inst->memory_data,
+                              memory_inst->memory_data_size)) {
+        wasm_munmap_linear_memory(memory_inst->memory_data,
+                                  memory_inst->memory_data_size, map_size);
+    }
+#else
     wasm_munmap_linear_memory(memory_inst->memory_data,
                               memory_inst->memory_data_size, map_size);
+#endif
 #endif
 
     memory_inst->memory_data = NULL;
 }
+
+/*
+ * Linear-memory reservation cache (gated by
+ * `WASM_LINMEM_RESERVATION_CAP > 0`, off by default).
+ *
+ * The default WAMR allocator path (`HW_BOUND_CHECK` off) mmaps just
+ * `init_page_count * page_size` bytes per instantiate, and
+ * `wasm_enlarge_memory_internal` then `os_mremap`s on every
+ * `memory.grow`. For workloads that re-instantiate the same module
+ * many times (e.g. Porffor's no-GC graphql-validation harness
+ * re-creates a Store/instance per iteration to avoid OOMing), each
+ * cycle pays both an `mmap` fault-on-first-touch storm AND a
+ * round of `mremap` refaults as the wasm grows back to its
+ * working set. On iPhone 12 A14 the per-iter cost is ~12 K page
+ * faults, ~36 ms of kernel time — about 4× the user-mode interp
+ * cost.
+ *
+ * This cache lets the allocator pre-reserve up to
+ * `WASM_LINMEM_RESERVATION_CAP` bytes per instance and reuse the
+ * mapping across instantiate/deinstantiate cycles:
+ *
+ *   - Allocate: scan the cache for an unused slot whose reservation
+ *     is at least the requested `map_size`. If found, hand it back
+ *     and `memset` the committed range to zero (wasm semantics
+ *     require zero-initialized memory). Else `os_mmap` a fresh
+ *     reservation up to `min(max_page_count * page_size,
+ *     WASM_LINMEM_RESERVATION_CAP)` and remember the slot.
+ *   - Free: `madvise(MADV_FREE)` on the committed range to release
+ *     physical pages back to the kernel while keeping the virtual
+ *     mapping alive. Return the slot to the cache. If the cache is
+ *     full, fall through to a normal `os_munmap`.
+ *
+ * Per-iter teardown is then ~one `madvise(MADV_FREE)` syscall (no
+ * fault storm); per-iter setup is one `memset` (~10 GB/s, hits
+ * L1/L2) plus whatever the wasm itself touches. The high-water
+ * mark from a previous instance is reused for the next instance,
+ * eliminating the grow-driven `mremap` refaults entirely.
+ *
+ * The cap defaults to 0 (cache disabled — preserves upstream
+ * behaviour byte-for-byte). Set `-DWASM_LINMEM_RESERVATION_CAP=
+ * <bytes>` at cmake time to opt in. Recommend 16 MB for
+ * memory-constrained 32-bit targets like arm64_32-apple-watchos
+ * (4 GiB total address space — four cached 16 MB regions cost
+ * 64 MB / 1.5 % of the address space) and 64 MB for 64-bit
+ * targets where the address-space cost is negligible.
+ */
+
+#ifndef WASM_LINMEM_RESERVATION_CAP
+#define WASM_LINMEM_RESERVATION_CAP 0
+#endif
+
+#if WASM_LINMEM_RESERVATION_CAP > 0 && !defined(OS_ENABLE_HW_BOUND_CHECK)
+#define WASM_LINMEM_RESERVATION_CACHE_ENABLED 1
+#else
+#define WASM_LINMEM_RESERVATION_CACHE_ENABLED 0
+#endif
+
+#if WASM_LINMEM_RESERVATION_CACHE_ENABLED
+#include <sys/mman.h>
+#include <pthread.h>
+
+#define WASM_LINMEM_CACHE_SLOTS 4
+
+typedef struct {
+    void *base;
+    uint64 reservation;          /* total mmap'd bytes */
+    uint64 high_water_committed; /* max committed bytes ever for this slot */
+    bool in_use;
+    bool valid;
+} WasmLinMemCacheSlot;
+
+static WasmLinMemCacheSlot g_linmem_cache[WASM_LINMEM_CACHE_SLOTS];
+static pthread_mutex_t g_linmem_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *
+linmem_cache_acquire(uint64 reservation, uint64 commit_size)
+{
+    void *base = NULL;
+    uint32 i;
+
+    pthread_mutex_lock(&g_linmem_cache_lock);
+
+    /* First pass: exact-reservation match. */
+    for (i = 0; i < WASM_LINMEM_CACHE_SLOTS; i++) {
+        WasmLinMemCacheSlot *s = &g_linmem_cache[i];
+        if (s->valid && !s->in_use && s->reservation == reservation) {
+            s->in_use = true;
+            base = s->base;
+            /* Zero up to the high-water-mark of the previous user
+             * + the new requested commit_size. The kernel may have
+             * already reclaimed FREE'd pages (those re-zero on
+             * touch), but we can't tell which were reclaimed
+             * without a syscall, so memset the union to be safe.
+             * memset of constant-size aligned memory on aarch64
+             * runs at ~10 GB/s — for a 6 MB high-water, ~0.6 ms.
+             * Compare to ~5 ms of fault-on-first-touch for a
+             * fresh mmap of the same region. */
+            uint64 to_zero = s->high_water_committed > commit_size
+                                 ? s->high_water_committed
+                                 : commit_size;
+            memset(s->base, 0, (size_t)to_zero);
+            if (commit_size > s->high_water_committed)
+                s->high_water_committed = commit_size;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&g_linmem_cache_lock);
+    return base;
+}
+
+static bool
+linmem_cache_insert(void *base, uint64 reservation, uint64 commit_size)
+{
+    uint32 i;
+    bool inserted = false;
+
+    pthread_mutex_lock(&g_linmem_cache_lock);
+
+    /* First, find an empty slot. */
+    for (i = 0; i < WASM_LINMEM_CACHE_SLOTS; i++) {
+        WasmLinMemCacheSlot *s = &g_linmem_cache[i];
+        if (!s->valid) {
+            s->base = base;
+            s->reservation = reservation;
+            s->high_water_committed = commit_size;
+            s->in_use = true;
+            s->valid = true;
+            inserted = true;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&g_linmem_cache_lock);
+    return inserted;
+}
+
+static bool
+linmem_cache_release(void *base, uint64 commit_size)
+{
+    uint32 i;
+    bool released = false;
+
+    pthread_mutex_lock(&g_linmem_cache_lock);
+
+    for (i = 0; i < WASM_LINMEM_CACHE_SLOTS; i++) {
+        WasmLinMemCacheSlot *s = &g_linmem_cache[i];
+        if (s->valid && s->in_use && s->base == base) {
+            /* Release physical pages back to the kernel while
+             * keeping the virtual mapping alive. MADV_FREE on
+             * darwin tells the kernel it may reclaim these pages
+             * but the next touch can either fault in a fresh
+             * zero page or, if not yet reclaimed, see the old
+             * data — which is why `linmem_cache_acquire` memsets
+             * the high-water range on reuse. */
+            if (commit_size > 0) {
+                (void)madvise(base, (size_t)commit_size, MADV_FREE);
+            }
+            if (commit_size > s->high_water_committed)
+                s->high_water_committed = commit_size;
+            s->in_use = false;
+            released = true;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&g_linmem_cache_lock);
+    return released;
+}
+#endif /* WASM_LINMEM_RESERVATION_CACHE_ENABLED */
 
 int
 wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
@@ -2076,7 +2305,23 @@ wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
     else
 #endif
     {
+#if WASM_LINMEM_RESERVATION_CACHE_ENABLED
+        /* Pre-reserve up to min(max_page_count, RESERVATION_CAP)
+         * so grows within the cap don't trigger `os_mremap` (which
+         * may relocate + first-touch fault on darwin). Stays
+         * `init_page_count * page_size` for tiny modules where
+         * the cap is overkill — no wasted address space on
+         * workloads that don't grow. */
+        uint64 max_bytes = max_page_count * num_bytes_per_page;
+        uint64 init_bytes = init_page_count * num_bytes_per_page;
+        map_size = (max_bytes < WASM_LINMEM_RESERVATION_CAP)
+                       ? max_bytes
+                       : WASM_LINMEM_RESERVATION_CAP;
+        if (map_size < init_bytes)
+            map_size = init_bytes;
+#else
         map_size = init_page_count * num_bytes_per_page;
+#endif
     }
 #else  /* else of OS_ENABLE_HW_BOUND_CHECK */
     /* Totally 8G is mapped, the opcode load/store address range is 0 to 8G:
@@ -2104,9 +2349,29 @@ wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
             return BHT_ERROR;
         }
 #else
+#if WASM_LINMEM_RESERVATION_CACHE_ENABLED
+        {
+            /* Cache hit short-circuits the os_mmap + first-touch
+             * fault path. Misses fall through to fresh mmap + a
+             * one-time insert into the cache so subsequent
+             * cycles for the same reservation amortize. */
+            void *cached = linmem_cache_acquire(map_size, *memory_data_size);
+            if (cached) {
+                *data = (uint8 *)cached;
+            }
+            else {
+                if (!(*data =
+                          wasm_mmap_linear_memory(map_size, *memory_data_size)))
+                    return BHT_ERROR;
+                (void)linmem_cache_insert((void *)*data, map_size,
+                                          *memory_data_size);
+            }
+        }
+#else
         if (!(*data = wasm_mmap_linear_memory(map_size, *memory_data_size))) {
             return BHT_ERROR;
         }
+#endif
 #endif
     }
 
