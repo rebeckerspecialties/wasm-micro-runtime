@@ -539,6 +539,13 @@ wasi_output_stream_check_write(wasi_output_stream_t stream,
     // If the stream is currently flushing, we must check if it's done.
     if (is_in_flushing_list(stream)) {
         int queue_size = 0;
+#if defined(__APPLE__)
+        // macOS/Darwin has no TIOCOUTQ to query the bytes still queued in the
+        // socket/tty output buffer. Treat the output queue as already drained
+        // (0 bytes queued) so the flush is reported complete and writes are not
+        // blocked. This is the conservative "is the queue empty" answer.
+        queue_size = 0;
+#else
         // Use ioctl with TIOCOUTQ to get the number of bytes in the output
         // buffer.
         if (ioctl(stream, TIOCOUTQ, &queue_size) < 0) {
@@ -548,6 +555,7 @@ wasi_output_stream_check_write(wasi_output_stream_t stream,
             ret->u.err.payload.error = errno;
             return;
         }
+#endif
 
         if (queue_size == 0) {
             // If the output queue is empty, the flush is complete.
@@ -585,10 +593,37 @@ wasi_output_stream_check_write(wasi_output_stream_t stream,
             return;
         }
 
+#if !defined(__APPLE__)
         int used_space = 0;
         if (ioctl(stream, TIOCOUTQ, &used_space) == 0) {
             available_space -= used_space;
         }
+#else
+        // macOS/Darwin has no TIOCOUTQ to learn how many bytes are already
+        // queued, so SO_SNDBUF cannot be turned into exact free space.
+        // Reporting the full SO_SNDBUF would over-grant: the socket is
+        // non-blocking and wasi_output_stream_write treats a short write as a
+        // stream error, so an over-large permit turns normal TCP backpressure
+        // into a write failure. Report a readiness-based permit instead — only
+        // when the socket is writable (POLLOUT), and capped at SO_SNDLOWAT, the
+        // send low-water mark that POLLOUT guarantees is free.
+        struct pollfd wpfd = { .fd = stream, .events = POLLOUT };
+        if (poll(&wpfd, 1, 0) <= 0 || !(wpfd.revents & POLLOUT)) {
+            available_space = 0;
+        }
+        else {
+            int low_water = 0;
+            socklen_t lwlen = sizeof(low_water);
+            if (getsockopt(stream, SOL_SOCKET, SO_SNDLOWAT, &low_water, &lwlen)
+                    < 0
+                || low_water <= 0) {
+                low_water = 1024; // macOS default send low-water mark
+            }
+            if (available_space > low_water) {
+                available_space = low_water;
+            }
+        }
+#endif
 
         ret->is_err = false;
         ret->u.ok = available_space > 0 ? available_space : 0;
@@ -759,6 +794,13 @@ wasi_output_stream_flush(wasi_output_stream_t stream,
     pthread_mutex_lock(&flushing_streams_list_lock);
 
     int queue_size = 0;
+#if defined(__APPLE__)
+    // macOS/Darwin has no TIOCOUTQ to query the bytes still queued in the
+    // kernel's output buffer. Treat the output queue as already drained
+    // (0 bytes queued) so the stream is never marked as flushing and
+    // subsequent check-write calls proceed immediately.
+    queue_size = 0;
+#else
     // Use ioctl with TIOCOUTQ to get the number of bytes in the kernel's output
     // buffer.
     if (ioctl(stream, TIOCOUTQ, &queue_size) < 0) {
@@ -768,6 +810,7 @@ wasi_output_stream_flush(wasi_output_stream_t stream,
         ret->u.err.payload.error = errno;
         return;
     }
+#endif
 
     // If there is data in the output queue, mark the stream as flushing.
     if (queue_size > 0) {
