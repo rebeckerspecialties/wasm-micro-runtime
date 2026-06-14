@@ -14,13 +14,18 @@
 #include "bh_read_file.h"
 #include "wasm_export.h"
 #if WASM_ENABLE_COMPONENT_MODEL != 0
+/* The component-model headers below pull in core-module types from the
+ * interpreter's wasm.h. That header lives in core/iwasm/interpreter, which is
+ * only on the include path when WAMR_BUILD_INTERP=1, so keep this include
+ * inside the component-model guard: a pure AOT-only build (INTERP=0) does not
+ * build the component model and must not reference wasm.h. */
+#include "wasm.h"
 #include "wasm_component.h"
 #include "wasm_component_runtime.h"
 #include "component-model/wasm_component_host_resource.h"
 #include "wasm_component_export.h"
 #include "component-model/wasm_component_validate.h"
 #endif
-#include "wasm.h"
 #if WASM_ENABLE_LIBC_WASI != 0
 #include "../common/libc_wasi.c"
 #endif
