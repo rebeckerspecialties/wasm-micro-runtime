@@ -720,7 +720,14 @@ execute_wasm_module(uint8 *wasm_file_buf, uint32 wasm_file_size,
         wasm_module, inst_args, error_buf, sizeof(error_buf));
     wasm_runtime_instantiation_args_destroy(inst_args);
     if (!wasm_module_inst) {
-        LOG_ERROR("%s\n", error_buf);
+        /* Print the instantiation error directly (matching upstream and the
+         * module-load error path above). LOG_ERROR routes through bh_log,
+         * which prefixes a "[time - tid]:" banner that pollutes iwasm's
+         * stdout; the spec-test harness reads that stream for the
+         * "webassembly> " prompt / expected trap text, so the banner makes
+         * data/elem/start (and the ba-issues regression suite) spuriously
+         * fail. */
+        printf("%s\n", error_buf);
         wasm_runtime_unload(wasm_module);
         return false;
     }
