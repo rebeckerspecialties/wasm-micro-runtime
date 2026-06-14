@@ -7,7 +7,16 @@
 
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+/* macOS/iOS have no timerfd; a monotonic one-shot timer pollable is
+ * emulated with a kqueue + EVFILT_TIMER (see
+ * wasi_monotonic_clock_subscribe below). */
+#include <sys/event.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#else
 #include <sys/timerfd.h>
+#endif
 
 /**
  * @brief Read the current value of the wall-clock.
@@ -103,11 +112,55 @@ wasi_monotonic_clock_resolution(void)
  * @return A pollable context wrapping the timerfd. On error, `fd` is -1.
  */
 static wasi_pollable_context_t
-wasi_monotonic_clock_subscribe(wasi_duration_t when, int flags)
+wasi_monotonic_clock_subscribe(wasi_duration_t when, int is_absolute)
 {
     wasi_pollable_context_t pollable = { .fd = -1,
                                          .own_fd = false,
                                          .type = WASI_POLLABLE_IN };
+
+#if defined(__APPLE__)
+    /* macOS/iOS: emulate the monotonic one-shot timerfd with a kqueue +
+     * EVFILT_TIMER. The kqueue descriptor becomes readable (poll/select
+     * POLLIN) when the timer fires, matching how the timerfd was polled.
+     * EVFILT_TIMER is relative, so an absolute deadline is converted to a
+     * remaining duration against the monotonic clock. */
+    uint64_t rel_ns;
+    if (is_absolute) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t now_ns =
+            (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+        rel_ns = (when > now_ns) ? (when - now_ns) : 0;
+    }
+    else {
+        rel_ns = when;
+    }
+    /* A zero duration would disarm a timerfd; fire promptly instead. */
+    if (rel_ns == 0) {
+        rel_ns = 1;
+    }
+    if (rel_ns > (uint64_t)INT64_MAX) {
+        rel_ns = (uint64_t)INT64_MAX;
+    }
+
+    int kq = kqueue();
+    if (kq < 0) {
+        return pollable;
+    }
+    fcntl(kq, F_SETFD, FD_CLOEXEC); /* match TFD_CLOEXEC */
+
+    struct kevent ev;
+    EV_SET(&ev, 1, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, NOTE_NSECONDS,
+           (int64_t)rel_ns, NULL);
+    if (kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
+        close(kq);
+        return pollable;
+    }
+
+    SET_INPUT_POLLABLE(&pollable, kq, true);
+    return pollable;
+#else
+    int flags = is_absolute ? TFD_TIMER_ABSTIME : 0;
 
     // Create a timer file descriptor based on the monotonic clock.
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
@@ -138,6 +191,7 @@ wasi_monotonic_clock_subscribe(wasi_duration_t when, int flags)
 
     SET_INPUT_POLLABLE(&pollable, tfd, true);
     return pollable;
+#endif
 }
 
 /**
@@ -150,9 +204,8 @@ wasi_monotonic_clock_subscribe(wasi_duration_t when, int flags)
 wasi_pollable_context_t
 wasi_monotonic_clock_subscribe_instant(wasi_instant_t when)
 {
-    // Call the helper with the TFD_TIMER_ABSTIME flag to treat `when` as an
-    // absolute timestamp.
-    return wasi_monotonic_clock_subscribe(when, TFD_TIMER_ABSTIME);
+    // Treat `when` as an absolute timestamp.
+    return wasi_monotonic_clock_subscribe(when, /*is_absolute=*/1);
 }
 
 /**
@@ -166,6 +219,6 @@ wasi_monotonic_clock_subscribe_instant(wasi_instant_t when)
 wasi_pollable_context_t
 wasi_monotonic_clock_subscribe_duration(wasi_duration_t when)
 {
-    // Call the helper with a flag of 0 to treat `when` as a relative duration.
-    return wasi_monotonic_clock_subscribe(when, 0);
+    // Treat `when` as a relative duration.
+    return wasi_monotonic_clock_subscribe(when, /*is_absolute=*/0);
 }

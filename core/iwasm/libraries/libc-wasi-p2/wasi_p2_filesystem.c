@@ -15,10 +15,25 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <bh_common.h>
+#if !defined(__APPLE__)
 #include <sys/syscall.h>
 #include <linux/openat2.h>
+#endif
 
 #include "wasi_p2_common.h"
+
+#if defined(__APPLE__)
+/* Darwin/BSD names the nanosecond-resolution stat timestamp fields
+ * st_*timespec rather than POSIX-2008's st_*tim. Both are 'struct timespec',
+ * so a textual rename keeps every st_atim.tv_nsec etc. site working unchanged.
+ */
+#define st_atim st_atimespec
+#define st_mtim st_mtimespec
+#define st_ctim st_ctimespec
+/* macOS has no fdatasync(); fsync() flushes both data and metadata, which is a
+ * conformant (stronger-than-required) superset of fdatasync semantics. */
+#define fdatasync fsync
+#endif
 
 void
 filesystem_descriptor_dtor(void *data)
@@ -403,6 +418,17 @@ int
 wasi_filesystem_advise(wasi_descriptor_t fd, wasi_filesize_t offset,
                        wasi_filesize_t length, wasi_advice_t advice)
 {
+#if defined(__APPLE__)
+    /* macOS/iOS have no posix_fadvise. The advice is purely an optional
+     * performance hint to the kernel, so ignoring it is conformant behavior.
+     * (F_RDADVISE/F_NOCACHE exist but do not map cleanly onto the WASI advice
+     * enum, so we treat advise as a successful no-op.) */
+    (void)fd;
+    (void)offset;
+    (void)length;
+    (void)advice;
+    return WASI_ERROR_CODE_SUCCESS;
+#else
     int advice_posix = 0;
 
     // Translate the abstract WASI advice enum to the corresponding POSIX
@@ -436,6 +462,7 @@ wasi_filesystem_advise(wasi_descriptor_t fd, wasi_filesize_t offset,
     }
 
     return WASI_ERROR_CODE_SUCCESS;
+#endif
 }
 
 /**
@@ -879,16 +906,53 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     }
 #endif
 
-    struct open_how how = {0};
+#if defined(__APPLE__)
+    /* macOS/iOS have no openat2 / RESOLVE_BENEATH. Emulate the sandbox the
+     * Linux path gets from open_how.resolve:
+     *   - RESOLVE_BENEATH: reject absolute paths and any ".." component, so
+     *     resolution cannot escape the preopened directory `fd`.
+     *   - RESOLVE_NO_SYMLINKS / RESOLVE_NO_MAGICLINKS: O_NOFOLLOW_ANY refuses
+     *     a symlink in *any* path component (not just the last, as plain
+     *     O_NOFOLLOW would). Requires macOS 10.15+ / iOS 13+, which all of
+     *     our deployment targets satisfy.
+     * SECURITY: this is the sandbox boundary for the embedder. The ".."
+     * rejection is textual (the path never contains a symlink thanks to
+     * O_NOFOLLOW_ANY, so there is no symlink-to-".." bypass). */
+    if (path[0] == '/') {
+        *err = EPERM;
+        *ret = -1;
+        return;
+    }
+    for (const char *seg = path; seg && *seg;) {
+        const char *slash = strchr(seg, '/');
+        size_t seg_len = slash ? (size_t)(slash - seg) : strlen(seg);
+        if (seg_len == 2 && seg[0] == '.' && seg[1] == '.') {
+            *err = EPERM;
+            *ret = -1;
+            return;
+        }
+        seg = slash ? slash + 1 : NULL;
+    }
+    int r = openat(fd, path, internal_flags | O_NOFOLLOW_ANY,
+                   (internal_flags & O_CREAT) ? mode : 0);
+    if (r < 0) {
+        *err = (errno == EXDEV) ? EPERM : errno;
+        *ret = -1;
+        return;
+    }
+    *err = 0;
+    *ret = r;
+#else
+    struct open_how how = { 0 };
     how.flags = internal_flags;
     how.mode = (how.flags & (O_CREAT)) ? mode : 0;
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
     int r = syscall(SYS_openat2, fd, path, &how, sizeof(how));
     if (r < 0) {
-        if(errno == EXDEV){
+        if (errno == EXDEV) {
             *err = EPERM;
         }
-        else{
+        else {
             *err = errno;
         }
         *ret = -1;
@@ -896,6 +960,7 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     }
     *err = 0;
     *ret = r;
+#endif
 }
 
 /**
@@ -1308,8 +1373,10 @@ wasi_filesystem_get_flags(wasi_descriptor_t fd, wasi_descriptor_flags_t *ret,
     // Translate POSIX synchronization flags to their WASI equivalents.
     if (flags & O_DSYNC)
         f |= WASI_DESCRIPTOR_FLAGS_DATA_INTEGRITY_SYNC;
+#ifdef O_RSYNC
     if (flags & O_RSYNC)
         f |= WASI_DESCRIPTOR_FLAGS_REQUESTED_WRITE_SYNC;
+#endif
     if (flags & O_SYNC)
         f |= WASI_DESCRIPTOR_FLAGS_FILE_INTEGRITY_SYNC;
 
