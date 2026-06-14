@@ -120,10 +120,17 @@ wasi_monotonic_clock_subscribe(wasi_duration_t when, int is_absolute)
 
 #if defined(__APPLE__)
     /* macOS/iOS: emulate the monotonic one-shot timerfd with a kqueue +
-     * EVFILT_TIMER. The kqueue descriptor becomes readable (poll/select
-     * POLLIN) when the timer fires, matching how the timerfd was polled.
-     * EVFILT_TIMER is relative, so an absolute deadline is converted to a
-     * remaining duration against the monotonic clock. */
+     * EVFILT_TIMER. A kqueue descriptor is itself selectable: when an event is
+     * pending it becomes readable to poll(2)/select(2) (kqueue(2): "The queue
+     * is represented by a descriptor that may be monitored with select(2),
+     * poll(2)..."). The shared WASI poll path (wasi_pollable_block / wasi_poll
+     * in wasi_p2_io.c) only ever poll(2)s pollable->fd for POLLIN and never
+     * read()s it, so a kqueue fd that becomes POLLIN-readable when its
+     * EV_ONESHOT EVFILT_TIMER fires is a correct drop-in for the timerfd here
+     * (verified: poll() returns POLLIN after the timer expires). The pollable
+     * is one-shot and is close()d on drop, so the event need never be drained
+     * via kevent(). EVFILT_TIMER is relative, so an absolute deadline is
+     * converted to a remaining duration against the monotonic clock. */
     uint64_t rel_ns;
     if (is_absolute) {
         struct timespec now;

@@ -909,27 +909,38 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
 #if defined(__APPLE__)
     /* macOS/iOS have no openat2 / RESOLVE_BENEATH. Emulate the sandbox the
      * Linux path gets from open_how.resolve:
-     *   - RESOLVE_BENEATH: reject absolute paths and any ".." component, so
-     *     resolution cannot escape the preopened directory `fd`.
+     *   - RESOLVE_BENEATH: the resolved path must stay beneath the preopened
+     *     directory `fd`. We reject absolute paths and walk the components
+     *     tracking depth: a ".." that would pop above the root escapes and is
+     *     rejected, but a non-escaping ".." such as "subdir/../file" stays
+     *     beneath `fd` and is allowed, exactly as RESOLVE_BENEATH permits.
      *   - RESOLVE_NO_SYMLINKS / RESOLVE_NO_MAGICLINKS: O_NOFOLLOW_ANY refuses
      *     a symlink in *any* path component (not just the last, as plain
      *     O_NOFOLLOW would). Requires macOS 10.15+ / iOS 13+, which all of
      *     our deployment targets satisfy.
-     * SECURITY: this is the sandbox boundary for the embedder. The ".."
-     * rejection is textual (the path never contains a symlink thanks to
-     * O_NOFOLLOW_ANY, so there is no symlink-to-".." bypass). */
+     * SECURITY: this is the sandbox boundary for the embedder. Because
+     * O_NOFOLLOW_ANY guarantees no component is a symlink, the purely textual
+     * depth check below cannot be subverted by symlink redirection. */
     if (path[0] == '/') {
         *err = EPERM;
         *ret = -1;
         return;
     }
+    int depth = 0;
     for (const char *seg = path; seg && *seg;) {
         const char *slash = strchr(seg, '/');
         size_t seg_len = slash ? (size_t)(slash - seg) : strlen(seg);
         if (seg_len == 2 && seg[0] == '.' && seg[1] == '.') {
-            *err = EPERM;
-            *ret = -1;
-            return;
+            /* ".." pops a level; popping above the preopen root escapes. */
+            if (--depth < 0) {
+                *err = EPERM;
+                *ret = -1;
+                return;
+            }
+        }
+        else if (!(seg_len == 0 || (seg_len == 1 && seg[0] == '.'))) {
+            /* a real name component (ignore "" from "//" and ".") */
+            depth++;
         }
         seg = slash ? slash + 1 : NULL;
     }

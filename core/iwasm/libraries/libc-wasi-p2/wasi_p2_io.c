@@ -592,12 +592,30 @@ wasi_output_stream_check_write(wasi_output_stream_t stream,
             available_space -= used_space;
         }
 #else
-        // macOS/Darwin has no TIOCOUTQ to query bytes already queued in the
-        // socket send buffer, so we cannot subtract the in-flight amount. Use
-        // the full SO_SNDBUF size as a generous upper-bound permit. This may
-        // over-report available space, but it never blocks a write; the actual
-        // write() will still report a short/blocked write if the kernel buffer
-        // is full.
+        // macOS/Darwin has no TIOCOUTQ to learn how many bytes are already
+        // queued, so SO_SNDBUF cannot be turned into exact free space.
+        // Reporting the full SO_SNDBUF would over-grant: the socket is
+        // non-blocking and wasi_output_stream_write treats a short write as a
+        // stream error, so an over-large permit turns normal TCP backpressure
+        // into a write failure. Report a readiness-based permit instead — only
+        // when the socket is writable (POLLOUT), and capped at SO_SNDLOWAT, the
+        // send low-water mark that POLLOUT guarantees is free.
+        struct pollfd wpfd = { .fd = stream, .events = POLLOUT };
+        if (poll(&wpfd, 1, 0) <= 0 || !(wpfd.revents & POLLOUT)) {
+            available_space = 0;
+        }
+        else {
+            int low_water = 0;
+            socklen_t lwlen = sizeof(low_water);
+            if (getsockopt(stream, SOL_SOCKET, SO_SNDLOWAT, &low_water, &lwlen)
+                    < 0
+                || low_water <= 0) {
+                low_water = 1024; // macOS default send low-water mark
+            }
+            if (available_space > low_water) {
+                available_space = low_water;
+            }
+        }
 #endif
 
         ret->is_err = false;
