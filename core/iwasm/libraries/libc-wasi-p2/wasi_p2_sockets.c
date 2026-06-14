@@ -24,6 +24,72 @@
 #include "bh_hashmap.h"
 #include "wasm_export.h"
 
+#if defined(__APPLE__)
+/* Darwin/BSD libc lacks the Linux-only mmsg(2) batch API, the SOCK_NONBLOCK /
+   SOCK_CLOEXEC / accept4 atomic-flag extensions and a few constants. Provide
+   local equivalents so the non-Apple path below stays byte-for-byte unchanged.
+ */
+#include <limits.h> /* IOV_MAX */
+
+/* macOS has no UIO_MAXIOV; IOV_MAX from <limits.h> is the equivalent cap. */
+#ifndef UIO_MAXIOV
+#define UIO_MAXIOV IOV_MAX
+#endif
+
+/* macOS has no MSG_NOSIGNAL send flag; SIGPIPE is suppressed per-socket via
+   the SO_NOSIGPIPE option set right after the socket is created. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+/* macOS provides neither struct mmsghdr nor recvmmsg()/sendmmsg(). Define the
+   struct and implement the two calls as a recvmsg()/sendmsg() loop matching the
+   glibc signatures, so the existing __linux__ batch paths have a portable
+   fallback if they are ever compiled on Apple. The udp receive/send paths below
+   take the non-__linux__ recvmsg/sendmsg loops, so these are marked unused to
+   keep the build clean under -Werror. */
+struct mmsghdr {
+    struct msghdr msg_hdr;
+    unsigned int msg_len;
+};
+
+static int __attribute__((unused))
+recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags,
+         struct timespec *timeout)
+{
+    /* timeout is unsupported in this fallback; the caller passes NULL. */
+    (void)timeout;
+    unsigned int i;
+    for (i = 0; i < vlen; i++) {
+        ssize_t s = recvmsg(sockfd, &msgvec[i].msg_hdr, flags);
+        if (s < 0) {
+            /* Return what we have so far, mirroring recvmmsg() semantics. */
+            if (i > 0)
+                break;
+            return -1;
+        }
+        msgvec[i].msg_len = (unsigned int)s;
+    }
+    return (int)i;
+}
+
+static int __attribute__((unused))
+sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
+{
+    unsigned int i;
+    for (i = 0; i < vlen; i++) {
+        ssize_t s = sendmsg(sockfd, &msgvec[i].msg_hdr, flags);
+        if (s < 0) {
+            if (i > 0)
+                break;
+            return -1;
+        }
+        msgvec[i].msg_len = (unsigned int)s;
+    }
+    return (int)i;
+}
+#endif /* __APPLE__ */
+
 /**
  * @brief A singleton resource representing the host's network capability.
  * @details The `wasi:sockets/network` interface represents access to the
@@ -489,10 +555,23 @@ wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
     // Create a pipe to signal completion from the worker thread.
     // The read-end of this pipe will become the pollable for the stream's
     // subscribe method.
+#if defined(__APPLE__)
+    // macOS lacks pipe2; create the pipe then set FD_CLOEXEC on both ends.
+    if (pipe(pipefd) < 0) {
+        *err = errno;
+        goto fail;
+    }
+    if (fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) < 0
+        || fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) < 0) {
+        *err = errno;
+        goto fail;
+    }
+#else
     if (pipe2(pipefd, O_CLOEXEC) < 0) {
         *err = errno;
         goto fail;
     }
+#endif
     stream->pipe_fd = pipefd[0];
     args->pipe_write_fd = pipefd[1];
     pipefd[0] = pipefd[1] = -1;
@@ -737,7 +816,33 @@ create_socket(wasi_ip_address_family_t family, int type, int *ret_sock,
             *err = WASI_NETWORK_ERROR_CODE_NOT_SUPPORTED;
             return;
     }
-    // Create a non-blocking, close-on-exec socket of the specified type.
+        // Create a non-blocking, close-on-exec socket of the specified type.
+#if defined(__APPLE__)
+    // macOS lacks the SOCK_NONBLOCK/SOCK_CLOEXEC socket() flags: create the
+    // socket then set O_NONBLOCK and FD_CLOEXEC via fcntl. Also set
+    // SO_NOSIGPIPE so writes to a broken connection fail with EPIPE instead of
+    // raising SIGPIPE (macOS has no MSG_NOSIGNAL send flag).
+    int sock = socket(af, type, 0);
+    if (sock < 0) {
+        *err = errno;
+    }
+    else {
+        int flags = fcntl(sock, F_GETFL, 0);
+        int nosigpipe = 1;
+        if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0
+            || fcntl(sock, F_SETFD, FD_CLOEXEC) < 0
+            || setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
+                          sizeof(nosigpipe))
+                   < 0) {
+            *err = errno;
+            close(sock);
+        }
+        else {
+            *err = 0;
+            *ret_sock = sock;
+        }
+    }
+#else
     int sock = socket(af, type | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (sock < 0) {
         *err = errno;
@@ -746,6 +851,7 @@ create_socket(wasi_ip_address_family_t family, int type, int *ret_sock,
         *err = 0;
         *ret_sock = sock;
     }
+#endif
 }
 
 // wasi:sockets/tcp-create-socket
@@ -1058,6 +1164,21 @@ wasi_sockets_tcp_accept(wasi_tcp_socket_t socket, wasi_tcp_socket_t *ret,
     }
 #endif
 
+#if defined(__APPLE__)
+    // macOS has no MSG_NOSIGNAL: suppress SIGPIPE per-socket on the accepted
+    // fd, matching the SO_NOSIGPIPE set in create_socket().
+    {
+        int nosigpipe = 1;
+        if (setsockopt(new_socket, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
+                       sizeof(nosigpipe))
+            < 0) {
+            *err = errno;
+            close(new_socket);
+            return;
+        }
+    }
+#endif
+
     // On success, the new socket represents a bidirectional stream.
     *err = 0;
     *ret = new_socket;
@@ -1284,7 +1405,12 @@ wasi_sockets_tcp_keep_alive_idle_time(wasi_tcp_socket_t socket,
     int val;
     socklen_t len = sizeof(val);
     // Use the helper to query the TCP_KEEPIDLE socket option.
+#if defined(__APPLE__)
+    // macOS spells the idle-before-first-probe option (seconds) TCP_KEEPALIVE.
+    get_socket_option(socket, IPPROTO_TCP, TCP_KEEPALIVE, &val, &len, err);
+#else
     get_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, &val, &len, err);
+#endif
     if (*err != 0) {
         return;
     }
@@ -1307,8 +1433,14 @@ wasi_sockets_tcp_set_keep_alive_idle_time(wasi_tcp_socket_t socket,
     // The POSIX option requires seconds; convert from nanoseconds.
     int val = value / 1000000000;
     // Use the helper to set the TCP_KEEPIDLE socket option.
+#if defined(__APPLE__)
+    // macOS spells the idle-before-first-probe option (seconds) TCP_KEEPALIVE.
+    return set_socket_option(socket, IPPROTO_TCP, TCP_KEEPALIVE, &val,
+                             sizeof(val));
+#else
     return set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, &val,
                              sizeof(val));
+#endif
 }
 
 /**
