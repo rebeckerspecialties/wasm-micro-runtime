@@ -217,10 +217,10 @@ wasm_component_parse_instances_section(const uint8_t **payload,
                              * only writes *out on success. Pre-allocating here
                              * leaked that struct on success and, worse, left
                              * `name` pointing at uninitialized memory whose
-                             * ->name field free_core_name() then dereferenced on
-                             * the failure path (heap-use-after-free found by the
-                             * component-parser fuzz target). Pass NULL and let
-                             * parse_core_name own the allocation + its own
+                             * ->name field free_core_name() then dereferenced
+                             * on the failure path (heap-use-after-free found by
+                             * the component-parser fuzz target). Pass NULL and
+                             * let parse_core_name own the allocation + its own
                              * cleanup on failure. */
                             WASMComponentCoreName *name = NULL;
 
@@ -537,7 +537,8 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
         fail_inst:
             inst_ok = false;
         done_inst:
-            if (instance_expression.args) wasm_runtime_free(instance_expression.args);
+            if (instance_expression.args)
+                wasm_runtime_free(instance_expression.args);
             instance_expression.args = NULL;
             if (!inst_ok)
                 return false;
