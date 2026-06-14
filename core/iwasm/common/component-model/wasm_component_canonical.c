@@ -159,7 +159,10 @@ load_int(LiftLowerContext *cx, uint32_t ptr, uint32_t nbytes, bool is_signed,
 {
     const WASMMemoryInstance *mem = get_mem_from_cx(cx);
     bh_assert(nbytes >= 1 && nbytes <= 8);
-    trap_if((uint64)(ptr + nbytes) > mem->memory_data_size);
+    /* Widen ptr to 64-bit BEFORE the add: ptr and nbytes are both 32-bit, so
+     * `ptr + nbytes` wraps mod 2^32 before the cast, and a ptr near UINT32_MAX
+     * would bypass the bounds check and read outside linear memory. */
+    trap_if((uint64)ptr + nbytes > mem->memory_data_size);
 
     const uint8_t *src = mem->memory_data + ptr;
 
@@ -379,7 +382,10 @@ load_string_from_range(LiftLowerContext *cx, uint32_t begin,
     }
 
     trap_if(begin != align_to(begin, alignment));
-    trap_if((uint64_t)(begin + byte_length) > mem->memory_data_size);
+    /* Widen before the add: begin and byte_length are both uint32_t, so
+     * `begin + byte_length` wraps mod 2^32 before the cast; a crafted begin
+     * near UINT32_MAX would pass this check yet read out of linear memory. */
+    trap_if((uint64_t)begin + byte_length > mem->memory_data_size);
 
     const uint8_t *src = mem->memory_data + begin;
     char *decoded_str = NULL;
@@ -589,7 +595,11 @@ load_list_from_range(LiftLowerContext *cx, uint32_t ptr, uint32_t length,
     uint32_t elem_sz = get_elem_size(type);
     const WASMMemoryInstance *mem = get_mem_from_cx(cx);
     trap_if(ptr != align_to(ptr, elem_alignment));
-    trap_if((uint64_t)(ptr + (length * elem_sz)) > mem->memory_data_size);
+    /* Widen before the arithmetic: ptr, length and elem_sz are all 32-bit, so
+     * both `length * elem_sz` and `ptr + ...` wrap mod 2^32 before the cast.
+     * A crafted length/ptr would pass this check yet index out of linear
+     * memory in load_list_from_valid_range below. */
+    trap_if((uint64_t)ptr + (uint64_t)length * elem_sz > mem->memory_data_size);
 
     return load_list_from_valid_range(cx, ptr, length, type, out);
 }
