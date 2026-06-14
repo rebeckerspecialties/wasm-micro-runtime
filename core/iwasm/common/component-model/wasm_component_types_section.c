@@ -1918,9 +1918,9 @@ parse_component_type(const uint8_t **payload, const uint8_t *end,
         }
         /* Zero the array: (*out)->count is already the full declared count, so
          * if parse_component_decl fails partway the caller's cleanup
-         * (free_component_component_type -> free_component_decl) still walks all
-         * `count` entries. Without this the unparsed tail is uninitialized and
-         * free_component_decl dereferences a wild decl->tag (found by the
+         * (free_component_component_type -> free_component_decl) still walks
+         * all `count` entries. Without this the unparsed tail is uninitialized
+         * and free_component_decl dereferences a wild decl->tag (found by the
          * component-parser fuzz target). */
         memset((*out)->component_decls, 0,
                sizeof(WASMComponentComponentDecl) * component_count);
@@ -2012,8 +2012,8 @@ parse_component_instance_type(const uint8_t **payload, const uint8_t *end,
             goto fail;
         }
         /* Zero the array so a parse failure partway through the loop leaves the
-         * unparsed tail as zeroed decls. This function recurses (an instancedecl
-         * may itself be an instance type), and the cleanup walk
+         * unparsed tail as zeroed decls. This function recurses (an
+         * instancedecl may itself be an instance type), and the cleanup walk
          * (free_component_instance_decl) reads decl->tag for every entry; an
          * uninitialized tail produced a wild dereference at arbitrary nesting
          * depth (found by the component-parser fuzz target). */
