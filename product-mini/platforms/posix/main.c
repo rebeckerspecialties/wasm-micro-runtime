@@ -14,13 +14,18 @@
 #include "bh_read_file.h"
 #include "wasm_export.h"
 #if WASM_ENABLE_COMPONENT_MODEL != 0
+/* The component-model headers below pull in core-module types from the
+ * interpreter's wasm.h. That header lives in core/iwasm/interpreter, which is
+ * only on the include path when WAMR_BUILD_INTERP=1, so keep this include
+ * inside the component-model guard: a pure AOT-only build (INTERP=0) does not
+ * build the component model and must not reference wasm.h. */
+#include "wasm.h"
 #include "wasm_component.h"
 #include "wasm_component_runtime.h"
 #include "component-model/wasm_component_host_resource.h"
 #include "wasm_component_export.h"
 #include "component-model/wasm_component_validate.h"
 #endif
-#include "wasm.h"
 #if WASM_ENABLE_LIBC_WASI != 0
 #include "../common/libc_wasi.c"
 #endif
@@ -646,7 +651,7 @@ execute_wasm_module(uint8 *wasm_file_buf, uint32 wasm_file_size,
 #if WASM_CONFIGURABLE_BOUNDS_CHECKS != 0
                     bool disable_bounds_checks,
 #endif
-                    char *error_buf, int32 *ret_value,
+                    char *error_buf, uint32 error_buf_size, int32 *ret_value,
                     wasm_module_t *wasm_module_out,
                     wasm_module_inst_t *wasm_module_inst_out, int argc,
                     char *argv[]
@@ -682,14 +687,14 @@ execute_wasm_module(uint8 *wasm_file_buf, uint32 wasm_file_size,
 #endif
 
     if (!(wasm_module = wasm_runtime_load(wasm_file_buf, wasm_file_size,
-                                          error_buf, sizeof(error_buf)))) {
+                                          error_buf, error_buf_size))) {
         printf("%s\n", error_buf);
         return false;
     }
 
 #if WASM_ENABLE_DYNAMIC_AOT_DEBUG != 0
     if (!wasm_runtime_set_module_name(wasm_module, wasm_file, error_buf,
-                                      sizeof(error_buf))) {
+                                      error_buf_size)) {
         printf("set aot module name failed in dynamic aot debug mode, %s\n",
                error_buf);
         wasm_runtime_unload(wasm_module);
@@ -711,11 +716,18 @@ execute_wasm_module(uint8 *wasm_file_buf, uint32 wasm_file_size,
     libc_wasi_set_init_args(inst_args, argc, argv, wasi_parse_ctx);
 #endif
 
-    wasm_module_inst = wasm_runtime_instantiate_ex2(
-        wasm_module, inst_args, error_buf, sizeof(error_buf));
+    wasm_module_inst = wasm_runtime_instantiate_ex2(wasm_module, inst_args,
+                                                    error_buf, error_buf_size);
     wasm_runtime_instantiation_args_destroy(inst_args);
     if (!wasm_module_inst) {
-        LOG_ERROR("%s\n", error_buf);
+        /* Print the instantiation error directly (matching upstream and the
+         * module-load error path above). LOG_ERROR routes through bh_log,
+         * which prefixes a "[time - tid]:" banner that pollutes iwasm's
+         * stdout; the spec-test harness reads that stream for the
+         * "webassembly> " prompt / expected trap text, so the banner makes
+         * data/elem/start (and the ba-issues regression suite) spuriously
+         * fail. */
+        printf("%s\n", error_buf);
         wasm_runtime_unload(wasm_module);
         return false;
     }
@@ -1372,7 +1384,17 @@ main(int argc, char *argv[])
     }
     else
 #endif
-        if (is_wasm_module(header)) {
+        if (is_wasm_module(header)
+#if WASM_ENABLE_AOT != 0
+            /* AoT files carry the "\0aot" magic, so is_wasm_module() (which
+             * only matches the "\0asm" bytecode magic) rejects them. Route
+             * them through the same execute_wasm_module()/wasm_runtime_load()
+             * path, which dispatches AoT internally — otherwise `iwasm
+             * foo.aot` falls through to the "Unknown WASM file type" error. */
+            || get_package_type(wasm_file_buf, wasm_file_size)
+                   == Wasm_Module_AoT
+#endif
+        ) {
 #if WASM_ENABLE_COMPONENT_MODEL != 0
         if (component_func_invoke) {
             ret = print_help();
@@ -1400,8 +1422,9 @@ main(int argc, char *argv[])
 #if WASM_CONFIGURABLE_BOUNDS_CHECKS != 0
                                  disable_bounds_checks,
 #endif
-                                 error_buf, &ret, &wasm_module,
-                                 &wasm_module_inst, app_argc, app_argv
+                                 error_buf, sizeof(error_buf), &ret,
+                                 &wasm_module, &wasm_module_inst, app_argc,
+                                 app_argv
 #if WASM_ENABLE_LIBC_WASI != 0
                                  ,
                                  &wasi_parse_ctx
