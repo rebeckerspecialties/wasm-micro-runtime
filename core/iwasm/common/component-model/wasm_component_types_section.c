@@ -115,6 +115,9 @@ static WASMComponentTypeInstance primitive_type_error_context = {
 static void
 free_component_instance_decl(WASMComponentInstDecl *decl);
 
+static void
+free_component_decl(WASMComponentComponentDecl *decl);
+
 // Free helpers for nested component/instance/resource types
 static void
 free_component_types_entry(WASMComponentTypes *type);
@@ -1941,6 +1944,13 @@ parse_component_type(const uint8_t **payload, const uint8_t *end,
                                       error_buf_size)) {
                 set_error_buf_ex(error_buf, error_buf_size,
                                  "Failed to parse component %d", i);
+                /* parse_component_decl may have populated decl contents
+                 * (e.g. an import's import_name) before failing on a later
+                 * sub-parse such as the extern-desc; free those contents
+                 * first, mirroring the parse_component_instance_type fail
+                 * path. component_decls[i] is still zeroed, so the
+                 * centralized cleanup never reaches this transient shell. */
+                free_component_decl(component_decl);
                 wasm_runtime_free(component_decl);
                 return false;
             }
