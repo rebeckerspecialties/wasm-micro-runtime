@@ -36,7 +36,6 @@ endfunction()
 # List of unsupported feature tests
 set(UNSUPPORTED_FEATURE_TESTS
   "exce_handling_aot -DWAMR_BUILD_EXCE_HANDLING=1 -DWAMR_BUILD_AOT=1"
-  "exce_handling_fast_interp -DWAMR_BUILD_EXCE_HANDLING=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_FAST_INTERP=1"
   "exce_handling_fast_jit -DWAMR_BUILD_EXCE_HANDLING=1 -DWAMR_BUILD_FAST_JIT=1"
   "exce_handling_llvm_jit -DWAMR_BUILD_EXCE_HANDLING=1 -DWAMR_BUILD_JIT=1"
   "gc_fast_jit -DWAMR_BUILD_GC=1 -DWAMR_BUILD_FAST_JIT=1"
