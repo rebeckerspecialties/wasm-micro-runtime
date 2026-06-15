@@ -10,6 +10,16 @@ if(NOT CMAKE_C_COMPILER_ID MATCHES ".*Clang")
   message(FATAL_ERROR "Please use Clang as the C compiler for libFuzzer compatibility.")
 endif()
 
+# The sanitizer/fuzzer compile flags below are emitted only for C/CXX (see the
+# COMPILE_LANGUAGE generator expressions), so they never reach the .s assembly
+# TUs (e.g. invokeNative_em64*.s on x86_64). But the ASM compiler must still be
+# Clang: the runtime's .s sources are assembled by ${CMAKE_ASM_COMPILER}, and a
+# non-Clang assembler (e.g. system gcc/as) can choke on the Clang-driver flags
+# CMake still forwards. Require Clang for ASM so the build stays self-consistent.
+if(NOT CMAKE_ASM_COMPILER_ID MATCHES ".*Clang")
+  message(FATAL_ERROR "Please use Clang as the ASM compiler for libFuzzer compatibility.")
+endif()
+
 set(CMAKE_BUILD_TYPE Debug)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -74,18 +84,31 @@ else()
   set(IN_OSS_FUZZ 0)
 endif()
 
+# The instrumentation flags below are scoped to C and CXX via
+# $<$<COMPILE_LANGUAGE:C,CXX>:...>. The runtime pulls in hand-written assembly
+# (e.g. invokeNative_em64*.s on x86_64); the sanitizer/fuzzer flags are
+# meaningless there and a non-Clang assembler can reject them, so they must not
+# leak onto the ASM TUs. ASan+UBSan+libFuzzer stay fully applied to every C/C++
+# TU. add_link_options is left unscoped: it is per-link, not per-language.
 if(NOT IN_OSS_FUZZ)
   message(STATUS "Enabling ASan + UBSan for the component-model fuzz target")
-  add_compile_options(-g -O1 -fno-omit-frame-pointer)
-  add_compile_options(-fsanitize=address -fsanitize-address-use-after-scope)
   add_compile_options(
-    -fsanitize=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound
-    -fno-sanitize-recover=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound)
+    $<$<COMPILE_LANGUAGE:C,CXX>:-g>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-O1>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>)
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=address>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize-address-use-after-scope>)
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-fno-sanitize-recover=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound>)
   add_link_options(-fsanitize=address,undefined)
 endif()
 
 # libFuzzer driver (no vptr: RTTI is off in the runtime build).
-add_compile_options(-fsanitize=fuzzer -fno-sanitize=vptr)
+add_compile_options(
+  $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=fuzzer>
+  $<$<COMPILE_LANGUAGE:C,CXX>:-fno-sanitize=vptr>)
 add_link_options(-fsanitize=fuzzer -fno-sanitize=vptr)
 
 # Drop unreferenced functions (the instantiation / canonical-ABI / host
