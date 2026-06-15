@@ -161,9 +161,26 @@ TEST_F(CanonicalAbiTrapTest, ListRangePtrLenOverflowTraps)
     wit_value_t out = nullptr;
     // length * elem_sz wraps in 32-bit (0x40000000 * 4 == 0); the bounds
     // check must widen the multiply, otherwise it reads way out of bounds.
+    //
+    // EXPECT_FALSE alone is not enough here: if the overflow guard regressed,
+    // 0x40000000 * 4 wraps to 0, no trap fires, and load_list_from_valid_range
+    // then tries to malloc 0x40000000 * sizeof(wit_value_t) (~8GiB) which OOMs
+    // against the test heap and *also* returns false -- so the load would still
+    // report failure for the wrong reason. Assert the trap REASON so a
+    // regressed guard (which yields the "out of memory for list elements"
+    // message, not the bounds-check trap) actually fails the test.
+    c->inst->cur_exception[0] = '\0';
     bool ok =
         load_list_from_range(c, /*ptr=*/0, /*length=*/0x40000000u, &u32, &out);
     EXPECT_FALSE(ok) << "list length*elem_size overflow must trap";
+    // The bounds-check trap_if stringifies its condition, which contains
+    // "memory_data_size"; the OOM fallback does not. Requiring the bounds
+    // message (and rejecting the OOM one) makes a regressed guard fail.
+    EXPECT_NE(strstr(c->inst->cur_exception, "memory_data_size"), nullptr)
+        << "expected the bounds-check trap, got: " << c->inst->cur_exception;
+    EXPECT_EQ(strstr(c->inst->cur_exception, "out of memory"), nullptr)
+        << "regressed overflow guard fell through to allocation: "
+        << c->inst->cur_exception;
     if (out)
         free_wit_value(out);
 }
