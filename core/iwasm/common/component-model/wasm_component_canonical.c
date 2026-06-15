@@ -340,7 +340,13 @@ load_string_from_range(LiftLowerContext *cx, uint32_t begin,
     WASMMemoryInstance *mem = get_mem_from_cx(cx);
 
     uint32_t alignment = 0;
-    uint32_t byte_length = 0;
+    /* byte_length must be 64-bit: for UTF-16 it is 2 * code_units, and a
+     * crafted code-unit count near UINT32_MAX would overflow a uint32_t
+     * multiply (wrapping to a small value) BEFORE the bounds check below,
+     * letting a truncated string slip past the guard. Keep the byte count in
+     * 64 bits and enforce the Canonical-ABI MAX_STRING_BYTE_LENGTH precondition
+     * on the post-tag-strip code-unit count (mirrors the STORE path). */
+    uint64_t byte_length = 0;
     StringDecoding decoding = DECODING_UTF_8;
 
     switch (encoding) {
@@ -355,7 +361,11 @@ load_string_from_range(LiftLowerContext *cx, uint32_t begin,
         case ENCODING_UTF_16:
         {
             alignment = 2;
-            byte_length = 2 * tagged_code_units;
+            /* code-unit count must satisfy the Canonical-ABI precondition;
+             * trap before the (now 64-bit) multiply so a count >= 2^31 cannot
+             * wrap byte_length. */
+            trap_if(tagged_code_units > (uint32_t)MAX_STRING_BYTE_LENGTH);
+            byte_length = 2 * (uint64_t)tagged_code_units;
             decoding = DECODING_UTF_16_LE;
             break;
         }
@@ -364,7 +374,9 @@ load_string_from_range(LiftLowerContext *cx, uint32_t begin,
         {
             alignment = 2;
             if (tagged_code_units & UTF16_TAG) {
-                byte_length = 2 * (tagged_code_units ^ UTF16_TAG);
+                uint32_t code_units = tagged_code_units ^ UTF16_TAG;
+                trap_if(code_units > (uint32_t)MAX_STRING_BYTE_LENGTH);
+                byte_length = 2 * (uint64_t)code_units;
                 decoding = DECODING_UTF_16_LE;
             }
             else {
@@ -382,16 +394,19 @@ load_string_from_range(LiftLowerContext *cx, uint32_t begin,
     }
 
     trap_if(begin != align_to(begin, alignment));
-    /* Widen before the add: begin and byte_length are both uint32_t, so
-     * `begin + byte_length` wraps mod 2^32 before the cast; a crafted begin
-     * near UINT32_MAX would pass this check yet read out of linear memory. */
+    /* Widen before the add: begin is uint32_t and byte_length is uint64_t, so
+     * `begin + byte_length` is evaluated in 64 bits and cannot wrap; a crafted
+     * begin near UINT32_MAX would otherwise pass this check yet read out of
+     * linear memory. */
     trap_if((uint64_t)begin + byte_length > mem->memory_data_size);
 
     const uint8_t *src = mem->memory_data + begin;
     char *decoded_str = NULL;
     uint32_t decoded_len = 0;
 
-    if (!decode_string(cx, src, byte_length, decoding, &decoded_str,
+    /* byte_length is now bounded by the checks above (<= memory_data_size,
+     * which fits in 32 bits), so this narrowing cast cannot lose bits. */
+    if (!decode_string(cx, src, (uint32_t)byte_length, decoding, &decoded_str,
                        &decoded_len)) {
         return false;
     }
