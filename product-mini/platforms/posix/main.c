@@ -956,7 +956,9 @@ main(int argc, char *argv[])
     bool component_loaded = false;
     bool component_func_invoke = false; // 'true' if component function is invoked
 #endif
+#if WASM_ENABLE_COMPONENT_MODEL != 0
     bool module_func_invoke = false; // 'true' if module function is invoked
+#endif
     RunningMode running_mode = 0;
     RuntimeInitArgs init_args;
     char error_buf[128] = { 0 };
@@ -1003,7 +1005,9 @@ main(int argc, char *argv[])
                 return print_help();
             }
             func_name = argv[0];
+#if WASM_ENABLE_COMPONENT_MODEL != 0
             module_func_invoke = true;
+#endif
         }
 #if WASM_ENABLE_COMPONENT_MODEL != 0
         else if (!strcmp(argv[0], "-i") || !strcmp(argv[0], "--invoke")) {
