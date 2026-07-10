@@ -76,7 +76,7 @@ run_aot_tests () {
         fi
 
         echo "Compiling $test_wasm to $test_aot"
-        ${WAMRC_CMD} --enable-multi-thread ${target_option} \
+        ${WAMRC_CMD} --enable-multi-thread "${target_options[@]}" \
             -o ${test_aot} ${test_wasm}
 
         echo "Running $test_aot"
@@ -140,9 +140,14 @@ if [[ $MODE != "aot" ]];then
 
     deactivate
 else
-    target_option=""
+    target_options=()
     if [[ $TARGET == "X86_32" ]];then
-        target_option="--target=i386"
+        target_options=(--target=i386)
+    elif [[ $TARGET == "X86_64" ]];then
+        # Keep generated AOT artifacts independent of the hosted runner CPU.
+        # In particular, znver4 auto-detection enables AVX-512 code paths that
+        # are not reliable on every runner execution environment.
+        target_options=(--target=x86_64 --cpu=skylake)
     fi
 
     exit_code=0

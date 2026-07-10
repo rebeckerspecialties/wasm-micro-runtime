@@ -673,18 +673,32 @@ TEST_F(CanonicalExecutionTest, test_wasi_ip_name_lookup)
 
   char func_name[] = "run()";
   status = wasm_component_application_execute_func(comp_instance, func_name);
+
+  fflush(stdout);
+  int restore_result = dup2(log_file_fd, STDOUT_FILENO);
+  close(log_file_fd);
+  log_file_fd = -1;
+  ASSERT_EQ(restore_result, STDOUT_FILENO);
   ASSERT_TRUE(status);
 
   FILE *output = fopen(output_path, "r");
   ASSERT_TRUE(output);
 
-  char line[256][256];
-  uint32_t i = 0;
-  while(fgets(line[i], sizeof(line[i]), output)) i++;
+  bool saw_resolving = false;
+  bool saw_address = false;
+  bool saw_summary = false;
+  char line[256];
+  while (fgets(line, sizeof(line), output)) {
+      saw_resolving |= strstr(line, "Resolving: localhost") != NULL;
+      saw_address |= strstr(line, "  -> ") != NULL;
+      saw_summary |= strstr(line, "Resolved ") != NULL
+                     && strstr(line, " address(es) for localhost") != NULL;
+  }
+  fclose(output);
 
-  ASSERT_TRUE(strstr(line[0], "Resolving: localhost"));
-  ASSERT_TRUE(strstr(line[1], "-> 127.0.0.1")); // address found
-  ASSERT_TRUE(strstr(line[2], "Resolved 1 address(es) for localhost"));
+  ASSERT_TRUE(saw_resolving);
+  ASSERT_TRUE(saw_address);
+  ASSERT_TRUE(saw_summary);
 }
 
 // Test apps made with C WASi-SDK

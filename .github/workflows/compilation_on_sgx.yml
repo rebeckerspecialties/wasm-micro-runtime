@@ -227,7 +227,10 @@ jobs:
         if: matrix.iwasm_make_options_run_mode == '$AOT_BUILD_OPTIONS'
         run: |
           source /opt/intel/sgxsdk/environment
-          ./wamrc -sgx -o ./file.aot ./file.wasm
+          # A hosted Zen 4 runner can select AVX-512 instructions that the SGX
+          # execution environment does not expose. Use the same non-AVX-512
+          # SIMD baseline as the x86-64 spec suite instead of the host CPU.
+          ./wamrc -sgx --cpu=skylake -o ./file.aot ./file.wasm
           ./iwasm --dir=. ./file.aot
         working-directory: product-mini/platforms/${{ matrix.platform }}/enclave-sample
 
@@ -242,17 +245,13 @@ jobs:
           [$DEFAULT_TEST_OPTIONS, $SIMD_TEST_OPTIONS, $XIP_TEST_OPTIONS]
         os: [ubuntu-22.04]
         exclude:
-          # classic-interp, fast-interp and fast-jit don't support simd
+          # classic-interp and fast-jit don't support simd
           - running_mode: "classic-interp"
-            test_option: $SIMD_TEST_OPTIONS
-          - running_mode: "fast-interp"
             test_option: $SIMD_TEST_OPTIONS
           - running_mode: "fast-jit"
             test_option: $SIMD_TEST_OPTIONS
-          # classic-interp, fast-interp and fast jit don't support XIP
+          # classic-interp and fast-jit don't support XIP
           - running_mode: "classic-interp"
-            test_option: $XIP_TEST_OPTIONS
-          - running_mode: "fast-interp"
             test_option: $XIP_TEST_OPTIONS
           - running_mode: "fast-jit"
             test_option: $XIP_TEST_OPTIONS
