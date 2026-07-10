@@ -3,6 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "wasi_p2_io.h"
 #include "wasi_p2_error.h"
 #include <errno.h>
