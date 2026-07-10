@@ -50,16 +50,9 @@ class WasiP2IoWrapperTest : public testing::Test
       bool success = instantiate_host_resource_table();
       ASSERT_TRUE(success);
 
-      char cwd[PATH_MAX];
-      getcwd(cwd, sizeof(cwd));
-      const char *substr = "wasm-micro-runtime";
-      char *pos = strstr(cwd, substr);
-      ASSERT_TRUE(pos != NULL) << "Could not find 'wasm-micro-runtime' in cwd";
-      size_t prefix_len = (pos - cwd) + strlen(substr);
-      char path[PATH_MAX] = "";
-      strncat(path, cwd, prefix_len);
-      strcat(path, "/tests/unit/libc-wasi-p2/test_dir/test_input.txt");
-      
+      char path[PATH_MAX] =
+          WAMR_UNIT_TEST_SOURCE_DIR "/test_dir/test_input.txt";
+
       FILE *input_file = freopen(path, "r", stdin);
       ASSERT_TRUE(input_file);
 
@@ -348,16 +341,8 @@ TEST_F(WasiP2IoWrapperTest, test_blocking_splice)
 TEST_F(WasiP2IoWrapperTest, test_to_debug_string)
 {
   // redirect stdin to write only file in order to cause input-stream.read to return last-operation-failed and generate an error resource
-  char cwd[PATH_MAX];
-  getcwd(cwd, sizeof(cwd));
-  const char *substr = "wasm-micro-runtime";
-  char *pos = strstr(cwd, substr);
-  ASSERT_TRUE(pos != NULL) << "Could not find 'wasm-micro-runtime' in cwd";
-  size_t prefix_len = (pos - cwd) + strlen(substr);
-  char path[PATH_MAX] = "";
-  strncat(path, cwd, prefix_len);
-  strcat(path, "/tests/unit/libc-wasi-p2/test_dir/test_output.txt");
-  
+  char path[PATH_MAX] = WAMR_UNIT_TEST_SOURCE_DIR "/test_dir/test_output.txt";
+
   FILE *input_file = freopen(path, "w", stdin);
   ASSERT_TRUE(input_file);
   ASSERT_TRUE(wasm_component_application_execute_func(comp_instance, (char *)"call-to-debug-string()"));

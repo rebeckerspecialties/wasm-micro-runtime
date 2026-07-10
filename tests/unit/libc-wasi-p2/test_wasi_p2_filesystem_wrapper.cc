@@ -34,7 +34,7 @@ class WasiP2FilesystemWrapperTest : public testing::Test
     WASMComponentInstance *comp_instance;
 
     WASIContext *wasi_ctx;
-    char test_dir[128];
+    char test_dir[PATH_MAX] = WAMR_UNIT_TEST_SOURCE_DIR "/test_dir";
 
     int32_t dir_fd;
 
@@ -97,42 +97,27 @@ class WasiP2FilesystemWrapperTest : public testing::Test
       return load_component_from_candidates_internal(file_name, "libc-wasi-p2");
     }
 
-    void get_test_dir() {
-      char cwd[PATH_MAX];
-      getcwd(cwd, sizeof(cwd));
-      const char *substr = "wasm-micro-runtime";
-      char *pos = strstr(cwd, substr);
-      if (!pos) {
-          printf("Could not find 'wasm-micro-runtime' in cwd\n");
-          return;
-      }
-      size_t prefix_len = (pos - cwd) + strlen(substr);
-      test_dir[0] = '\0';
-      strncat(test_dir, cwd, prefix_len);
-      strcat(test_dir, "/tests/unit/libc-wasi-p2/test_dir");
-    }
+    void init_prestats()
+    {
+        WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(
+            (WASMModuleInstanceCommon *)
+                comp_instance->core_module_instances[0]);
+        wasi_ctx->prestats = (struct fd_prestats *)wasm_runtime_malloc(
+            sizeof(struct fd_prestats));
+        ASSERT_NE(wasi_ctx->prestats, nullptr);
+        memset(wasi_ctx->prestats, 0, sizeof(struct fd_prestats));
+        // one preopen
+        wasi_ctx->prestats->size = 10;
+        wasi_ctx->prestats->prestats = (struct fd_prestat *)wasm_runtime_malloc(
+            10 * sizeof(struct fd_prestat));
+        ASSERT_NE(wasi_ctx->prestats->prestats, nullptr);
+        memset(wasi_ctx->prestats->prestats, 0, 10 * sizeof(struct fd_prestat));
+        dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
 
-    void init_prestats() {
-
-      get_test_dir();
-
-      WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx((WASMModuleInstanceCommon *)comp_instance->core_module_instances[0]);
-      wasi_ctx->prestats = (struct fd_prestats *)wasm_runtime_malloc(
-          sizeof(struct fd_prestats));
-      ASSERT_NE(wasi_ctx->prestats, nullptr);
-      memset(wasi_ctx->prestats, 0, sizeof(struct fd_prestats));
-      // one preopen
-      wasi_ctx->prestats->size = 10;
-      wasi_ctx->prestats->prestats = (struct fd_prestat *)wasm_runtime_malloc(
-          10 * sizeof(struct fd_prestat));
-      ASSERT_NE(wasi_ctx->prestats->prestats, nullptr);
-      memset(wasi_ctx->prestats->prestats, 0, 10 * sizeof(struct fd_prestat));
-      dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
-
-      ASSERT_TRUE(dir_fd < (int32_t)wasi_ctx->prestats->size );
-      wasi_ctx->prestats->prestats[dir_fd].dir = test_dir;
-      ASSERT_NE(wasi_ctx->prestats->prestats[dir_fd].dir[0], '\0');
-      fd_table_insert_existing(wasi_ctx->curfds, dir_fd, dir_fd, false);
+        ASSERT_TRUE(dir_fd < (int32_t)wasi_ctx->prestats->size);
+        wasi_ctx->prestats->prestats[dir_fd].dir = test_dir;
+        ASSERT_NE(wasi_ctx->prestats->prestats[dir_fd].dir[0], '\0');
+        fd_table_insert_existing(wasi_ctx->curfds, dir_fd, dir_fd, false);
     }
 
     void test_function_execution(const char *binary_name, const char *func_name) {

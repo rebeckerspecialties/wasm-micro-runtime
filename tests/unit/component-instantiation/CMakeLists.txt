@@ -55,7 +55,10 @@ target_include_directories(component-instantiation PRIVATE ${LIBC_WASI_P2_INCLUD
 find_package(Threads REQUIRED)
 target_link_libraries (component-instantiation ${LLVM_AVAILABLE_LIBS} ${WAMR_TEST_OPENSSL_LIBS} gmock gtest_main Threads::Threads)
 
-target_compile_definitions(component-instantiation PRIVATE WAMR_BUILD_COMPONENT_MODEL=1)
+target_compile_definitions(component-instantiation PRIVATE
+  WAMR_BUILD_COMPONENT_MODEL=1
+  WAMR_UNIT_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
 
 
 gtest_discover_tests(component-instantiation

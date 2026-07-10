@@ -32,20 +32,20 @@ class CanonicalExecutionTest : public testing::Test
 
     bool runtime_init = false;
 
-    char input_path[PATH_MAX];
-    char output_path[PATH_MAX];
+    char input_path[PATH_MAX] = CANONICAL_EXECUTION_TEST_DIR "/test_input.txt";
+    char output_path[PATH_MAX] =
+        CANONICAL_EXECUTION_TEST_DIR "/test_output.txt";
 
     WASIContext *wasi_ctx;
-    char test_dir[128];
+    char test_dir[PATH_MAX] = CANONICAL_EXECUTION_TEST_DIR;
 
     int32_t dir_fd;
     char source_dir[8] = "/source";
     char dest_dir[6] = "/dest";
     char cwd_path[2] = "/";
-    char path[PATH_MAX] = "";
 
-
-    int log_file_fd;
+    int log_file_fd = -1;
+    pid_t child_pid = -1;
 
     virtual void SetUp() {
       printf("Starting setup\n");
@@ -68,94 +68,94 @@ class CanonicalExecutionTest : public testing::Test
       bool success = instantiate_host_resource_table();
       ASSERT_TRUE(success);
 
-      char cwd[PATH_MAX];
-      getcwd(cwd, sizeof(cwd));
-      const char *substr = "wasm-micro-runtime";
-      char *pos = strstr(cwd, substr);
-      ASSERT_TRUE(pos != NULL) << "Could not find 'wasm-micro-runtime' in cwd";
-      size_t prefix_len = (pos - cwd) + strlen(substr);
-      strncat(path, cwd, prefix_len);
-      strcat(path, "/tests/unit/canonical-execution/test-dir/");
-      strcat(input_path, path);
-      strcat(output_path, path);
-      strcat(input_path, "test_input.txt");
-      strcat(output_path, "test_output.txt");
+      FILE *input_file = fopen(input_path, "r");
+      ASSERT_NE(input_file, nullptr) << strerror(errno);
+      fclose(input_file);
+
+      FILE *output_file = fopen(output_path, "w");
+      ASSERT_NE(output_file, nullptr) << strerror(errno);
+      fclose(output_file);
 
       printf("Ending setup\n");
     }
 
     virtual void TearDown() {
       printf("Starting teardown\n");
+      StopChild();
       destroy_host_resource_table();
         if (runtime_init) {
           printf("Starting to destroy runtime\n");
           wasm_runtime_destroy();
           runtime_init = false;
         }
-        
-        fclose(fopen(output_path, "w"));
-        dup2(log_file_fd, STDOUT_FILENO); // return output to original log file
+
+        fflush(stdout);
+        if (log_file_fd >= 0) {
+            dup2(log_file_fd,
+                 STDOUT_FILENO); // return output to original log file
+            close(log_file_fd);
+            log_file_fd = -1;
+        }
         printf("Ending teardown\n");
 
     }
 
-    WASMComponent* LoadfromCandidates(const char *file_name) { 
-      return load_component_from_candidates_internal(file_name, "canonical-execution");
+    void StopChild()
+    {
+        if (child_pid <= 0)
+            return;
+
+        (void)kill(child_pid, SIGTERM);
+        while (waitpid(child_pid, nullptr, 0) == -1 && errno == EINTR) {
+        }
+        child_pid = -1;
     }
 
-    void get_test_dir() {
-      char cwd[PATH_MAX];
-      getcwd(cwd, sizeof(cwd));
-      const char *substr = "wasm-micro-runtime";
-      char *pos = strstr(cwd, substr);
-      if (!pos) {
-          printf("Could not find 'wasm-micro-runtime' in cwd\n");
-          return;
-      }
-      size_t prefix_len = (pos - cwd) + strlen(substr);
-      test_dir[0] = '\0';
-      strncat(test_dir, cwd, prefix_len);
-      strcat(test_dir, "/tests/unit/canonical-execution/test-dir");
+    WASMComponent *LoadfromCandidates(const char *file_name)
+    {
+        return load_component_from_candidates_internal(file_name,
+                                                       "canonical-execution");
     }
 
-    void init_prestats(WASMComponentInstance *comp_instance) {
+    void init_prestats(WASMComponentInstance *comp_instance)
+    {
+        WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(
+            (WASMModuleInstanceCommon *)
+                comp_instance->core_module_instances[0]);
+        wasi_ctx->prestats = (struct fd_prestats *)wasm_runtime_malloc(
+            sizeof(struct fd_prestats));
+        ASSERT_NE(wasi_ctx->prestats, nullptr);
+        memset(wasi_ctx->prestats, 0, sizeof(struct fd_prestats));
+        wasi_ctx->prestats->size = 10;
+        wasi_ctx->prestats->prestats = (struct fd_prestat *)wasm_runtime_malloc(
+            10 * sizeof(struct fd_prestat));
+        ASSERT_NE(wasi_ctx->prestats->prestats, nullptr);
+        memset(wasi_ctx->prestats->prestats, 0, 10 * sizeof(struct fd_prestat));
 
-      get_test_dir();
+        char source_path[PATH_MAX];
+        source_path[0] = '\0';
+        strcat(source_path, test_dir);
+        strcat(source_path, source_dir);
+        int32_t source_dir_fd = open(source_path, O_RDONLY | O_DIRECTORY);
+        wasi_ctx->prestats->prestats[source_dir_fd].dir = source_dir;
 
-      WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx((WASMModuleInstanceCommon *)comp_instance->core_module_instances[0]);
-      wasi_ctx->prestats = (struct fd_prestats *)wasm_runtime_malloc(
-          sizeof(struct fd_prestats));
-      ASSERT_NE(wasi_ctx->prestats, nullptr);
-      memset(wasi_ctx->prestats, 0, sizeof(struct fd_prestats));
-      wasi_ctx->prestats->size = 10;
-      wasi_ctx->prestats->prestats = (struct fd_prestat *)wasm_runtime_malloc(
-          10 * sizeof(struct fd_prestat));
-      ASSERT_NE(wasi_ctx->prestats->prestats, nullptr);
-      memset(wasi_ctx->prestats->prestats, 0, 10 * sizeof(struct fd_prestat));
+        fd_table_insert_existing(wasi_ctx->curfds, source_dir_fd, source_dir_fd,
+                                 false);
 
-      char source_path[PATH_MAX];
-      source_path[0] = '\0';
-      strcat(source_path, test_dir);
-      strcat(source_path, source_dir);
-      int32_t source_dir_fd = open(source_path, O_RDONLY | O_DIRECTORY);
-      wasi_ctx->prestats->prestats[source_dir_fd].dir = source_dir;
+        char dest_path[PATH_MAX];
+        dest_path[0] = '\0';
+        strcat(dest_path, test_dir);
+        strcat(dest_path, dest_dir);
+        int32_t dest_dir_fd = open(dest_path, O_RDONLY | O_DIRECTORY);
+        wasi_ctx->prestats->prestats[dest_dir_fd].dir = dest_dir;
 
-      fd_table_insert_existing(wasi_ctx->curfds, source_dir_fd, source_dir_fd, false);
+        fd_table_insert_existing(wasi_ctx->curfds, dest_dir_fd, dest_dir_fd,
+                                 false);
 
-      char dest_path[PATH_MAX];
-      dest_path[0] = '\0';
-      strcat(dest_path, test_dir);
-      strcat(dest_path, dest_dir);
-      int32_t dest_dir_fd = open(dest_path, O_RDONLY | O_DIRECTORY);
-      wasi_ctx->prestats->prestats[dest_dir_fd].dir = dest_dir;
+        int32_t cwd_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
+        wasi_ctx->prestats->prestats[cwd_fd].dir = cwd_path;
 
-      fd_table_insert_existing(wasi_ctx->curfds, dest_dir_fd, dest_dir_fd, false);
-
-      int32_t cwd_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
-      wasi_ctx->prestats->prestats[cwd_fd].dir = cwd_path;
-
-      fd_table_insert_existing(wasi_ctx->curfds, cwd_fd, cwd_fd, false);
-
+        fd_table_insert_existing(wasi_ctx->curfds, cwd_fd, cwd_fd, false);
     }
 };
 
@@ -485,52 +485,54 @@ TEST_F(CanonicalExecutionTest, test_tcp_server)
     printf("[Setup] Cleaning up port %d...\n", port);
     system(command);
 
-  pid_t pid = fork();
+    child_pid = fork();
 
-  ASSERT_TRUE(pid >= 0);
+    ASSERT_TRUE(child_pid >= 0);
 
-  if (pid == 0) {
-      // --- CHILD PROCESS: tcp-server ---
-    char func_name[] = "run()";
-    wasm_component_application_execute_func(comp_instance, func_name);
+    if (child_pid == 0) {
+        // --- CHILD PROCESS: tcp-server ---
+        alarm(30);
+        char func_name[] = "run()";
+        bool child_status =
+            wasm_component_application_execute_func(comp_instance, func_name);
+        _exit(child_status ? 0 : 1);
+    }
+    else {
 
-  } else {
+        usleep(500000);
+        printf("[Parent] Connecting via native sockets...\n");
 
-    usleep(500000);
-    printf("[Parent] Connecting via native sockets...\n");
+        // Create socket, configure address, and connect
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_TRUE(sock >= 0);
 
-    // Create socket, configure address, and connect
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    ASSERT_TRUE(sock >= 0);
+        struct sockaddr_in serv_addr;
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(7878);
+        inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
 
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(7878);
-    inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
+        // Connect to the server
+        int connection_status =
+            connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+        printf("Errno: %d\n", errno);
 
-    // Connect to the server
-    int connection_status = connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
-    printf("Errno: %d\n", errno);
+        ASSERT_TRUE(connection_status == 0);
 
-    ASSERT_TRUE(connection_status == 0);
+        // Send 2 messages
+        const char *msg1 = "Message 1: Hello Server!\n";
+        send(sock, msg1, strlen(msg1), 0);
 
-    // Send 2 messages
-    const char *msg1 = "Message 1: Hello Server!\n";
-    send(sock, msg1, strlen(msg1), 0);
+        sleep(1);
 
-    sleep(1);
+        const char *msg2 = "Message 2: Testing complete.\n";
+        send(sock, msg2, strlen(msg2), 0);
+        sleep(1);
 
-    const char *msg2 = "Message 2: Testing complete.\n";
-    send(sock, msg2, strlen(msg2), 0);
-    sleep(1);
+        // Cleanup
+        StopChild();
 
-    // Cleanup
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
-
-    printf("[Parent] Messages sent. Cleaning up...\n");
-
-  }
+        printf("[Parent] Messages sent. Cleaning up...\n");
+    }
 
   FILE *output = fopen(output_path, "r");
   ASSERT_TRUE(output);
@@ -579,28 +581,29 @@ TEST_F(CanonicalExecutionTest, test_udp_server)
 
   char func_name[] = "run()";
 
-  pid_t pid = fork();
+  child_pid = fork();
 
-  ASSERT_TRUE(pid >= 0);
+  ASSERT_TRUE(child_pid >= 0);
 
-  if (pid == 0) {
+  if (child_pid == 0) {
 
-    wasm_component_application_execute_func(comp_instance_1, func_name);
+      alarm(30);
+      bool child_status =
+          wasm_component_application_execute_func(comp_instance_1, func_name);
+      _exit(child_status ? 0 : 1);
+  }
+  else {
 
-  } else {
+      // Redirect client output to log file
+      FILE *output_file = freopen(output_path, "w", stdout);
+      ASSERT_TRUE(output_file);
+      // --- Parent PROCESS: udp-client ---
+      char line[256];
 
-    // Redirect client output to log file
-    FILE *output_file = freopen(output_path, "w", stdout);
-    ASSERT_TRUE(output_file);
-    // --- Parent PROCESS: udp-client ---
-    char line[256];
+      usleep(500000); // 0.5 seconds
 
-    usleep(500000); // 0.5 seconds
-
-    wasm_component_application_execute_func(comp_instance_2, func_name);
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
-
+      wasm_component_application_execute_func(comp_instance_2, func_name);
+      StopChild();
   }
 
   FILE *output = fopen(output_path, "r");
@@ -839,50 +842,52 @@ TEST_F(CanonicalExecutionTest, test_tcp_server_c)
     printf("[Setup] Cleaning up port %d...\n", port);
     system(command);
 
-  pid_t pid = fork();
+    child_pid = fork();
 
-  ASSERT_TRUE(pid >= 0);
+    ASSERT_TRUE(child_pid >= 0);
 
-  if (pid == 0) {
-      // --- CHILD PROCESS: tcp-server ---
-    char func_name[] = "run()";
-    wasm_component_application_execute_func(comp_instance, func_name);
+    if (child_pid == 0) {
+        // --- CHILD PROCESS: tcp-server ---
+        alarm(30);
+        char func_name[] = "run()";
+        bool child_status =
+            wasm_component_application_execute_func(comp_instance, func_name);
+        _exit(child_status ? 0 : 1);
+    }
+    else {
+        usleep(500000);
 
-  } else {
-    usleep(500000);
+        printf("[Parent] Connecting via native sockets...\n");
 
-    printf("[Parent] Connecting via native sockets...\n");
+        // Create socket, configure address, and connect
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_TRUE(sock >= 0);
 
-    // Create socket, configure address, and connect
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    ASSERT_TRUE(sock >= 0);
+        struct sockaddr_in serv_addr;
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(8080);
+        inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
 
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(8080);
-    inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
+        // Connect to the server
+        int connection_status =
+            connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+        ASSERT_TRUE(connection_status == 0);
 
-    // Connect to the server
-    int connection_status = connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
-    ASSERT_TRUE(connection_status == 0);
+        // Send 2 messages
+        const char *msg1 = "Message 1: Hello Server!\n";
+        send(sock, msg1, strlen(msg1), 0);
 
-    // Send 2 messages
-    const char *msg1 = "Message 1: Hello Server!\n";
-    send(sock, msg1, strlen(msg1), 0);
+        sleep(1);
 
-    sleep(1);
+        const char *msg2 = "Message 2: Testing complete.\n";
+        send(sock, msg2, strlen(msg2), 0);
+        sleep(1);
 
-    const char *msg2 = "Message 2: Testing complete.\n";
-    send(sock, msg2, strlen(msg2), 0);
-    sleep(1);
+        // Cleanup
+        StopChild();
 
-    // Cleanup
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
-
-    printf("[Parent] Messages sent. Cleaning up...\n");
-
-  }
+        printf("[Parent] Messages sent. Cleaning up...\n");
+    }
 }
 
 
@@ -912,30 +917,34 @@ TEST_F(CanonicalExecutionTest, test_udp_server_c)
   printf("Here\n");
   fflush(stdout);
 
-  pid_t pid = fork();
+  child_pid = fork();
 
-  ASSERT_TRUE(pid >= 0);
+  ASSERT_TRUE(child_pid >= 0);
 
-  if (pid == 0) {
+  if (child_pid == 0) {
 
-    char command[128];
-    // This command finds the PID using the port and kills it.
-    // We redirect stderr to /dev/null so it doesn't complain if the port is already free.
-    uint32_t port = 8080;
-    sprintf(command, "lsof -t -i:%d | xargs kill -9 > /dev/null 2>&1", port);
+      alarm(30);
+      char command[128];
+      // This command finds the PID using the port and kills it.
+      // We redirect stderr to /dev/null so it doesn't complain if the port is
+      // already free.
+      uint32_t port = 8080;
+      sprintf(command, "lsof -t -i:%d | xargs kill -9 > /dev/null 2>&1", port);
 
-     sleep(1);
+      sleep(1);
 
-    printf("[Setup] Cleaning up port %d...\n", port);
-    system(command);
+      printf("[Setup] Cleaning up port %d...\n", port);
+      system(command);
 
-    fflush(stdout);
+      fflush(stdout);
 
-    printf("running server\n");
-    fflush(stdout);
+      printf("running server\n");
+      fflush(stdout);
       // --- CHILD PROCESS: udp-server ---
     char func_name[] = "run()";
-    wasm_component_application_execute_func(comp_instance, func_name);
+    bool child_status =
+        wasm_component_application_execute_func(comp_instance, func_name);
+    _exit(child_status ? 0 : 1);
   }
   else {
     usleep(500000);
@@ -961,8 +970,7 @@ TEST_F(CanonicalExecutionTest, test_udp_server_c)
 
     sleep(1);
 
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
+    StopChild();
 
     printf("[Parent] Messages sent. Cleaning up...\n");
 
@@ -979,9 +987,8 @@ TEST_F(CanonicalExecutionTest, test_wasi_filesystem_sandboxing)
 
   ASSERT_FALSE(libc_wasi_parse_options("inherit-env=y", &parse_ctx));
 
-  char absolute_escaped_path[PATH_MAX];
-  strcat(absolute_escaped_path, path);
-  strcat(absolute_escaped_path, "example.txt");
+  char absolute_escaped_path[PATH_MAX] =
+      CANONICAL_EXECUTION_TEST_DIR "/example.txt";
 
   const char *wasm_argv[] = {
       file_name, 

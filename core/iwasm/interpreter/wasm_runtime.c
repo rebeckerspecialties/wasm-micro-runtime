@@ -1583,19 +1583,19 @@ export_tags_instantiate(const WASMModule *module,
 }
 #endif /* end of WASM_ENABLE_TAGS != 0 */
 
+static void
+export_tables_deinstantiate(WASMExportTabInstance *tables)
+{
+    if (tables)
+        wasm_runtime_free(tables);
+}
+
 #if WASM_ENABLE_MULTI_MEMORY != 0
 static void
 export_memories_deinstantiate(WASMExportMemInstance *memories)
 {
     if (memories)
         wasm_runtime_free(memories);
-}
-
-static void
-export_tables_deinstantiate(WASMExportTabInstance *tables)
-{
-    if (tables)
-        wasm_runtime_free(tables);
 }
 
 static WASMExportMemInstance *

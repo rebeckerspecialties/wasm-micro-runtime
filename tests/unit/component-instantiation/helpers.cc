@@ -48,64 +48,79 @@ bool component_is_simple_enough(const WASMComponent* c, const char** why) {
   return true; // “simple” component
 }
 
-WASMComponent* load_component_from_candidates_internal(const char *file_name, const char *test_dir_name) {
-  char cwd[PATH_MAX];
-  getcwd(cwd, sizeof(cwd));
-  if (!file_name) {
-      printf("Invalid file\n");
-      return NULL;
-  }
+WASMComponent *
+load_component_from_candidates_internal(const char *file_name,
+                                        const char *test_dir_name)
+{
+    if (!file_name) {
+        printf("Invalid file\n");
+        return NULL;
+    }
 
-  const char *substr = "wasm-micro-runtime";
-  char *pos = strstr(cwd, substr);
-  if (!pos) {
-      printf("Could not find 'wasm-micro-runtime' in cwd\n");
-      return NULL;
-  }
+    char full_path[PATH_MAX];
+#ifdef WAMR_UNIT_TEST_SOURCE_DIR
+    (void)test_dir_name;
+    int path_length = snprintf(full_path, sizeof(full_path), "%s/wasm-apps/%s",
+                               WAMR_UNIT_TEST_SOURCE_DIR, file_name);
+#else
+    int path_length =
+        snprintf(full_path, sizeof(full_path), "tests/unit/%s/wasm-apps/%s",
+                 test_dir_name, file_name);
+#endif
+    if (path_length < 0 || (size_t)path_length >= sizeof(full_path)) {
+        printf("Component fixture path is too long\n");
+        return NULL;
+    }
 
-  size_t prefix_len = (pos - cwd) + strlen(substr);
-  char full_path[prefix_len + strlen("/tests/unit/") + strlen(test_dir_name) + strlen("/wasm-apps/") + strlen(file_name) + 1];
+    const char *candidates[] = {
+        file_name,
+        full_path // absolute path necessary for running debugger
+    };
 
-  full_path[0] = '\0';
-  strncat(full_path, cwd, prefix_len);
-  strcat(full_path, "/tests/unit/");
-  strcat(full_path, test_dir_name);
-  strcat(full_path, "/wasm-apps/");
-  strcat(full_path, file_name);
-  const char* candidates[] = {
-    file_name,
-    full_path // absolute path necessary for running debugger
-  };
+    unsigned char *buf = nullptr;
+    uint32_t size = 0;
+    const char *path = nullptr;
+    for (const char *p : candidates) {
+        buf = (unsigned char *)bh_read_file_to_buffer(p, &size);
+        if (buf) {
+            path = p;
+            break;
+        }
+    }
+    if (!buf)
+        return nullptr;
 
-  unsigned char *buf = nullptr; uint32_t size = 0; const char *path = nullptr;
-  for (const char *p : candidates) {
-    buf = (unsigned char*)bh_read_file_to_buffer(p, &size);
-    if (buf) { path = p; break; }
-  }
-  if (!buf) return nullptr;
+    auto *comp = (WASMComponent *)wasm_runtime_malloc(sizeof(WASMComponent));
+    if (!comp) {
+        BH_FREE(buf);
+        return nullptr;
+    }
+    memset(comp, 0, sizeof(WASMComponent));
 
-  auto *comp = (WASMComponent *)wasm_runtime_malloc(sizeof(WASMComponent));
-  if (!comp) { BH_FREE(buf); return nullptr; }
-  memset(comp, 0, sizeof(WASMComponent));
+    if (!wasm_decode_header(buf, size, &comp->header)
+        || !is_wasm_component(comp->header)) {
+        wasm_runtime_free(comp);
+        BH_FREE(buf);
+        return nullptr;
+    }
 
-  if (!wasm_decode_header(buf, size, &comp->header) || !is_wasm_component(comp->header)) {
-    wasm_runtime_free(comp); BH_FREE(buf); return nullptr;
-  }
+    LoadArgs args{};
+    char name_buf[32] = { 0 };
+    memset(&args, 0, sizeof(LoadArgs));
+    std::snprintf(name_buf, sizeof(name_buf), "%s", "Real Component");
+    args.name = name_buf;
+    args.wasm_binary_freeable = false;
+    args.clone_wasm_binary = false;
+    args.no_resolve = true;
+    args.is_component = true;
 
-  LoadArgs args{}; char name_buf[32] = {0};
-  memset(&args, 0, sizeof(LoadArgs));
-  std::snprintf(name_buf, sizeof(name_buf), "%s", "Real Component");
-  args.name = name_buf;
-  args.wasm_binary_freeable = false;
-  args.clone_wasm_binary = false;
-  args.no_resolve = true;
-  args.is_component = true;
+    if (!wasm_component_parse_sections(buf, size, comp, &args, 0)) {
+        wasm_runtime_free(comp);
+        BH_FREE(buf);
+        return nullptr;
+    }
 
-  if (!wasm_component_parse_sections(buf, size, comp, &args, 0)) {
-    wasm_runtime_free(comp); BH_FREE(buf); return nullptr;
-  }
-
-  return comp;
+    return comp;
 }
 
 // Pretty name for section ids

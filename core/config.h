@@ -707,9 +707,9 @@ unless used elsewhere */
 #define WASM_ENABLE_MEMORY64 0
 #endif
 
-/* Enable multi-memory by default */
+/* Enable multi-memory by default for component-model builds only */
 #ifndef WASM_ENABLE_MULTI_MEMORY
-#define WASM_ENABLE_MULTI_MEMORY 1
+#define WASM_ENABLE_MULTI_MEMORY WASM_ENABLE_COMPONENT_MODEL
 #endif
 
 #ifndef WASM_TABLE_MAX_SIZE

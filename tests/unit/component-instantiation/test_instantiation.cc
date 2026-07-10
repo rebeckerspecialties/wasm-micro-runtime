@@ -544,6 +544,7 @@ TEST_F(ComponentInstantiationTest, TestResolveCoreInstance)
   WASMComponentIndexCount index_count;
   memset(&index_count, 0, sizeof(WASMComponentIndexCount));
   index_count.core_instances = 3;
+  index_count.defined_core_instances = 2;
   index_count.core_modules = 1;
   index_count.core_functions = 1;
   index_count.core_tables = 1;
@@ -738,7 +739,9 @@ TEST_F(ComponentInstantiationTest, TestResolveCanons)
   memset(&index_count, 0, sizeof(index_count));
   index_count.types = 1;
   index_count.functions = 2;
+  index_count.defined_functions = 1;
   index_count.core_functions = 2;
+  index_count.defined_core_functions = 1;
 
   WASMComponentInstance *comp_instance = wasm_component_instance_allocate(&index_count, NULL, 0);
   comp_instance->functions[0]      = &dummy_comp_func;
@@ -1104,5 +1107,4 @@ TEST_F(ComponentInstantiationTest, TestInstantiateCanonFunctions)
   ASSERT_TRUE(comp_instance->component_instances[7]->core_module_instances[7]->e->functions[8].is_canon_func);
   ASSERT_EQ(comp_instance->component_instances[7]->core_module_instances[7]->e->functions[8].canon_type, WASM_COMP_CANON_RESOURCE_DROP);
   ASSERT_EQ(comp_instance->component_instances[7]->core_module_instances[7]->e->functions[8].resource, comp_instance->component_instances[7]->types[11]->type_specific.resource);
-
 }

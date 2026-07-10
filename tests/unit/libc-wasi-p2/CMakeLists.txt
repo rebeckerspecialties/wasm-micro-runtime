@@ -52,6 +52,17 @@ target_include_directories(libc-wasi-p2 PRIVATE ${LIBC_WASI_P2_INCLUDE_DIRS})
 find_package(Threads REQUIRED)
 target_link_libraries (libc-wasi-p2 ${LLVM_AVAILABLE_LIBS} ${WAMR_TEST_OPENSSL_LIBS} gtest_main Threads::Threads)
 
-target_compile_definitions(libc-wasi-p2 PRIVATE WAMR_BUILD_COMPONENT_MODEL=1)
+target_compile_definitions(libc-wasi-p2 PRIVATE
+  WAMR_BUILD_COMPONENT_MODEL=1
+  WAMR_UNIT_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
 
-gtest_discover_tests(libc-wasi-p2)
+gtest_discover_tests(libc-wasi-p2
+  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+add_custom_command(TARGET libc-wasi-p2 POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps/*.wasm
+    ${CMAKE_CURRENT_BINARY_DIR}/
+)

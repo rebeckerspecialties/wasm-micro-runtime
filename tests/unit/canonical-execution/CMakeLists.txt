@@ -57,11 +57,16 @@ target_include_directories(canonical-execution PRIVATE ${LIBC_WASI_P2_INCLUDE_DI
 find_package(Threads REQUIRED)
 target_link_libraries (canonical-execution ${LLVM_AVAILABLE_LIBS} ${WAMR_TEST_OPENSSL_LIBS} gmock gtest_main Threads::Threads)
 
-target_compile_definitions(canonical-execution PRIVATE WAMR_BUILD_COMPONENT_MODEL=1)
+target_compile_definitions(canonical-execution PRIVATE
+  WAMR_BUILD_COMPONENT_MODEL=1
+  WAMR_UNIT_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+  CANONICAL_EXECUTION_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test-dir"
+)
 
 
 gtest_discover_tests(canonical-execution
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+  PROPERTIES TIMEOUT 60
 )
 
 add_custom_command(TARGET canonical-execution POST_BUILD
