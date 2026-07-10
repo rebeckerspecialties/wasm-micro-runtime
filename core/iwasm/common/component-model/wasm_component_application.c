@@ -366,8 +366,8 @@ execute_component_func(WASMComponentInstance *component_inst, char *argv,
         goto fail;
     }
 
-    LOG_DEBUG("Executing WASM component function: %s with %d arguments\n",
-              inv.func_name);
+    LOG_DEBUG("Executing WASM component function: %s with %u arguments\n",
+              inv.func_name, inv.arg_count);
 
     CanonicalOptions *lower_opts = target_func->canon_options;
     WASMComponentFuncTypeInstance *ft = target_func->func_type;

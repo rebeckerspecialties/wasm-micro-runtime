@@ -97,9 +97,8 @@ wasi_filesystem_get_directories_wrapper(wasm_exec_env_t exec_env,
             if (!fd_table_get_host_handle(curfds, i, &host_fd))
                 continue;
 
-            uint32_t dir_len = strlen(prestats->prestats[i].dir);
-            char *dir = (char *)wasm_runtime_malloc(sizeof(char) * dir_len);
-            strcpy(dir, prestats->prestats[i].dir);
+            const char *dir = prestats->prestats[i].dir;
+            uint32_t dir_len = strlen(dir);
             HostResourceTable *hr_table = get_global_host_resource_table();
             HostResource *hr = host_resource_create(
                 WASI_P2_FILESYSTEM_DESCRIPTOR, sizeof(uint32_t));
@@ -117,8 +116,8 @@ wasi_filesystem_get_directories_wrapper(wasm_exec_env_t exec_env,
             uint8_t *encoded_str = NULL;
             uint32_t encoded_str_len = 0;
             uint32_t encoded_code_units = 0;
-            encode_string(exec_env->cx, dir, strlen(dir), encoding,
-                          &encoded_str, &encoded_str_len, &encoded_code_units);
+            encode_string(exec_env->cx, dir, dir_len, encoding, &encoded_str,
+                          &encoded_str_len, &encoded_code_units);
             tuple_elems[1] =
                 wit_string_ctor((char *)encoded_str, encoded_str_len,
                                 encoded_code_units, encoding);
