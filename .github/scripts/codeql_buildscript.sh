@@ -69,6 +69,7 @@ build_iwasm() {
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Debug \
         -DLLVM_DIR=${LLVM_DIR} \
+        -DWAMR_BUILD_COMPONENT_MODEL=0 \
         $options
     cmake --build build --target iwasm --parallel
     if [[ $? != 0 ]]; then
@@ -86,8 +87,11 @@ wamrc_options_list=(
 
 # List of compilation options for iwasm
 iwasm_options_list=(
-    #default
-    ""
+    # Default plus Preview 2. The remaining entries deliberately start from
+    # the core runtime so each feature permutation is independent; several
+    # legacy-libc, 32-bit, GC and thread combinations are not component-model
+    # configurations.
+    "-DWAMR_BUILD_COMPONENT_MODEL=1"
     # +classic interp
     "-DWAMR_BUILD_FAST_INTERP=0 -DWAMR_BUILD_SIMD=0"
     # fast jit
@@ -95,10 +99,9 @@ iwasm_options_list=(
     # +llvm jit
     "-DWAMR_BUILD_JIT=1"
     #
-    # The Preview 2 native-call bridge is 64-bit-only. Keep the X86_32 build in
-    # CodeQL for the core runtime, but do not claim unsupported component/AOT
-    # coverage (whose instance-layout assertions are 64-bit-specific).
-    "-DWAMR_BUILD_TARGET=X86_32 -DWAMR_BUILD_COMPONENT_MODEL=0"
+    # The Preview 2 native-call bridge is 64-bit-only; this still covers the
+    # core X86_32 runtime.
+    "-DWAMR_BUILD_TARGET=X86_32"
     #
     # libraries
     "-DWAMR_BUILD_LIBC_BUILTIN=0 -DWAMR_BUILD_LIBC_UVWASI=1 -DWAMR_BUILD_LIBC_EMCC=1"

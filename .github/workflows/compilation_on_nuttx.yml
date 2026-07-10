@@ -56,6 +56,11 @@ jobs:
       image: ghcr.io/apache/nuttx/apache-nuttx-ci-linux@sha256:d9261eacf6c6ebe656c571757751c803e8f04c3ae9b820320a5ea5dd57b7205a
 
     strategy:
+      # A single hosted-runner loss during checkout should not discard the
+      # other board/config results, and limiting the checkout burst avoids
+      # launching all 56 container jobs at once.
+      fail-fast: false
+      max-parallel: 16
       matrix:
         nuttx_board_config: [
           # x64
@@ -82,7 +87,6 @@ jobs:
           - "CONFIG_INTERPRETERS_WAMR_AOT CONFIG_INTERPRETERS_WAMR_FAST CONFIG_INTERPRETERS_WAMR_LIBC_WASI"
           - "CONFIG_INTERPRETERS_WAMR_AOT CONFIG_INTERPRETERS_WAMR_FAST CONFIG_INTERPRETERS_WAMR_LIBC_BUILTIN"
           - "CONFIG_INTERPRETERS_WAMR_AOT CONFIG_INTERPRETERS_WAMR_CLASSIC"
-          - "CONFIG_INTERPRETERS_WAMR_AOT CONFIG_INTERPRETERS_WAMR_CLASSIC CONFIG_INTERPRETERS_WAMR_LIBC_WASI"
           - "CONFIG_INTERPRETERS_WAMR_AOT CONFIG_INTERPRETERS_WAMR_CLASSIC CONFIG_INTERPRETERS_WAMR_LIBC_WASI"
 
     steps:
@@ -123,7 +127,7 @@ jobs:
 
       - name: Build
         working-directory: nuttx
-        run: make -j$(nproc) EXTRAFLAGS=-Werror
+        run: make -j"$(nproc)" EXTRAFLAGS=-Werror
 
       - name: Checkout Bloaty
         uses: actions/checkout@v7.0.0
