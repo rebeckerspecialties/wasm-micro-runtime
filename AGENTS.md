@@ -62,17 +62,12 @@ job log + comparing the same-named job on upstream `main`. **Method that worked:
 
 ## CI state & gates
 
-- **macOS: fully green (128/0). ubuntu: green except 3 `test aot` jobs** —
-  one shared `align.wast` "stack size does not match block type": `wamrc`
-  (WASM_ENABLE_WAMR_COMPILER build, GC=1) rejects a module the interpreter
-  accepts. **It is NOT a loader-code bug** — `wasm_loader.c` is 26 lines from
-  upstream (component params + `is_load_from_file_buf` string/data flag, NOT
-  stack validation), `check_block_stack` is byte-identical, and a GC-enabled
-  interpreter accepts all align modules. It only manifests under the full wamrc
-  build (needs WAMR's PINNED LLVM via `wamr-compiler/build_llvm.py` to repro —
-  homebrew LLVM is too new). Green upstream → an airbus-base wamrc-config bug;
-  report to airbus. Accepted/deferred (the App-Store app is interpreter-only,
-  never uses AOT).
+- **June 18 head: 454 passed, 4 failed, 1 cancelled.** Three failing AOT jobs
+  share the `align.wast` "stack size does not match block type" failure. The
+  X86_32 unit job is missing generated WASIp2 component fixtures, and the
+  X86_64 unit job was cancelled after the canonical UDP server test ran for six
+  hours. macOS, Windows, SGX, Zephyr, NuttX, and coding-guideline jobs passed.
+  Treat these as branch CI debt, not as infrastructure failures.
 - **Gates**: `compilation` workflows (`-Werror`), `Coding Guidelines`
   (`ci/coding_guidelines_check.py` runs `git-clang-format-14 --diff` — only
   CHANGED lines, so pre-existing violations don't count; format with
@@ -100,6 +95,39 @@ Gotchas: the `darwin` platform CMakeLists does NOT default COMPONENT_MODEL on
 rejected by `build-scripts/unsupported_combination.cmake` — use FAST_INTERP
 with SIMD, or disable SIMD for classic. The component model requires an
 interpreter (calls `wasm_instantiate`); pure AOT-only + component can't link.
+
+## App Store core-wasm embedding profile
+
+CapsHost is core wasm with custom preview2-style imports. It is not component
+execution, so its first WAMR build keeps `WAMR_BUILD_COMPONENT_MODEL`,
+`WAMR_BUILD_LIBC_WASI`, and `WAMR_BUILD_LIBC_BUILTIN` off. The production shape
+is a static fast-interpreter archive with multi-module, SIMD/relaxed-SIMD,
+legacy-EH parsing, custom names, and call stacks enabled; all AOT/JIT/compiler
+paths stay off. Enable `WAMR_BUILD_THREAD_MGR=1` solely so asynchronous
+termination is observed inside pure-Wasm loops; keep guest pthreads, WASI
+threads, and shared memory disabled.
+
+Set `WAMR_DISABLE_HW_BOUND_CHECK=1` on every Apple target. This keeps software
+linear-memory checks while avoiding WAMR's process-global SIGSEGV/SIGBUS
+handlers; `sigaltstack` is unavailable on tvOS/watchOS. Non-executable macOS
+mappings must not carry `MAP_JIT`, so this profile does not need the hardened
+runtime JIT entitlement. Also set `WAMR_DISABLE_WAKEUP_BLOCKING_OP=1`; CapsHost
+owns cancellation/wakeup for its native asynchronous imports.
+
+`.github/workflows/apple_app_store_interpreter.yml` cross-builds that exact
+archive for macOS arm64, iOS arm64, tvOS arm64, watchOS arm64_32, and visionOS
+arm64 under `-Werror`. It rejects AOT/JIT/compiler objects and runs a hardened
+macOS embedding smoke that covers runtime initialization, a native import with
+an attachment, module load/instantiate, an exported function call, and
+asynchronous termination of an infinite guest loop.
+
+WAMR's multi-module reader and module registry are process-global and keyed only
+by logical module name. Until WAMR gains scoped resolver contexts and graph
+teardown, use one serialized WAMR session per active guest root: retain every
+root/worklet wasm buffer, load all worklets from the same immutable namespace,
+join/deinstantiate them before `wasm_runtime_destroy()`, and reject a logical
+dependency name that maps to different bytes. Put host state on explicit exec
+environment user data; submodule instance custom data is not inherited.
 
 ## Constraints
 

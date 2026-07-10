@@ -7,38 +7,34 @@
 
 #include <stdlib.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if !defined(__APPLE__)
 #include <sys/random.h>
+#endif
 #include <pthread.h>
 #include "wasm_export.h"
 
 #if defined(__APPLE__)
 /*
  * Apple platforms (macOS/iOS/tvOS/watchOS/visionOS) do not provide the Linux
- * getrandom() syscall. They do provide getentropy() (declared in
- * <sys/random.h>), which fills at most 256 bytes per call and returns 0 on
- * success or -1 (with errno set) on failure. Wrap it in a getrandom()-style
- * shim so the call sites below keep their ssize_t/loop semantics unchanged.
+ * getrandom() syscall. arc4random_buf() is available across Apple's supported
+ * SDKs and provides cryptographically secure random bytes without an extra
+ * framework dependency. Wrap it in a getrandom()-style shim so the call sites
+ * below keep their ssize_t/loop semantics unchanged.
  */
 static ssize_t
 getrandom(void *buf, size_t buflen, unsigned int flags)
 {
-    size_t offset = 0;
+    size_t chunk = buflen;
 
     (void)flags;
-    while (offset < buflen) {
-        size_t chunk = buflen - offset;
-        if (chunk > 256) {
-            chunk = 256;
-        }
-        if (getentropy((uint8_t *)buf + offset, chunk) != 0) {
-            /* errno is set by getentropy(); return -1 like getrandom(). */
-            return -1;
-        }
-        offset += chunk;
+    if (chunk > SSIZE_MAX) {
+        chunk = SSIZE_MAX;
     }
-    return (ssize_t)offset;
+    arc4random_buf(buf, chunk);
+    return (ssize_t)chunk;
 }
 #endif
 

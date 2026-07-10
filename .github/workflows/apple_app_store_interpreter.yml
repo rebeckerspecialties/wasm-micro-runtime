@@ -1,0 +1,130 @@
+# Copyright (C) 2026 Matt Hargett. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+name: Apple App Store interpreter
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+    paths:
+      - ".github/workflows/apple_app_store_interpreter.yml"
+      - "build-scripts/**"
+      - "core/**"
+      - "!core/deps/**"
+      - "product-mini/platforms/darwin/**"
+      - "tests/apple-app-store-interpreter/**"
+  push:
+    branches:
+      - main
+      - "dev/**"
+    paths:
+      - ".github/workflows/apple_app_store_interpreter.yml"
+      - "build-scripts/**"
+      - "core/**"
+      - "!core/deps/**"
+      - "product-mini/platforms/darwin/**"
+      - "tests/apple-app-store-interpreter/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build_static_interpreter:
+    name: ${{ matrix.platform }} static interpreter
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS
+            system_name: Darwin
+            sdk: macosx
+            architecture: arm64
+          - platform: iOS
+            system_name: iOS
+            sdk: iphoneos
+            architecture: arm64
+          - platform: tvOS
+            system_name: tvOS
+            sdk: appletvos
+            architecture: arm64
+          - platform: watchOS
+            system_name: watchOS
+            sdk: watchos
+            architecture: arm64_32
+          - platform: visionOS
+            system_name: visionOS
+            sdk: xros
+            architecture: arm64
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Build static interpreter archive
+        run: |
+          cmake \
+            -S product-mini/platforms/darwin \
+            -B "build/apple-${{ matrix.sdk }}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-Werror" \
+            -DCMAKE_SYSTEM_NAME="${{ matrix.system_name }}" \
+            -DCMAKE_OSX_SYSROOT="${{ matrix.sdk }}" \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.architecture }}" \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DWAMR_BUILD_TARGET=AARCH64 \
+            -DWAMR_BUILD_INTERP=1 \
+            -DWAMR_BUILD_FAST_INTERP=1 \
+            -DWAMR_BUILD_AOT=0 \
+            -DWAMR_BUILD_JIT=0 \
+            -DWAMR_BUILD_FAST_JIT=0 \
+            -DWAMR_BUILD_WAMR_COMPILER=0 \
+            -DWAMR_BUILD_COMPONENT_MODEL=0 \
+            -DWAMR_BUILD_LIBC_WASI=0 \
+            -DWAMR_BUILD_LIBC_BUILTIN=0 \
+            -DWAMR_BUILD_MULTI_MODULE=1 \
+            -DWAMR_BUILD_THREAD_MGR=1 \
+            -DWAMR_BUILD_SHARED_MEMORY=0 \
+            -DWAMR_BUILD_LIB_PTHREAD=0 \
+            -DWAMR_BUILD_LIB_WASI_THREADS=0 \
+            -DWAMR_BUILD_SIMD=1 \
+            -DWAMR_BUILD_RELAXED_SIMD=1 \
+            -DWAMR_BUILD_EXCE_HANDLING=1 \
+            -DWAMR_BUILD_REF_TYPES=1 \
+            -DWAMR_BUILD_CUSTOM_NAME_SECTION=1 \
+            -DWAMR_BUILD_DUMP_CALL_STACK=1 \
+            -DWAMR_DISABLE_HW_BOUND_CHECK=1 \
+            -DWAMR_DISABLE_WAKEUP_BLOCKING_OP=1
+          cmake --build "build/apple-${{ matrix.sdk }}" \
+            --target vmlib --config Release --parallel 4
+
+      - name: Verify archive shape
+        run: |
+          library="build/apple-${{ matrix.sdk }}/libiwasm.a"
+          lipo -info "$library" | grep -F \
+            "architecture: ${{ matrix.architecture }}"
+          if ar -t "$library" | grep -Eiq '(^|/)(aot|jit|compilation)'; then
+            echo "Unexpected AOT/JIT/compiler object in $library" >&2
+            ar -t "$library" | grep -Ei '(^|/)(aot|jit|compilation)' >&2
+            exit 1
+          fi
+
+      - name: Run hardened-runtime embedding smoke
+        if: matrix.platform == 'macOS'
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror \
+            -I core/iwasm/include \
+            tests/apple-app-store-interpreter/smoke.c \
+            "build/apple-${{ matrix.sdk }}/libiwasm.a" \
+            -lpthread -lm \
+            -o "build/apple-${{ matrix.sdk }}/embed-smoke"
+          codesign --force --sign - --options runtime \
+            "build/apple-${{ matrix.sdk }}/embed-smoke"
+          "build/apple-${{ matrix.sdk }}/embed-smoke"
