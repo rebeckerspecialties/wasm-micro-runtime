@@ -95,7 +95,10 @@ iwasm_options_list=(
     # +llvm jit
     "-DWAMR_BUILD_JIT=1"
     #
-    "-DWAMR_BUILD_TARGET=X86_32"
+    # The Preview 2 native-call bridge is 64-bit-only. Keep the X86_32 build in
+    # CodeQL for the core runtime, but do not claim unsupported component/AOT
+    # coverage (whose instance-layout assertions are 64-bit-specific).
+    "-DWAMR_BUILD_TARGET=X86_32 -DWAMR_BUILD_COMPONENT_MODEL=0"
     #
     # libraries
     "-DWAMR_BUILD_LIBC_BUILTIN=0 -DWAMR_BUILD_LIBC_UVWASI=1 -DWAMR_BUILD_LIBC_EMCC=1"

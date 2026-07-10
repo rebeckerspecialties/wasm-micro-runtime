@@ -230,7 +230,7 @@ jobs:
           # A hosted Zen 4 runner can select AVX-512 instructions that the SGX
           # execution environment does not expose. Use the same non-AVX-512
           # SIMD baseline as the x86-64 spec suite instead of the host CPU.
-          ./wamrc -sgx --cpu=skylake -o ./file.aot ./file.wasm
+          ./wamrc -sgx --target=x86_64 --cpu=skylake -o ./file.aot ./file.wasm
           ./iwasm --dir=. ./file.aot
         working-directory: product-mini/platforms/${{ matrix.platform }}/enclave-sample
 
