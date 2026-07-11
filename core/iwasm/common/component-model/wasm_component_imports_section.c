@@ -12,7 +12,9 @@
 #include "wasm_runtime_common.h"
 #include "wasm_export.h"
 #include <stdio.h>
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
 #include "../../libraries/libc-wasi-p2/libc_wasi_p2_wrapper.h"
+#endif
 
 // Section 10: imports section
 bool
@@ -344,6 +346,7 @@ wasm_resolve_core_imports(WASMInstExpr *expression, WASMModule *target,
     return true;
 }
 
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
 bool
 wasm_resolve_imports_WASI(WASMComponentImportSection *import_section,
                           WASMComponentInstance *comp_instance, char *error_buf,
@@ -518,6 +521,7 @@ wasm_resolve_imports_WASI(WASMComponentImportSection *import_section,
     comp_instance->defined_instances_count++;
     return true;
 }
+#endif
 
 bool
 wasm_resolve_imports(WASMComponentImportSection *import_section,

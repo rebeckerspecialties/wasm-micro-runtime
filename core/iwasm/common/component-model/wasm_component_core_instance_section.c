@@ -778,19 +778,9 @@ wasm_resolve_core_instance(WASMComponentCoreInstSection *instance_section,
                 [comp_instance->defined_core_instances_count] = core_instance;
             comp_instance->defined_core_instances_count++;
 
-            WASMComponentInstance *root_comp_inst = comp_instance;
-            while (root_comp_inst->parent)
-                root_comp_inst = root_comp_inst->parent;
-            WASMComponent *root_comp = root_comp_inst->component;
-
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
             wasm_runtime_set_wasi_ctx((WASMModuleInstanceCommon *)core_instance,
                                       comp_instance->wasi_ctx);
-            WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(
-                (WASMModuleInstanceCommon *)core_instance);
-            if (wasi_ctx) {
-                wasi_ctx->wasi_options = root_comp->wasi_args.wasi_options;
-            }
 #endif
             goto done_imports;
         fail_imports:

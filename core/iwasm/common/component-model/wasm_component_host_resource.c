@@ -68,8 +68,7 @@ bool
 instantiate_host_resource_table()
 {
     if (g_host_resource_table != NULL) {
-        LOG_WARNING("Global host resource table already initialized\n");
-        return false;
+        return true;
     }
 
     // Create HashMap: size, with lock for thread safety, hash_func, key_equal,

@@ -1730,7 +1730,7 @@ void
 wasm_runtime_instantiation_args_set_defaults(struct InstantiationArgs2 *args)
 {
     memset(args, 0, sizeof(*args));
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     wasi_args_set_defaults(&args->wasi);
 #endif
 }
@@ -1806,7 +1806,7 @@ wasm_runtime_instantiation_args_set_custom_data(struct InstantiationArgs2 *p,
     p->custom_data = custom_data;
 }
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 void
 wasm_runtime_instantiation_args_set_wasi_arg(struct InstantiationArgs2 *p,
                                              char *argv[], int argc)
@@ -1882,7 +1882,7 @@ wasm_runtime_instantiation_args_set_wasi_ns_lookup_pool(
     wasi_args->ns_lookup_count = ns_lookup_pool_size;
     wasi_args->set_by_user = true;
 }
-#endif /* WASM_ENABLE_LIBC_WASI != 0 */
+#endif /* WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0 */
 
 WASMModuleInstanceCommon *
 wasm_runtime_instantiate_ex2(WASMModuleCommon *module,
@@ -3631,7 +3631,7 @@ wasm_runtime_module_dup_data(WASMModuleInstanceCommon *module_inst,
     return 0;
 }
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 
 void
 wasi_args_set_defaults(WASIArguments *args)
@@ -4396,7 +4396,7 @@ wasm_runtime_get_wasi_exit_code(WASMModuleInstanceCommon *module_inst)
 #endif
     return wasi_ctx->exit_code;
 }
-#endif /* end of WASM_ENABLE_LIBC_WASI */
+#endif /* WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0 */
 
 WASMModuleCommon *
 wasm_exec_env_get_module(WASMExecEnv *exec_env)

@@ -300,7 +300,7 @@ typedef struct AOTModule {
     /* is indirect mode or not */
     bool is_indirect_mode;
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIArguments wasi_args;
     bool import_wasi_api;
 #endif

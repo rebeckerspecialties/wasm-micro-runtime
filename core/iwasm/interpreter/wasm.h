@@ -13,7 +13,8 @@
 #include "gc_export.h"
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0 && WASM_ENABLE_COMPONENT_MODEL != 0
+#if (WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0) \
+    && WASM_ENABLE_COMPONENT_MODEL != 0
 typedef struct libc_wasi_options_t libc_wasi_options_t;
 #endif
 
@@ -838,7 +839,7 @@ typedef struct BlockAddr {
     uint8 *end_addr;
 } BlockAddr;
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 typedef struct WASIArguments {
     const char **dir_list;
     uint32 dir_count;
@@ -1018,7 +1019,7 @@ struct WASMModule {
     bh_list *br_table_cache_list;
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIArguments wasi_args;
     bool import_wasi_api;
 #endif

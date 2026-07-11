@@ -14,7 +14,8 @@ include_directories(${PLATFORM_SHARED_DIR}/../include)
 file (GLOB_RECURSE source_all ${PLATFORM_SHARED_DIR}/*.c
 			      ${PLATFORM_SHARED_DIR}/*.cpp)
 
-if (NOT WAMR_BUILD_LIBC_WASI EQUAL 1)
+if (NOT WAMR_BUILD_LIBC_WASI EQUAL 1
+    AND NOT WAMR_BUILD_LIBC_WASI_P2 EQUAL 1)
     list(REMOVE_ITEM source_all ${PLATFORM_SHARED_DIR}/win_file.c)
 elseif (WAMR_BUILD_LIBC_UVWASI EQUAL 1)
     # uvwasi doesn't need to compile win_file.c

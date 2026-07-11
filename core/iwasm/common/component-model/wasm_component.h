@@ -1558,7 +1558,7 @@ typedef struct WASMComponent {
     WASMHeader header;
     WASMComponentSection *sections;
     uint32_t section_count;
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIArguments wasi_args;
     bool import_wasi_api;
 #endif

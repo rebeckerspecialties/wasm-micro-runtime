@@ -16,11 +16,12 @@
 #include "gc/gc_object.h"
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0 && WASM_ENABLE_COMPONENT_MODEL != 0
+#if (WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0) \
+    && WASM_ENABLE_COMPONENT_MODEL != 0
 typedef struct libc_wasi_options_t libc_wasi_options_t;
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 #if WASM_ENABLE_UVWASI == 0
 #include "posix.h"
 #else
@@ -557,7 +558,7 @@ typedef struct WASMModuleInstMemConsumption {
     uint32 exports_size;
 } WASMModuleInstMemConsumption;
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 #if WASM_ENABLE_UVWASI == 0
 typedef struct WASIContext {
     struct fd_table *curfds;
@@ -630,7 +631,7 @@ wasm_runtime_get_exec_env_tls(void);
 struct InstantiationArgs2 {
     InstantiationArgs v1;
     void *custom_data;
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIArguments wasi;
 #endif
 };
@@ -1160,7 +1161,7 @@ wasm_exec_env_set_aux_stack(WASMExecEnv *exec_env, uint64 start_offset,
                             uint32 size);
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_set_wasi_args_ex(WASMModuleCommon *module, const char *dir_list[],
                               uint32 dir_count, const char *map_dir_list[],
@@ -1228,7 +1229,7 @@ WASM_RUNTIME_API_EXTERN void
 wasm_runtime_set_wasi_ns_lookup_pool(wasm_module_t module,
                                      const char *ns_lookup_pool[],
                                      uint32 ns_lookup_pool_size);
-#endif /* end of WASM_ENABLE_LIBC_WASI */
+#endif /* WASM_ENABLE_LIBC_WASI || WASM_ENABLE_LIBC_WASI_P2 */
 
 #if WASM_ENABLE_GC != 0
 void

@@ -670,7 +670,7 @@ execute_component_main(WASMComponentInstance *component_inst, int32 argc,
     uint32 *argv_offsets = NULL, module_type = 0;
     bool ret = false, is_import_func = true, is_memory64 = false;
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     /* In wasi mode, we should call the function named "_start"
        which initializes the wasi environment and then calls
        the actual main function. Directly calling main function
@@ -699,7 +699,7 @@ execute_component_main(WASMComponentInstance *component_inst, int32 argc,
         }
         return ret;
     }
-#endif /* end of WASM_ENABLE_LIBC_WASI */
+#endif /* end of WASM_ENABLE_LIBC_WASI_P2 */
 
     func = wasm_component_lookup_function(
         component_inst,
