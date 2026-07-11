@@ -11,7 +11,15 @@ file_names=("main")
 WORKDIR="$PWD"
 WAMRC_ROOT_DIR="${WORKDIR}/../../../wamr-compiler"
 WAMRC="${WAMRC_ROOT_DIR}/build/wamrc"
-WAST2WASM="/opt/wabt/bin/wat2wasm"
+WAST2WASM="${WAST2WASM:-/opt/wabt/bin/wat2wasm}"
+if [ ! -x "$WAST2WASM" ]; then
+    WAST2WASM="$(command -v wat2wasm || true)"
+fi
+
+if [ ! -x "$WAST2WASM" ]; then
+    echo "wat2wasm not found; install WABT or set WAST2WASM" >&2
+    exit 1
+fi
 
 # build wamrc if not exist
 if [ ! -s "$WAMRC" ]; then
@@ -28,4 +36,3 @@ for file_name in "${file_names[@]}"; do
     # compile wasm to aot
     $WAMRC -o "wasm-apps/${file_name}.aot" "wasm-apps/${file_name}.wasm"
 done
-

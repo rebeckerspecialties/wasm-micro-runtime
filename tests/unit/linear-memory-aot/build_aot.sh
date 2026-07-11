@@ -14,7 +14,10 @@ file_names=("mem_grow_out_of_bounds_01" "mem_grow_out_of_bounds_02"
 WORKDIR="$PWD"
 WAMRC_ROOT_DIR="${WORKDIR}/../../../wamr-compiler"
 WAMRC="${WAMRC_ROOT_DIR}/build/wamrc"
-WAST2WASM="/opt/wabt/bin/wat2wasm"
+WAST2WASM="${WAST2WASM:-/opt/wabt/bin/wat2wasm}"
+if [ ! -x "$WAST2WASM" ]; then
+    WAST2WASM="$(command -v wat2wasm || true)"
+fi
 
 # build wamrc if not exist
 if [ ! -s "$WAMRC" ]; then
@@ -27,8 +30,9 @@ if [ ! -s "$WAMRC" ]; then
 fi
 
 # error if not exist
-if [ ! -s "$WAST2WASM" ]; then
-    echo "please install wabt first" && exit -1
+if [ ! -x "$WAST2WASM" ]; then
+    echo "wat2wasm not found; install WABT or set WAST2WASM" >&2
+    exit 1
 fi
 
 # Detect host architecture
