@@ -227,7 +227,10 @@ jobs:
         if: matrix.iwasm_make_options_run_mode == '$AOT_BUILD_OPTIONS'
         run: |
           source /opt/intel/sgxsdk/environment
-          ./wamrc -sgx -o ./file.aot ./file.wasm
+          # Hosted Zen 4 runners may select AVX-512 instructions that the SGX
+          # execution environment does not expose. Use the same non-AVX-512
+          # SIMD baseline as the x86-64 spec suite instead of the host CPU.
+          ./wamrc -sgx --target=x86_64 --cpu=skylake -o ./file.aot ./file.wasm
           ./iwasm --dir=. ./file.aot
         working-directory: product-mini/platforms/${{ matrix.platform }}/enclave-sample
 
