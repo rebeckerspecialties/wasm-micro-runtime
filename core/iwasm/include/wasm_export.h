@@ -600,7 +600,7 @@ WASM_RUNTIME_API_EXTERN void
 wasm_runtime_set_module_reader(const module_reader reader,
                                const module_destroyer destroyer);
 /**
- * Give the "module" a name "module_name".
+ * Give the "module" a copied name "module_name".
  * Can not assign a new name to a module if it already has a name
  *
  * @param module_name indicate a name
@@ -613,6 +613,29 @@ wasm_runtime_set_module_reader(const module_reader reader,
 WASM_RUNTIME_API_EXTERN bool
 wasm_runtime_register_module(const char *module_name, wasm_module_t module,
                              char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Try to remove a module from the multi-module registry without unloading it.
+ *
+ * A registered module is owned by the runtime, so wasm_runtime_unload() does
+ * not release it.  After this call removes the module from the registry, the
+ * caller owns the module again and should release it with
+ * wasm_runtime_unload().  Unload parent modules before dependencies that they
+ * reference.
+ *
+ * A dependency loaded by the configured module_reader remains runtime-owned
+ * and registered so its backing buffer can be released by the configured
+ * module_destroyer after the module is unloaded during wasm_runtime_destroy().
+ * Calling this function for NULL or an unregistered module succeeds without
+ * taking any action.
+ *
+ * @param module the module to remove from the registry
+ *
+ * @return true if the module is no longer registered, false if it remains
+ *         registered because it owns a module_reader buffer
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_runtime_unregister_module(wasm_module_t module);
 
 /**
  * Check if there is already a loaded module named module_name in the
@@ -679,6 +702,11 @@ wasm_runtime_load_from_sections(wasm_section_list_t section_list, bool is_aot,
 
 /**
  * Unload a WASM module.
+ *
+ * When the multi-module feature is enabled, this function leaves registered
+ * modules intact because the runtime owns them.  Call
+ * wasm_runtime_unregister_module() first to transfer ownership back to the
+ * caller, and unload the module immediately only when it returns true.
  *
  * @param module the module to be unloaded
  */

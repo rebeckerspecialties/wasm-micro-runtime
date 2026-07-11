@@ -586,7 +586,7 @@ typedef struct WASIContext {
 #if WASM_ENABLE_MULTI_MODULE != 0
 typedef struct WASMRegisteredModule {
     bh_list_link l;
-    /* point to a string pool */
+    /* Owned in the global registry, borrowed in a parent's import list. */
     const char *module_name;
     WASMModuleCommon *module;
     /* to store the original module file buffer address */
@@ -1098,8 +1098,8 @@ wasm_runtime_register_module_internal(const char *module_name,
                                       uint32 orig_file_buf_size,
                                       char *error_buf, uint32 error_buf_size);
 
-void
-wasm_runtime_unregister_module(const WASMModuleCommon *module);
+bool
+wasm_runtime_unregister_module(WASMModuleCommon *module);
 
 WASMModuleCommon *
 wasm_runtime_find_module_registered(const char *module_name);
