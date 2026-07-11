@@ -1611,6 +1611,10 @@ wasm_runtime_load_from_sections(WASMSection *section_list, bool is_aot,
 void
 wasm_runtime_unload(WASMModuleCommon *module)
 {
+    if (!module) {
+        return;
+    }
+
 #if WASM_ENABLE_MULTI_MODULE != 0
     /**
      * since we will unload and free all module when runtime_destroy()

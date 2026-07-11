@@ -39,6 +39,11 @@ class TEST_SUITE_NAME : public testing::Test
     WAMRRuntimeRAII<512 * 1024> runtime;
 };
 
+TEST_F(TEST_SUITE_NAME, unload_null_module)
+{
+    wasm_runtime_unload(nullptr);
+}
+
 struct ret_env {
     wasm_exec_env_t exec_env;
     wasm_module_t wasm_module;
