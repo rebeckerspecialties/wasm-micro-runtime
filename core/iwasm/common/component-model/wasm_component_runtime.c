@@ -1182,6 +1182,13 @@ wasm_component_instance_allocate(WASMComponentIndexCount *index_count,
         return NULL;
     }
     memset(comp_instance, 0, total_size);
+    wasm_runtime_instantiation_args_set_defaults(
+        &comp_instance->instantiation_args);
+    wasm_runtime_instantiation_args_set_default_stack_size(
+        &comp_instance->instantiation_args, COMPONENT_DEFAULT_STACK_SIZE);
+    wasm_runtime_instantiation_args_set_host_managed_heap_size(
+        &comp_instance->instantiation_args, COMPONENT_DEFAULT_HEAP_SIZE);
+    comp_instance->default_wasm_stack_size = COMPONENT_DEFAULT_STACK_SIZE;
     // The types defined in this component will be stored in the memory region
     // right after the component instance, similar to Wasm Module implementation
 
@@ -1390,14 +1397,6 @@ wasm_component_instantiate_internal_ex(
     }
     if (args) {
         comp_instance->instantiation_args = *args;
-    }
-    else {
-        wasm_runtime_instantiation_args_set_defaults(
-            &comp_instance->instantiation_args);
-        wasm_runtime_instantiation_args_set_default_stack_size(
-            &comp_instance->instantiation_args, COMPONENT_DEFAULT_STACK_SIZE);
-        wasm_runtime_instantiation_args_set_host_managed_heap_size(
-            &comp_instance->instantiation_args, COMPONENT_DEFAULT_HEAP_SIZE);
     }
     comp_instance->default_wasm_stack_size =
         comp_instance->instantiation_args.v1.default_stack_size;

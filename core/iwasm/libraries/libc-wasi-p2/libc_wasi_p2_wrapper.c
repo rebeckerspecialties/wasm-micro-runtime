@@ -276,7 +276,7 @@ static NativeSymbol sockets_ip_name_lookup_symbols[] = {
         "(ii)"),
     REG_WASI_P2_FUNCTION(
         "[method]resolve-address-stream.subscribe",
-        wasi_sockets_ip_name_lookup_resolve_address_stream_subscribe, "(i)"),
+        wasi_sockets_ip_name_lookup_resolve_address_stream_subscribe, "(i)i"),
 };
 
 static NativeSymbol sockets_tcp_create_socket_symbols[] = {

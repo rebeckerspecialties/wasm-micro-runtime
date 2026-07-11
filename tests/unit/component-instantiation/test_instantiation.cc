@@ -639,6 +639,8 @@ TEST_F(ComponentInstantiationTest, TestResolveCoreInstance)
   WASMComponent *comp_1 = component->sections[3].parsed.component;
   ASSERT_EQ(comp_1->sections[2].id, 1);
   WASMModule *core_module_0 = (WASMModule *)component->sections[3].parsed.component->sections[2].parsed.core_module->module_handle;
+  dummy_core_func_2.u.func->func_type =
+      core_module_0->import_functions[0].u.function.func_type;
 
   ASSERT_EQ(comp_1->sections[5].id, 2);
   instance_section = comp_1->sections[5].parsed.core_instance_section;
@@ -698,8 +700,22 @@ TEST_F(ComponentInstantiationTest, TestResolveCoreInstance)
   ASSERT_EQ(comp_instance_2->core_module_instances[0]->export_func_count , 1);
   ASSERT_EQ(comp_instance_2->core_module_instances[0]->export_functions[0].function , &dummy_core_func_2);
   ASSERT_TRUE(comp_instance_2->core_module_instances[1]->e->functions[0].is_import_func);
-  ASSERT_EQ(*(comp_instance_2->core_module_instances[1]->e->functions[0].local_types), 8);
-  ASSERT_EQ(*(comp_instance_2->core_module_instances[1]->e->functions[0].local_offsets), 16);
+  ASSERT_EQ(comp_instance_2->core_module_instances[1]
+                ->e->functions[0]
+                .import_func_inst,
+            &dummy_core_func_2);
+  ASSERT_EQ(comp_instance_2->core_module_instances[1]
+                ->e->functions[0]
+                .u.func_import->func_type,
+            core_module_0->import_functions[0].u.function.func_type);
+  ASSERT_EQ(*(comp_instance_2->core_module_instances[1]
+                  ->e->functions[0]
+                  .import_func_inst->local_types),
+            8);
+  ASSERT_EQ(*(comp_instance_2->core_module_instances[1]
+                  ->e->functions[0]
+                  .import_func_inst->local_offsets),
+            16);
 
   wasm_component_deinstantiate(comp_instance);
 
@@ -840,7 +856,14 @@ TEST_F(ComponentInstantiationTest, TestInstantiateInternal)
   ASSERT_EQ(comp_instance->component_instances[2]->core_module_instances[0]->export_table_count, 1);
 
   // Test core module instantiation (test imports are resolved properly)
-  ASSERT_EQ(comp_instance->component_instances[2]->core_module_instances[2]->e->functions[0].u.func, comp_instance->component_instances[2]->core_functions[0]->u.func );
+  ASSERT_EQ(comp_instance->component_instances[2]
+                ->core_module_instances[2]
+                ->e->functions[0]
+                .u.func_import->func_type,
+            comp_instance->component_instances[2]
+                ->core_module_instances[2]
+                ->module->import_functions[0]
+                .u.function.func_type);
   ASSERT_EQ(comp_instance->component_instances[2]->core_module_instances[2]->e->functions[0].import_func_inst, comp_instance->component_instances[2]->core_functions[0]);
   ASSERT_EQ(comp_instance->component_instances[2]->core_module_instances[2]->e->functions[0].import_module_inst, comp_instance->component_instances[2]->core_functions[0]->module_instance);
 
@@ -1038,44 +1061,70 @@ TEST_F(ComponentInstantiationTest, TestTypesInstantiation)
   // Test resource type instantiation
   ASSERT_EQ(comp_instance->types[2]->type_specific.instance->types[2]->type, COMPONENT_VAL_TYPE_RESOURCE_SYNC);
   ASSERT_FALSE(strcmp(comp_instance->types[2]->type_specific.instance->types[2]->type_specific.resource->name , "output-stream"));
-  ASSERT_FALSE(strcmp(comp_instance->types[2]->type_specific.instance->types[2]->type_specific.resource->interface_name, "wasi:io/streams@0.2.3"));
+  ASSERT_EQ(comp_instance->types[2]
+                ->type_specific.instance->types[2]
+                ->type_specific.resource->interface_name,
+            nullptr);
+  ASSERT_FALSE(comp_instance->types[2]
+                   ->type_specific.instance->types[2]
+                   ->type_specific.resource->is_host);
   ASSERT_TRUE(comp_instance->types[2]->type_specific.instance->types[2]->type_specific.resource->drop_method);
-
-
+  ASSERT_FALSE(strcmp(comp_instance->component_instances[3]
+                          ->types[0]
+                          ->type_specific.resource->interface_name,
+                      "wasi:io/streams@0.2.3"));
+  ASSERT_TRUE(comp_instance->component_instances[3]
+                  ->types[0]
+                  ->type_specific.resource->is_host);
 }
 
 TEST_F(ComponentInstantiationTest, TestInstantiateSmokeTest)
 {
-  std::vector<std::string> component_files = {
-    "complex.wasm",
-    "hello_wasi.wasm",
-    "hello_wasip1_hacked.component.wasm",
-    "logging_service.component.wasm",
-    "processor_and_logging_merged_wac_plug.wasm",
-    "surface_and_geometry_0_2_0.wasm",
-    "surface_and_geometry.wasm",
-    "wasi_server.wasm",
-    "wasip2_tcp_server.wasm",
-    "add.wasm",
-    "sampletypes.wasm"
-  };
+    std::vector<std::string> component_files = {
+        "complex.wasm",
+        "hello_wasi.wasm",
+        "logging_service.component.wasm",
+        "processor_and_logging_merged_wac_plug.wasm",
+        "surface_and_geometry_0_2_0.wasm",
+        "surface_and_geometry.wasm",
+        "wasi_server.wasm",
+        "wasip2_tcp_server.wasm",
+        "add.wasm",
+        "sampletypes.wasm"
+    };
 
-  WASMComponent *component;
-  WASMComponentInstance *comp_instance;
+    WASMComponent *component;
+    WASMComponentInstance *comp_instance;
 
-  for (uint32 i = 0; i < component_files.size(); i++)
-  {
-    const char *file_name = component_files[i].c_str();
-    component = load_component_from_candidates(file_name);
-    ASSERT_NE(component, nullptr) << "Failed to load/parse component from candidates: "<< file_name;
+    for (uint32 i = 0; i < component_files.size(); i++) {
+        const char *file_name = component_files[i].c_str();
+        component = load_component_from_candidates(file_name);
+        ASSERT_NE(component, nullptr)
+            << "Failed to load/parse component from candidates: " << file_name;
 
-    // Test component is instantiated
-    printf("Instantiate %s\n", file_name);
-    comp_instance = wasm_component_instantiate_internal(component, NULL, error_buf, sizeof(error_buf));
-    ASSERT_NE(comp_instance, nullptr) << "Failed to instantiate " << file_name;
-    wasm_component_deinstantiate(comp_instance);
+        // Test component is instantiated
+        printf("Instantiate %s\n", file_name);
+        comp_instance = wasm_component_instantiate_internal(
+            component, NULL, error_buf, sizeof(error_buf));
+        ASSERT_NE(comp_instance, nullptr)
+            << "Failed to instantiate " << file_name;
+        wasm_component_deinstantiate(comp_instance);
+    }
+}
 
-  }
+TEST_F(ComponentInstantiationTest, TestRejectMissingCoreImportArguments)
+{
+    char file_name[] = "hello_wasip1_hacked.component.wasm";
+    WASMComponent *component = load_component_from_candidates(file_name);
+    ASSERT_NE(component, nullptr)
+        << "Failed to load/parse component from candidates.";
+
+    error_buf[0] = '\0';
+    WASMComponentInstance *comp_instance = wasm_component_instantiate_internal(
+        component, NULL, error_buf, sizeof(error_buf));
+    ASSERT_EQ(comp_instance, nullptr);
+    ASSERT_STREQ(error_buf,
+                 "Import 0 of core instance not found in arguments\n");
 }
 
 TEST_F(ComponentInstantiationTest, TestInstantiateCanonFunctions)

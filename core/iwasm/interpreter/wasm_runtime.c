@@ -14,6 +14,7 @@
 #include "../common/wasm_memory.h"
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 #include "../common/component-model/wasm_component.h"
+#include "../common/component-model/wasm_component_flat.h"
 #include "../common/component-model/wasm_component_runtime.h"
 #endif
 #if WASM_ENABLE_GC != 0
@@ -87,9 +88,59 @@ validate_canon_import_type(const WASMFunctionInstance *source,
 }
 
 static bool
+validate_lower_import_type(const WASMFunctionInstance *source,
+                           const WASMFuncType *target_type,
+                           WASMComponentInstance *component_inst)
+{
+    WASMComponentCoreFuncType expected = { 0 };
+    LiftLowerContext context = { 0 };
+    bool matches = false;
+    uint32 i;
+
+    if (!source || !target_type || !component_inst
+        || !source->component_function || !source->component_function->func_type
+        || !source->canon_options) {
+        return false;
+    }
+
+    context.canonical_opts = source->canon_options;
+    context.inst = component_inst;
+    context.borrow_scope_type = BORROW_SCOPE_NONE;
+    if (!flatten_functype(&context, source->component_function->func_type,
+                          FLATTEN_CONTEXT_LOWER, &expected)) {
+        goto done;
+    }
+    if (expected.params.count != target_type->param_count
+        || expected.results.count != target_type->result_count) {
+        goto done;
+    }
+
+    for (i = 0; i < expected.params.count; i++) {
+        if (expected.params.val_types[i].tag != WASM_CORE_VALTYPE_NUM
+            || expected.params.val_types[i].type.num_type
+                   != target_type->types[i]) {
+            goto done;
+        }
+    }
+    for (i = 0; i < expected.results.count; i++) {
+        if (expected.results.val_types[i].tag != WASM_CORE_VALTYPE_NUM
+            || expected.results.val_types[i].type.num_type
+                   != target_type->types[target_type->param_count + i]) {
+            goto done;
+        }
+    }
+    matches = true;
+
+done:
+    free_core_functype(&expected);
+    return matches;
+}
+
+static bool
 validate_prelinked_imports(const WASMModule *module,
-                           const WASMCoreImports *imports, char *error_buf,
-                           uint32 error_buf_size)
+                           const WASMCoreImports *imports,
+                           WASMComponentInstance *component_inst,
+                           char *error_buf, uint32 error_buf_size)
 {
     uint32 i;
 
@@ -153,6 +204,15 @@ validate_prelinked_imports(const WASMModule *module,
                                 "native signature mismatch for component "
                                 "function import %u",
                                 i);
+                return false;
+            }
+            continue;
+        }
+        if (source->component_function) {
+            if (!validate_lower_import_type(source, target_type,
+                                            component_inst)) {
+                set_error_buf_v(error_buf, error_buf_size,
+                                "canonical lower import %u type mismatch", i);
                 return false;
             }
             continue;
@@ -1074,6 +1134,7 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
     bh_assert(table_index == table_count);
     (void)module_inst;
     return tables;
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
 fail:
 #if WASM_ENABLE_MULTI_MODULE != 0
     if (module_inst->e->table_insts_linked) {
@@ -1091,6 +1152,7 @@ fail:
 #endif
     wasm_runtime_free(tables);
     return NULL;
+#endif
 }
 
 /**
@@ -2920,8 +2982,8 @@ wasm_instantiate_internal(WASMModule *module, WASMModuleInstance *parent,
         return NULL;
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-    if (!validate_prelinked_imports(module, prelinked_imports, error_buf,
-                                    error_buf_size))
+    if (!validate_prelinked_imports(module, prelinked_imports, component_inst,
+                                    error_buf, error_buf_size))
         return NULL;
 #endif
 

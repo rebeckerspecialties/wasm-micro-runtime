@@ -53,14 +53,15 @@ bh_static_assert(offsetof(AOTModuleInstance, c_api_func_imports)
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 bh_static_assert(offsetof(AOTModuleInstance, global_table_data)
                  == 13 * sizeof(uint64) + 128 + 14 * sizeof(uint64)
-                        + sizeof(void *) + sizeof(uint64));
+                        + 3 * sizeof(uint64));
+bh_static_assert(sizeof(AOTMemoryInstance) == 128);
+bh_static_assert(offsetof(AOTTableInstance, elems) == 40);
 #else
 bh_static_assert(offsetof(AOTModuleInstance, global_table_data)
                  == 13 * sizeof(uint64) + 128 + 14 * sizeof(uint64));
-#endif
-
 bh_static_assert(sizeof(AOTMemoryInstance) == 120);
 bh_static_assert(offsetof(AOTTableInstance, elems) == 24);
+#endif
 
 bh_static_assert(offsetof(AOTModuleInstanceExtra, stack_sizes) == 0);
 bh_static_assert(offsetof(AOTModuleInstanceExtra, shared_heap_base_addr_adj)

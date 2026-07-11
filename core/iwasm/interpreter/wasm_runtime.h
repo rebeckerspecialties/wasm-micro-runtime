@@ -188,7 +188,7 @@ struct WASMMemoryInstance {
        not itself import the selected memory.  Preserve the defining instance
        so a raw component host call can expose the correct linear memory via
        its execution environment. */
-    WASMModuleInstance *module_instance;
+    DefPointer(WASMModuleInstance *, module_instance);
 #endif
 };
 
@@ -225,8 +225,8 @@ struct WASMTableInstance {
        instance for lifetime accounting and an instance-local provenance
        sidecar so a borrowed table can contain functions written by several
        different core instances without rewriting its public element data. */
-    WASMModuleInstance *module_instance;
-    WASMFunctionInstance **component_func_refs;
+    DefPointer(WASMModuleInstance *, module_instance);
+    DefPointer(WASMFunctionInstance **, component_func_refs);
 #endif
     /* Table elements */
     table_elem_type_t elems[1];
@@ -569,7 +569,7 @@ struct WASMModuleInstance {
     uint32 reserved[7];
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-    WASMComponentInstance *comp_instance;
+    DefPointer(WASMComponentInstance *, comp_instance);
     uint32 core_instance_idx;
     /* Component core imports borrow their defining instance's memories.
        These entries must never be deallocated by the importing instance. */
@@ -577,6 +577,9 @@ struct WASMModuleInstance {
     /* The same ownership rule applies to imported tables and their funcref
        provenance sidecars. */
     uint32 prelinked_import_table_count;
+    /* Keep the component extension 64-bit aligned in AOT-enabled 32-bit
+       builds, matching the fixed-width DefPointer fields above. */
+    uint32 component_fields_padding;
 #endif
 
     /*

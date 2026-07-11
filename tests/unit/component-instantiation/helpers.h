@@ -17,6 +17,10 @@ extern "C" {
 #include "wasm_component_runtime.h"
 }
 
+#ifndef HEAP_SIZE
+#define HEAP_SIZE (100 * 1024 * 1024) /* 100 MB */
+#endif
+
 // -------- helpers to inspect real components --------
 
 bool
