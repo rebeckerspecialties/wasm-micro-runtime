@@ -1700,6 +1700,10 @@ wasm_runtime_load_from_sections(WASMSection *section_list, bool is_aot,
 void
 wasm_runtime_unload(WASMModuleCommon *module)
 {
+    if (!module) {
+        return;
+    }
+
 #if WASM_ENABLE_MULTI_MODULE != 0
     /* Registered modules are owned by the runtime and released by
      * wasm_runtime_destroy().  An explicitly unregistered module is owned by
