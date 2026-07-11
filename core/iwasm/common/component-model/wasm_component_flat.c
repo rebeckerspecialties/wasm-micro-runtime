@@ -469,6 +469,8 @@ flatten_functype(LiftLowerContext *cx, WASMComponentFuncTypeInstance *ft,
             // Clean up params on failure
             if (out->params.val_types) {
                 wasm_runtime_free(out->params.val_types);
+                out->params.val_types = NULL;
+                out->params.count = 0;
             }
             set_component_exception(cx, "failed to build core results");
             return false;
@@ -515,6 +517,8 @@ flatten_functype(LiftLowerContext *cx, WASMComponentFuncTypeInstance *ft,
             // Clean up params on failure
             if (out->params.val_types) {
                 wasm_runtime_free(out->params.val_types);
+                out->params.val_types = NULL;
+                out->params.count = 0;
             }
             set_component_exception(cx, "failed to build core results");
             return false;
