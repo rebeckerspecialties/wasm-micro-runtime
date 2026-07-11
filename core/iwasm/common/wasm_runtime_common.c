@@ -1141,6 +1141,23 @@ wasm_runtime_find_module_registered_by_reference(WASMModuleCommon *module)
     return reg_module;
 }
 
+static char *
+clone_registered_module_name(const char *module_name, char *error_buf,
+                             uint32 error_buf_size)
+{
+    uint64 module_name_size = (uint64)strlen(module_name) + 1;
+    char *module_name_copy =
+        runtime_malloc(module_name_size, NULL, error_buf, error_buf_size);
+
+    if (!module_name_copy) {
+        return NULL;
+    }
+
+    bh_memcpy_s(module_name_copy, (uint32)module_name_size, module_name,
+                (uint32)module_name_size);
+    return module_name_copy;
+}
+
 bool
 wasm_runtime_register_module_internal(const char *module_name,
                                       WASMModuleCommon *module,
@@ -1172,7 +1189,14 @@ wasm_runtime_register_module_internal(const char *module_name,
         }
         else {
             /* module has empty name, reset it */
-            node->module_name = module_name;
+            if (!module_name) {
+                return true;
+            }
+            node->module_name = clone_registered_module_name(
+                module_name, error_buf, error_buf_size);
+            if (!node->module_name) {
+                return false;
+            }
             return true;
         }
     }
@@ -1185,8 +1209,14 @@ wasm_runtime_register_module_internal(const char *module_name,
         return false;
     }
 
-    /* share the string and the module */
-    node->module_name = module_name;
+    /* The global registry owns the name and module. */
+    node->module_name = NULL;
+    if (module_name
+        && !(node->module_name = clone_registered_module_name(
+                 module_name, error_buf, error_buf_size))) {
+        wasm_runtime_free(node);
+        return false;
+    }
     node->module = module;
     node->orig_file_buf = orig_file_buf;
     node->orig_file_buf_size = orig_file_buf_size;
@@ -1242,6 +1272,9 @@ wasm_runtime_unregister_module(WASMModuleCommon *module)
     /* it does not matter if it is not exist. after all, it is gone */
     if (registered_module) {
         bh_list_remove(registered_module_list, registered_module);
+        if (registered_module->module_name) {
+            wasm_runtime_free((void *)registered_module->module_name);
+        }
         wasm_runtime_free(registered_module);
     }
     os_mutex_unlock(&registered_module_list_lock);
@@ -1301,6 +1334,9 @@ wasm_runtime_destroy_registered_module_list()
             reg_module->orig_file_buf_size = 0;
         }
 
+        if (reg_module->module_name) {
+            wasm_runtime_free((void *)reg_module->module_name);
+        }
         wasm_runtime_free(reg_module);
         reg_module = next_reg_module;
     }

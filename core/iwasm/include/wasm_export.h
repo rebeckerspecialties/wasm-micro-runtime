@@ -558,7 +558,7 @@ WASM_RUNTIME_API_EXTERN void
 wasm_runtime_set_module_reader(const module_reader reader,
                                const module_destroyer destroyer);
 /**
- * Give the "module" a name "module_name".
+ * Give the "module" a copied name "module_name".
  * Can not assign a new name to a module if it already has a name
  *
  * @param module_name indicate a name
