@@ -328,8 +328,10 @@ TEST_F(ComponentExecutionTest, TestRepeatedLoadExecuteAndUnload)
         helper->component_inst = nullptr;
         helper->component_instantiated = false;
         helper->reset_component();
-        BH_FREE(helper->component_raw);
-        helper->component_raw = nullptr;
+        if (helper->component_raw) {
+            BH_FREE(helper->component_raw);
+            helper->component_raw = nullptr;
+        }
     }
 }
 
