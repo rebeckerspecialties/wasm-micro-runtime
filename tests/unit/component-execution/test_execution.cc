@@ -7,6 +7,32 @@
 #include "helpers.h"
 #include <iostream>
 #include <cmath>
+#include <cstdlib>
+
+namespace {
+bool reject_runtime_allocations = false;
+uint64_t runtime_allocation_attempts = 0;
+
+void *
+prepared_call_test_malloc(unsigned int size)
+{
+    runtime_allocation_attempts++;
+    return reject_runtime_allocations ? nullptr : std::malloc(size);
+}
+
+void *
+prepared_call_test_realloc(void *ptr, unsigned int size)
+{
+    runtime_allocation_attempts++;
+    return reject_runtime_allocations ? nullptr : std::realloc(ptr, size);
+}
+
+void
+prepared_call_test_free(void *ptr)
+{
+    std::free(ptr);
+}
+} // namespace
 
 class ComponentExecutionTest : public testing::Test
 {
@@ -72,6 +98,99 @@ TEST_F(ComponentExecutionTest, TestAddWASM)
 
     ASSERT_GT(argc1, 0U);  // Should have at least one result cell
     ASSERT_EQ(result, 7U);  // Result should be 7
+}
+
+class ComponentPreparedCallAllocationTest : public testing::Test
+{
+  public:
+    ComponentHelper helper;
+    WASMComponentPreparedCall *prepared = nullptr;
+    char error_buf[128] = {};
+
+    void SetUp() override
+    {
+        RuntimeInitArgs init_args = {};
+        init_args.mem_alloc_type = Alloc_With_Allocator;
+        init_args.mem_alloc_option.allocator.malloc_func =
+            reinterpret_cast<void *>(prepared_call_test_malloc);
+        init_args.mem_alloc_option.allocator.realloc_func =
+            reinterpret_cast<void *>(prepared_call_test_realloc);
+        init_args.mem_alloc_option.allocator.free_func =
+            reinterpret_cast<void *>(prepared_call_test_free);
+        ASSERT_TRUE(wasm_runtime_full_init(&init_args));
+        helper.runtime_init = true;
+    }
+
+    void TearDown() override
+    {
+        reject_runtime_allocations = false;
+        if (prepared) {
+            wasm_component_prepared_call_post_return(prepared);
+            wasm_component_destroy_prepared_call(prepared);
+            prepared = nullptr;
+        }
+        helper.do_teardown();
+    }
+};
+
+TEST_F(ComponentPreparedCallAllocationTest,
+       TestPreparedFlatAddRepeatedWithoutAllocations)
+{
+    static constexpr const char *interface_name =
+        "test:project/my-interface@0.1.0";
+
+    ASSERT_TRUE(helper.read_wasm_file("add.wasm"));
+    ASSERT_TRUE(helper.load_component());
+    ASSERT_TRUE(helper.instantiate_component());
+
+    wasm_val_t args[2] = {};
+    wasm_val_t results[1] = {};
+    args[0].kind = WASM_I32;
+    args[1].kind = WASM_I32;
+
+    prepared = wasm_component_prepare_export_call(helper.component_inst, "add",
+                                                  error_buf, sizeof(error_buf));
+    ASSERT_NE(prepared, nullptr) << error_buf;
+    EXPECT_FALSE(wasm_component_prepared_call_requires_post_return(nullptr));
+    EXPECT_FALSE(wasm_component_prepared_call_requires_post_return(prepared));
+    args[0].of.i32 = 3;
+    args[1].of.i32 = 4;
+    ASSERT_TRUE(wasm_component_call_prepared(prepared, 1, results, 2, args));
+    ASSERT_EQ(results[0].of.i32, 7);
+    ASSERT_TRUE(wasm_component_prepared_call_post_return(prepared));
+    wasm_component_destroy_prepared_call(prepared);
+    prepared = nullptr;
+
+    WASMComponentPreparedCall *wrong_interface =
+        wasm_component_prepare_export_call_qualified(
+            helper.component_inst, "test:project/my-interface@0.2.0", "add",
+            error_buf, sizeof(error_buf));
+    ASSERT_EQ(wrong_interface, nullptr);
+    ASSERT_NE(strstr(error_buf, "qualified prepared export lookup failed"),
+              nullptr);
+
+    prepared = wasm_component_prepare_export_call_qualified(
+        helper.component_inst, interface_name, "add", error_buf,
+        sizeof(error_buf));
+    ASSERT_NE(prepared, nullptr) << error_buf;
+
+    runtime_allocation_attempts = 0;
+    reject_runtime_allocations = true;
+
+    for (uint32_t i = 0; i < 10000; i++) {
+        args[0].of.i32 = static_cast<int32_t>(i);
+        args[1].of.i32 = 7;
+        ASSERT_TRUE(
+            wasm_component_call_prepared(prepared, 1, results, 2, args));
+        ASSERT_EQ(results[0].kind, WASM_I32);
+        ASSERT_EQ(results[0].of.i32, static_cast<int32_t>(i + 7));
+        ASSERT_TRUE(wasm_component_prepared_call_post_return(prepared));
+    }
+
+    reject_runtime_allocations = false;
+    EXPECT_EQ(runtime_allocation_attempts, 0U);
+    wasm_component_destroy_prepared_call(prepared);
+    prepared = nullptr;
 }
 
 // Call non-existent function

@@ -128,6 +128,8 @@ typedef struct WASMModuleInstanceCommon *wasm_module_inst_t;
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 struct WASMComponentInstance;
 typedef struct WASMComponentInstance WASMComponentInstance;
+struct WASMComponentPreparedCall;
+typedef struct WASMComponentPreparedCall WASMComponentPreparedCall;
 #endif
 
 /* Function instance */
@@ -1378,6 +1380,128 @@ wasm_runtime_get_exception(wasm_module_inst_t module_inst);
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 WASM_RUNTIME_API_EXTERN const char *
 wasm_component_runtime_get_exception(WASMComponentInstance *comp_inst);
+
+/**
+ * Prepare a synchronous component export for allocation-free flat calls.
+ *
+ * This resolves the export and creates its core execution environment. The
+ * returned handle uses the canonical ABI's flattened core signature: only
+ * WASM_I32, WASM_I64, WASM_F32, and WASM_F64 values are accepted. It does not
+ * parse WAVE text or perform WIT lifting/lowering.
+ *
+ * This compatibility entrypoint resolves a leaf function name using WAMR's
+ * legacy first-match lookup. Generated bindings should use
+ * wasm_component_prepare_export_call_qualified() so duplicate function names
+ * in different interfaces cannot be confused.
+ *
+ * The handle is thread-affine and non-reentrant. Prepare it on the thread
+ * which will call it, and keep both the component instance and that thread
+ * alive until wasm_component_destroy_prepared_call() returns.
+ *
+ * @param comp_inst the component instance containing the export
+ * @param export_name the exported component function name
+ * @param error_buf optional buffer which receives a preparation error
+ * @param error_buf_size size of error_buf in bytes
+ *
+ * @return a prepared call on success, NULL on failure
+ */
+WASM_RUNTIME_API_EXTERN WASMComponentPreparedCall *
+wasm_component_prepare_export_call(WASMComponentInstance *comp_inst,
+                                   const char *export_name, char *error_buf,
+                                   uint32_t error_buf_size);
+
+/**
+ * Prepare a synchronous component export by its interface and function name.
+ *
+ * interface_name is matched exactly against the component's exported
+ * interface instance name. For a versioned interface it must contain the full
+ * version suffix, for example "test:project/my-interface@0.1.0". The lookup
+ * never falls back to an unqualified or first-matching function.
+ *
+ * The returned handle has the same lifetime, thread-affinity, signature, and
+ * allocation behavior as wasm_component_prepare_export_call().
+ *
+ * @param comp_inst the component instance containing the interface export
+ * @param interface_name the complete exported interface instance name
+ * @param export_name the function name within that interface
+ * @param error_buf optional buffer which receives a preparation error
+ * @param error_buf_size size of error_buf in bytes
+ *
+ * @return a prepared call on success, NULL on failure
+ */
+WASM_RUNTIME_API_EXTERN WASMComponentPreparedCall *
+wasm_component_prepare_export_call_qualified(WASMComponentInstance *comp_inst,
+                                             const char *interface_name,
+                                             const char *export_name,
+                                             char *error_buf,
+                                             uint32_t error_buf_size);
+
+/**
+ * Report whether this export declares a canonical post-return function.
+ *
+ * This property is available immediately after preparation, before calling
+ * the export. A successful call requires
+ * wasm_component_prepared_call_post_return() exactly when this returns true.
+ * Embedders which cannot safely lift guest-backed results may use this query
+ * to reject the prepared call before executing it.
+ *
+ * @param prepared_call the prepared component export
+ * @return true when successful calls require post-return, false otherwise
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_prepared_call_requires_post_return(
+    const WASMComponentPreparedCall *prepared_call);
+
+/**
+ * Call a prepared component export with canonical flattened values.
+ *
+ * The argument/result counts and kinds must exactly match the prepared core
+ * signature. After preparation the adapter performs no heap allocation; it
+ * uses scratch storage owned by the prepared handle. Allocations explicitly
+ * performed by guest code or host imports are outside this guarantee.
+ *
+ * If the export has a canonical post-return function, a successful call
+ * retains guest-backed result storage. The caller must finish lifting or
+ * copying those results and then call
+ * wasm_component_prepared_call_post_return() before another call or destroy.
+ *
+ * @param prepared_call the prepared component export
+ * @param num_results number of flattened results
+ * @param results output array for flattened results
+ * @param num_args number of flattened arguments
+ * @param args input array of flattened arguments
+ * @return true on success, false on failure; component exception is set
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_call_prepared(WASMComponentPreparedCall *prepared_call,
+                             uint32_t num_results, wasm_val_t results[],
+                             uint32_t num_args, const wasm_val_t args[]);
+
+/**
+ * Complete the last prepared call's canonical post-return step.
+ *
+ * This is a no-op when the export has no post-return function. It performs no
+ * adapter heap allocation. Call it only from the prepared handle's owning
+ * thread. Guest post-return code may itself allocate.
+ *
+ * @param prepared_call the prepared component export
+ * @return true on success, false on failure; component exception is set
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_prepared_call_post_return(
+    WASMComponentPreparedCall *prepared_call);
+
+/**
+ * Destroy a prepared component call.
+ *
+ * This does not implicitly execute a pending post-return. The caller must
+ * complete post-return before destroying the handle. Destroy must run on the
+ * handle's owning thread and before its component instance is deinstantiated.
+ *
+ * @param prepared_call the prepared component export
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_destroy_prepared_call(WASMComponentPreparedCall *prepared_call);
 
 /**
  * Validate a range in the canonical memory active for a component host

@@ -33,6 +33,7 @@ typedef struct WASMComponentTypeInstance WASMComponentTypeInstance;
 typedef struct WASMComponentInstance WASMComponentInstance;
 typedef struct WASMComponentExportInstance WASMComponentExportInstance;
 typedef struct WASMComponentFunctionInstance WASMComponentFunctionInstance;
+typedef struct WASMComponentPreparedCall WASMComponentPreparedCall;
 typedef struct WASMMemoryInstance WASMMemoryInstance;
 typedef struct WASMTableInstance WASMTableInstance;
 typedef struct WASMGlobalInstance WASMGlobalInstance;
@@ -561,6 +562,34 @@ bool
 wasm_component_application_execute_func_ex(WASMComponentInstance *, char *argv,
                                            uint32 *argc1, uint32 **argv1);
 
+WASMComponentPreparedCall *
+wasm_component_prepare_export_call(WASMComponentInstance *comp_inst,
+                                   const char *export_name, char *error_buf,
+                                   uint32 error_buf_size);
+
+WASMComponentPreparedCall *
+wasm_component_prepare_export_call_qualified(WASMComponentInstance *comp_inst,
+                                             const char *interface_name,
+                                             const char *export_name,
+                                             char *error_buf,
+                                             uint32 error_buf_size);
+
+bool
+wasm_component_prepared_call_requires_post_return(
+    const WASMComponentPreparedCall *prepared_call);
+
+bool
+wasm_component_call_prepared(WASMComponentPreparedCall *prepared_call,
+                             uint32 num_results, wasm_val_t results[],
+                             uint32 num_args, const wasm_val_t args[]);
+
+bool
+wasm_component_prepared_call_post_return(
+    WASMComponentPreparedCall *prepared_call);
+
+void
+wasm_component_destroy_prepared_call(WASMComponentPreparedCall *prepared_call);
+
 uint32_t
 align_to(uint32_t ptr, uint32_t alignment);
 uint32_t
@@ -579,6 +608,11 @@ compute_max_case_alignment(WASMComponentVariantInstance *type);
 WASMComponentFunctionInstance *
 wasm_component_lookup_function(const WASMComponentInstance *component_inst,
                                const char *name);
+
+WASMComponentFunctionInstance *
+wasm_component_lookup_function_qualified(
+    const WASMComponentInstance *component_inst, const char *interface_name,
+    const char *function_name);
 
 #if WASM_ENABLE_LIBC_WASI != 0
 

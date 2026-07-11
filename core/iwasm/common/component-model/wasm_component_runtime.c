@@ -1574,6 +1574,79 @@ wasm_component_lookup_function(const WASMComponentInstance *component_inst,
     return NULL; // Function not found
 }
 
+static const char *
+component_export_name(const WASMComponentExportInstance *export_inst)
+{
+    WASMComponentExportName *export_name;
+
+    if (!export_inst || !(export_name = export_inst->export_name)) {
+        return NULL;
+    }
+
+    if (export_name->tag == WASM_COMP_IMPORTNAME_SIMPLE) {
+        return export_name->exported.simple.name
+                   ? export_name->exported.simple.name->name
+                   : NULL;
+    }
+    if (export_name->tag == WASM_COMP_IMPORTNAME_VERSIONED) {
+        return export_name->exported.versioned.name
+                   ? export_name->exported.versioned.name->name
+                   : NULL;
+    }
+    return NULL;
+}
+
+WASMComponentFunctionInstance *
+wasm_component_lookup_function_qualified(
+    const WASMComponentInstance *component_inst, const char *interface_name,
+    const char *function_name)
+{
+    uint32 interface_index, function_index;
+
+    if (!component_inst || !component_inst->exports || !interface_name
+        || !function_name) {
+        return NULL;
+    }
+
+    for (interface_index = 0; interface_index < component_inst->exports_count;
+         interface_index++) {
+        WASMComponentExportInstance *interface_export =
+            &component_inst->exports[interface_index];
+        WASMComponentInstance *interface_inst;
+        const char *exported_interface_name;
+
+        if (interface_export->type != WASM_COMP_EXTERN_INSTANCE
+            || !(interface_inst = interface_export->exp.instance)
+            || !(exported_interface_name =
+                     component_export_name(interface_export))
+            || strcmp(exported_interface_name, interface_name) != 0) {
+            continue;
+        }
+
+        for (function_index = 0; function_index < interface_inst->exports_count;
+             function_index++) {
+            WASMComponentExportInstance *function_export =
+                &interface_inst->exports[function_index];
+            const char *exported_function_name;
+
+            if (function_export->type != WASM_COMP_EXTERN_FUNC
+                || !(exported_function_name =
+                         component_export_name(function_export))) {
+                continue;
+            }
+            if (strcmp(exported_function_name, function_name) == 0) {
+                return function_export->exp.function;
+            }
+        }
+
+        /* Component export names are unique, so an exact interface match
+         * cannot be followed by a second candidate. */
+        return NULL;
+    }
+
+    return NULL;
+}
+
 WASMMemoryInstance *
 canon_get_memory(CanonicalOptions *canon_opts)
 {
