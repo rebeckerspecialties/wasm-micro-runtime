@@ -30,6 +30,8 @@ static wasm_module_t tracked_parent;
 static wasm_module_t tracked_dependency;
 static bool tracked_parent_freed;
 static bool tracked_dependency_freed;
+static uint8_t *reader_buffer;
+static bool reader_buffer_destroyed;
 
 static void *
 tracking_malloc(unsigned int size)
@@ -64,16 +66,26 @@ module_reader_callback(package_type_t module_type, const char *module_name,
         return false;
     }
 
-    *p_buffer = dependency_wasm;
-    *p_size = (uint32_t)sizeof(dependency_wasm);
+    reader_buffer = (uint8_t *)malloc(sizeof(dependency_wasm_template));
+    if (!reader_buffer) {
+        return false;
+    }
+    memcpy(reader_buffer, dependency_wasm_template,
+           sizeof(dependency_wasm_template));
+    *p_buffer = reader_buffer;
+    *p_size = (uint32_t)sizeof(dependency_wasm_template);
     return true;
 }
 
 static void
 module_destroyer_callback(uint8_t *buffer, uint32_t size)
 {
-    (void)buffer;
     (void)size;
+    if (buffer == reader_buffer) {
+        reader_buffer_destroyed = true;
+        free(reader_buffer);
+        reader_buffer = nullptr;
+    }
 }
 
 class wasm_runtime_module_lifetime_test_suite : public testing::Test
@@ -90,6 +102,8 @@ class wasm_runtime_module_lifetime_test_suite : public testing::Test
         tracked_dependency = nullptr;
         tracked_parent_freed = false;
         tracked_dependency_freed = false;
+        reader_buffer = nullptr;
+        reader_buffer_destroyed = false;
 
         init_args.mem_alloc_type = Alloc_With_Allocator;
         init_args.mem_alloc_option.allocator.malloc_func =
@@ -98,16 +112,25 @@ class wasm_runtime_module_lifetime_test_suite : public testing::Test
             (void *)tracking_realloc;
         init_args.mem_alloc_option.allocator.free_func = (void *)tracking_free;
         ASSERT_TRUE(wasm_runtime_full_init(&init_args));
+        runtime_initialized = true;
         wasm_runtime_set_module_reader(module_reader_callback,
                                        module_destroyer_callback);
     }
 
     void TearDown() override
     {
-        wasm_runtime_destroy();
+        if (runtime_initialized) {
+            wasm_runtime_destroy();
+        }
+        if (reader_buffer) {
+            free(reader_buffer);
+            reader_buffer = nullptr;
+        }
         tracked_parent = nullptr;
         tracked_dependency = nullptr;
     }
+
+    bool runtime_initialized = false;
 };
 
 TEST_F(wasm_runtime_module_lifetime_test_suite,
@@ -115,11 +138,15 @@ TEST_F(wasm_runtime_module_lifetime_test_suite,
 {
     char error_buf[128] = {};
 
+    tracked_dependency = wasm_runtime_load(
+        dependency_wasm, sizeof(dependency_wasm), error_buf, sizeof(error_buf));
+    ASSERT_NE(tracked_dependency, nullptr);
+    ASSERT_TRUE(wasm_runtime_register_module("dependency", tracked_dependency,
+                                             error_buf, sizeof(error_buf)))
+        << error_buf;
     tracked_parent = wasm_runtime_load(parent_wasm, sizeof(parent_wasm),
                                        error_buf, sizeof(error_buf));
     ASSERT_NE(tracked_parent, nullptr) << error_buf;
-    tracked_dependency = wasm_runtime_find_module_registered("dependency");
-    ASSERT_NE(tracked_dependency, nullptr);
     ASSERT_TRUE(wasm_runtime_register_module("parent", tracked_parent,
                                              error_buf, sizeof(error_buf)))
         << error_buf;
@@ -132,15 +159,48 @@ TEST_F(wasm_runtime_module_lifetime_test_suite,
     EXPECT_EQ(wasm_runtime_find_module_registered("dependency"),
               tracked_dependency);
 
-    wasm_runtime_unregister_module(tracked_parent);
+    EXPECT_TRUE(wasm_runtime_unregister_module(tracked_parent));
     wasm_runtime_unload(tracked_parent);
     EXPECT_TRUE(tracked_parent_freed);
     EXPECT_EQ(wasm_runtime_find_module_registered("parent"), nullptr);
     EXPECT_EQ(wasm_runtime_find_module_registered("dependency"),
               tracked_dependency);
 
-    wasm_runtime_unregister_module(tracked_dependency);
+    EXPECT_TRUE(wasm_runtime_unregister_module(tracked_dependency));
     wasm_runtime_unload(tracked_dependency);
     EXPECT_TRUE(tracked_dependency_freed);
     EXPECT_EQ(wasm_runtime_find_module_registered("dependency"), nullptr);
+}
+
+TEST_F(wasm_runtime_module_lifetime_test_suite,
+       reader_owned_dependency_remains_registered_until_runtime_destroy)
+{
+    char error_buf[128] = {};
+
+    tracked_parent = wasm_runtime_load(parent_wasm, sizeof(parent_wasm),
+                                       error_buf, sizeof(error_buf));
+    ASSERT_NE(tracked_parent, nullptr) << error_buf;
+    tracked_dependency = wasm_runtime_find_module_registered("dependency");
+    ASSERT_NE(tracked_dependency, nullptr);
+    ASSERT_TRUE(wasm_runtime_register_module("parent", tracked_parent,
+                                             error_buf, sizeof(error_buf)))
+        << error_buf;
+
+    EXPECT_FALSE(wasm_runtime_unregister_module(tracked_dependency));
+    wasm_runtime_unload(tracked_dependency);
+    EXPECT_FALSE(tracked_dependency_freed);
+    EXPECT_FALSE(reader_buffer_destroyed);
+    EXPECT_EQ(wasm_runtime_find_module_registered("dependency"),
+              tracked_dependency);
+
+    EXPECT_TRUE(wasm_runtime_unregister_module(tracked_parent));
+    wasm_runtime_unload(tracked_parent);
+    EXPECT_TRUE(tracked_parent_freed);
+    EXPECT_EQ(wasm_runtime_find_module_registered("dependency"),
+              tracked_dependency);
+
+    wasm_runtime_destroy();
+    runtime_initialized = false;
+    EXPECT_TRUE(tracked_dependency_freed);
+    EXPECT_TRUE(reader_buffer_destroyed);
 }

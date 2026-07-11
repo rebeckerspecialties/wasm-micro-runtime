@@ -1080,7 +1080,7 @@ wasm_runtime_register_module_internal(const char *module_name,
                                       uint32 orig_file_buf_size,
                                       char *error_buf, uint32 error_buf_size);
 
-void
+bool
 wasm_runtime_unregister_module(WASMModuleCommon *module);
 
 WASMModuleCommon *

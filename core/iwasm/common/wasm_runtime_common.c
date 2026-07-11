@@ -1258,10 +1258,11 @@ wasm_runtime_register_module(const char *module_name, WASMModuleCommon *module,
                                                  error_buf, error_buf_size);
 }
 
-void
+bool
 wasm_runtime_unregister_module(WASMModuleCommon *module)
 {
     WASMRegisteredModule *registered_module = NULL;
+    bool unregistered = true;
 
     os_mutex_lock(&registered_module_list_lock);
     registered_module = bh_list_first_elem(registered_module_list);
@@ -1271,13 +1272,21 @@ wasm_runtime_unregister_module(WASMModuleCommon *module)
 
     /* it does not matter if it is not exist. after all, it is gone */
     if (registered_module) {
-        bh_list_remove(registered_module_list, registered_module);
-        if (registered_module->module_name) {
-            wasm_runtime_free((void *)registered_module->module_name);
+        if (registered_module->orig_file_buf) {
+            /* Keep reader-owned modules registered so runtime_destroy() can
+             * release their module and backing buffer in the required order. */
+            unregistered = false;
         }
-        wasm_runtime_free(registered_module);
+        else {
+            bh_list_remove(registered_module_list, registered_module);
+            if (registered_module->module_name) {
+                wasm_runtime_free((void *)registered_module->module_name);
+            }
+            wasm_runtime_free(registered_module);
+        }
     }
     os_mutex_unlock(&registered_module_list_lock);
+    return unregistered;
 }
 
 WASMModuleCommon *
