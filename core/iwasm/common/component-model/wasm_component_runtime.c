@@ -2310,6 +2310,120 @@ canon_get_memory(CanonicalOptions *canon_opts)
         return canon_opts->lift_lower_opts->lift_opts->memory;
     }
 }
+
+static WASMMemoryInstance *
+get_active_component_callback_memory(WASMExecEnv *exec_env)
+{
+    WASMMemoryInstance *memory = NULL;
+
+    if (!exec_env || !exec_env->component_inst || !exec_env->core_func
+        || !exec_env->core_func->canon_options
+        || !exec_env->core_func->component_function || !exec_env->memory) {
+        return NULL;
+    }
+
+    memory = canon_get_memory(exec_env->core_func->canon_options);
+    return memory == exec_env->memory ? memory : NULL;
+}
+
+static bool
+get_component_callback_memory_range(WASMExecEnv *exec_env, uint32 app_offset,
+                                    uint32 size, uint8 **p_native_addr)
+{
+    const uint64 wasm32_address_space_size = (uint64)UINT32_MAX + 1;
+    WASMMemoryInstance *memory = NULL;
+    WASMModuleInstanceCommon *module_inst_comm = NULL;
+    uint64 range_end = 0;
+    bool is_valid = false;
+
+    if (p_native_addr) {
+        *p_native_addr = NULL;
+    }
+    if (!p_native_addr
+        || !(memory = get_active_component_callback_memory(exec_env))) {
+        return false;
+    }
+
+    module_inst_comm = wasm_runtime_get_module_inst(exec_env);
+    if (!module_inst_comm
+        || (module_inst_comm->module_type != Wasm_Module_Bytecode
+            && module_inst_comm->module_type != Wasm_Module_AoT)) {
+        return false;
+    }
+
+    range_end = (uint64)app_offset + (uint64)size;
+    if (range_end > wasm32_address_space_size) {
+        goto fail;
+    }
+
+    SHARED_MEMORY_LOCK(memory);
+    if (range_end <= memory->memory_data_size
+        && (memory->memory_data || range_end == 0)) {
+        *p_native_addr =
+            memory->memory_data ? memory->memory_data + app_offset : NULL;
+        is_valid = true;
+    }
+    SHARED_MEMORY_UNLOCK(memory);
+
+    if (is_valid) {
+        return true;
+    }
+
+fail:
+    wasm_set_exception((WASMModuleInstance *)module_inst_comm,
+                       "out of bounds memory access");
+    return false;
+}
+
+bool
+wasm_component_validate_memory_range(wasm_exec_env_t exec_env,
+                                     uint32_t app_offset, uint32_t size)
+{
+    uint8 *native_addr = NULL;
+
+    return get_component_callback_memory_range(exec_env, app_offset, size,
+                                               &native_addr);
+}
+
+bool
+wasm_component_get_memory_range(wasm_exec_env_t exec_env, uint32_t app_offset,
+                                uint32_t size, uint8_t **p_native_addr)
+{
+    uint8 *native_addr = NULL;
+
+    if (p_native_addr) {
+        *p_native_addr = NULL;
+    }
+    if (!p_native_addr
+        || !get_component_callback_memory_range(exec_env, app_offset, size,
+                                                &native_addr)) {
+        return false;
+    }
+
+    *p_native_addr = native_addr;
+    return true;
+}
+
+bool
+wasm_component_get_memory_range_const(wasm_exec_env_t exec_env,
+                                      uint32_t app_offset, uint32_t size,
+                                      const uint8_t **p_native_addr)
+{
+    uint8 *native_addr = NULL;
+
+    if (p_native_addr) {
+        *p_native_addr = NULL;
+    }
+    if (!p_native_addr
+        || !get_component_callback_memory_range(exec_env, app_offset, size,
+                                                &native_addr)) {
+        return false;
+    }
+
+    *p_native_addr = native_addr;
+    return true;
+}
+
 typedef void (*GenericFunctionPointer)(void);
 
 /// @brief Allocates memory inside the wasm linerar memory (WASMMemoryInstance)
@@ -2890,6 +3004,12 @@ fail:
     if (argv1 != argv_buf)
         wasm_runtime_free(argv1);
     subtask_destroy(subtask);
+
+    exec_env->attachment = saved_attachment;
+    exec_env->cx = saved_cx;
+    exec_env->memory = saved_memory;
+    exec_env->core_func = saved_core_func;
+    exec_env->component_inst = saved_component_inst;
 
     return ret;
 }
