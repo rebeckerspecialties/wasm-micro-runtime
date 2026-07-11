@@ -78,6 +78,10 @@ extern "C" {
             sizeof(name##_symbols) / sizeof(NativeSymbol)      \
     }
 
+/* The built-in host surface implements the stable WASI Preview 2 package set
+ * published as 0.2.6. Keep the symbol tables synchronized with its WIT. */
+#define WASI_P2_IMPLEMENTED_VERSION "0.2.6"
+
 static NativeSymbol cli_environment_symbols[] = {
     REG_WASI_P2_FUNCTION("get-environment", wasi_cli_get_environment, "(i)"),
     REG_WASI_P2_FUNCTION("get-arguments", wasi_cli_get_arguments, "(i)"),
@@ -414,33 +418,44 @@ static NativeSymbol sockets_udp_symbols[] = {
 };
 
 static wasi_p2_module_t wasi_p2_modules[] = {
-    WASI_P2_MODULE(cli_environment, "cli/environment", "0.2.0"),
-    WASI_P2_MODULE(cli_exit, "cli/exit", "0.2.0"),
-    WASI_P2_MODULE(cli_stdin, "cli/stdin", "0.2.0"),
-    WASI_P2_MODULE(cli_stdout, "cli/stdout", "0.2.0"),
-    WASI_P2_MODULE(cli_stderr, "cli/stderr", "0.2.0"),
-    WASI_P2_MODULE(cli_terminal_stdin, "cli/terminal-stdin", "0.2.0"),
-    WASI_P2_MODULE(cli_terminal_stdout, "cli/terminal-stdout", "0.2.0"),
-    WASI_P2_MODULE(cli_terminal_stderr, "cli/terminal-stderr", "0.2.0"),
-    WASI_P2_MODULE(clocks_monotonic_clock, "clocks/monotonic-clock", "0.2.0"),
-    WASI_P2_MODULE(clocks_wall_clock, "clocks/wall-clock", "0.2.0"),
-    WASI_P2_MODULE(filesystem_preopens, "filesystem/preopens", "0.2.0"),
-    WASI_P2_MODULE(filesystem_types, "filesystem/types", "0.2.0"),
-    WASI_P2_MODULE(random_random, "random/random", "0.2.0"),
-    WASI_P2_MODULE(random_insecure, "random/insecure", "0.2.0"),
-    WASI_P2_MODULE(random_insecure_seed, "random/insecure-seed", "0.2.0"),
-    WASI_P2_MODULE(io_error, "io/error", "0.2.0"),
-    WASI_P2_MODULE(io_poll, "io/poll", "0.2.0"),
-    WASI_P2_MODULE(io_streams, "io/streams", "0.2.0"),
+    WASI_P2_MODULE(cli_environment, "cli/environment",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_exit, "cli/exit", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_stdin, "cli/stdin", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_stdout, "cli/stdout", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_stderr, "cli/stderr", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_terminal_stdin, "cli/terminal-stdin",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_terminal_stdout, "cli/terminal-stdout",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_terminal_stderr, "cli/terminal-stderr",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(clocks_monotonic_clock, "clocks/monotonic-clock",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(clocks_wall_clock, "clocks/wall-clock",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(filesystem_preopens, "filesystem/preopens",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(filesystem_types, "filesystem/types",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(random_random, "random/random", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(random_insecure, "random/insecure",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(random_insecure_seed, "random/insecure-seed",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(io_error, "io/error", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(io_poll, "io/poll", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(io_streams, "io/streams", WASI_P2_IMPLEMENTED_VERSION),
     WASI_P2_MODULE(sockets_instance_network, "sockets/instance-network",
-                   "0.2.0"),
-    WASI_P2_MODULE(sockets_ip_name_lookup, "sockets/ip-name-lookup", "0.2.0"),
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(sockets_ip_name_lookup, "sockets/ip-name-lookup",
+                   WASI_P2_IMPLEMENTED_VERSION),
     WASI_P2_MODULE(sockets_tcp_create_socket, "sockets/tcp-create-socket",
-                   "0.2.0"),
-    WASI_P2_MODULE(sockets_tcp, "sockets/tcp", "0.2.0"),
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(sockets_tcp, "sockets/tcp", WASI_P2_IMPLEMENTED_VERSION),
     WASI_P2_MODULE(sockets_udp_create_socket, "sockets/udp-create-socket",
-                   "0.2.0"),
-    WASI_P2_MODULE(sockets_udp, "sockets/udp", "0.2.0"),
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(sockets_udp, "sockets/udp", WASI_P2_IMPLEMENTED_VERSION),
 };
 
 static bool
