@@ -614,6 +614,9 @@ wasm_component_lookup_function_qualified(
     const WASMComponentInstance *component_inst, const char *interface_name,
     const char *function_name);
 
+bool
+wasm_component_exec_env_is_callback(wasm_exec_env_t exec_env);
+
 #if WASM_ENABLE_LIBC_WASI != 0
 
 bool

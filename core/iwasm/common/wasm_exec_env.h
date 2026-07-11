@@ -193,6 +193,7 @@ typedef struct WASMExecEnv {
     WASMFunctionInstance *core_func;
     WASMMemoryInstance *memory;
     LiftLowerContext *cx;
+    bool component_callback_active;
 #endif
 
     /* The WASM stack of current thread */

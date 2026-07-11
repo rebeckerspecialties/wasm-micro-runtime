@@ -1504,6 +1504,19 @@ WASM_RUNTIME_API_EXTERN void
 wasm_component_destroy_prepared_call(WASMComponentPreparedCall *prepared_call);
 
 /**
+ * Report whether exec_env is currently handling a raw component host import.
+ *
+ * The result is true only for the dynamic extent of the callback on its
+ * calling thread. It does not require canonical memory or non-NULL custom
+ * data, and becomes false as soon as the callback returns.
+ *
+ * @param exec_env the execution environment to inspect
+ * @return true only during its component host callback
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_exec_env_is_callback(wasm_exec_env_t exec_env);
+
+/**
  * Validate a range in the canonical memory active for a component host
  * callback.
  *

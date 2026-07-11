@@ -34,6 +34,7 @@ struct MemoryProbeState {
     bool bounds_rejected = false;
     bool overflow_rejected = false;
     bool failed_outputs_cleared = false;
+    bool callback_kind = false;
 };
 
 MemoryProbeState *memory_probe_state;
@@ -54,6 +55,7 @@ host_log(wasm_exec_env_t exec_env, uint32_t level, uint32_t contents_offset,
 
     state->callback_called = true;
     state->callback_exec_env = exec_env;
+    state->callback_kind = wasm_component_exec_env_is_callback(exec_env);
     state->contents_offset = contents_offset;
     state->contents_size = contents_size;
 
@@ -163,6 +165,7 @@ TEST_F(ComponentHostMemoryTest, ResolvesMutableAndConstCallbackRanges)
     ASSERT_TRUE(ExecuteProbe(&state));
 
     EXPECT_TRUE(state.callback_called);
+    EXPECT_TRUE(state.callback_kind);
     EXPECT_TRUE(state.validate_succeeded);
     EXPECT_TRUE(state.mutable_succeeded);
     EXPECT_TRUE(state.const_succeeded);
@@ -172,6 +175,7 @@ TEST_F(ComponentHostMemoryTest, ResolvesMutableAndConstCallbackRanges)
     EXPECT_TRUE(state.null_output_rejected);
 
     ASSERT_NE(state.callback_exec_env, nullptr);
+    EXPECT_FALSE(wasm_component_exec_env_is_callback(state.callback_exec_env));
     EXPECT_FALSE(wasm_component_validate_memory_range(
         state.callback_exec_env, state.contents_offset, state.contents_size));
     EXPECT_FALSE(wasm_component_get_memory_range(
@@ -194,10 +198,12 @@ TEST_F(ComponentHostMemoryTest, RejectsBoundsOverflowAndWrongContext)
     EXPECT_FALSE(ExecuteProbe(&state));
 
     EXPECT_TRUE(state.callback_called);
+    EXPECT_TRUE(state.callback_kind);
     EXPECT_TRUE(state.bounds_rejected);
     EXPECT_TRUE(state.overflow_rejected);
     EXPECT_TRUE(state.failed_outputs_cleared);
     EXPECT_FALSE(wasm_component_validate_memory_range(nullptr, 0, 0));
+    EXPECT_FALSE(wasm_component_exec_env_is_callback(nullptr));
     EXPECT_FALSE(
         wasm_component_get_memory_range(nullptr, 0, 0, &null_context_output));
     EXPECT_EQ(null_context_output, nullptr);

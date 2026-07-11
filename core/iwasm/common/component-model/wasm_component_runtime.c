@@ -1659,6 +1659,14 @@ canon_get_memory(CanonicalOptions *canon_opts)
     }
 }
 
+bool
+wasm_component_exec_env_is_callback(wasm_exec_env_t exec_env)
+{
+    WASMExecEnv *internal_exec_env = (WASMExecEnv *)exec_env;
+
+    return internal_exec_env && internal_exec_env->component_callback_active;
+}
+
 static WASMMemoryInstance *
 get_active_component_callback_memory(WASMExecEnv *exec_env)
 {
@@ -2114,6 +2122,7 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     WASMMemoryInstance *saved_memory = exec_env->memory;
     LiftLowerContext *saved_cx = exec_env->cx;
     void *saved_attachment = exec_env->attachment;
+    bool saved_component_callback_active = exec_env->component_callback_active;
 
     WASMComponentInstance *root_comp = module->comp_instance;
     while (root_comp->parent)
@@ -2282,6 +2291,7 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     }
 
     exec_env->attachment = attachment;
+    exec_env->component_callback_active = true;
     if (result_count == 0) {
         invokeNative_Void(func_ptr, argv1, n_stacks);
     }
@@ -2324,6 +2334,7 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
                 break;
         }
     }
+    exec_env->component_callback_active = saved_component_callback_active;
     exec_env->attachment = saved_attachment;
 
     subtask->state = SUBTASK_STATE_RETURNED;
@@ -2342,6 +2353,7 @@ fail:
     exec_env->memory = saved_memory;
     exec_env->core_func = saved_core_func;
     exec_env->component_inst = saved_component_inst;
+    exec_env->component_callback_active = saved_component_callback_active;
 
     return ret;
 }
