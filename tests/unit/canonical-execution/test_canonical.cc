@@ -116,6 +116,25 @@ class CanonicalExecutionTest : public testing::Test
                                                        "canonical-execution");
     }
 
+    void ExpectUnsupportedWasiFixture(const char *file_name)
+    {
+        WASMComponent *component = LoadfromCandidates(file_name);
+        ASSERT_NE(component, nullptr)
+            << "Failed to load/parse component from candidates.";
+
+        libc_component_wasi_init(component, 0, NULL, &parse_ctx);
+        memset(error_buf, 0, sizeof(error_buf));
+
+        WASMComponentInstance *comp_instance =
+            wasm_component_instantiate_internal(component, NULL, error_buf,
+                                                sizeof(error_buf));
+        ASSERT_EQ(comp_instance, nullptr)
+            << file_name << " unexpectedly instantiated against WASI 0.2.6";
+        ASSERT_NE(strstr(error_buf, "Incompatible WASI version"), nullptr)
+            << error_buf;
+        ASSERT_NE(strstr(error_buf, "@0.2.9"), nullptr) << error_buf;
+    }
+
     void init_prestats(WASMComponentInstance *comp_instance)
     {
         WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(
@@ -263,189 +282,23 @@ TEST_F(CanonicalExecutionTest, test_surface)
   ASSERT_TRUE(status);
 }
 
-TEST_F(CanonicalExecutionTest, test_wasi_random)
+// These Rust fixtures were built with rustc 1.94.1 and import WASI 0.2.9.
+// Keep them as negative compatibility coverage while the executable Preview 2
+// tests below and the Apple fixture exercise the implemented 0.2.0-0.2.6 line.
+TEST_F(CanonicalExecutionTest, rejects_wasi_0_2_9_random)
 {
-  bool status;
-
-  WASMComponent *component = LoadfromCandidates("wasi_random.wasm");
-  ASSERT_NE(component, nullptr) << "Failed to load/parse component from candidates.";
-  
-  ASSERT_TRUE(component);
-  libc_component_wasi_init(component, 0, NULL, &parse_ctx);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-  // Test component is instantiated
-  WASMComponentInstance *comp_instance = wasm_component_instantiate_internal(component, NULL, error_buf, sizeof(error_buf));
-  ASSERT_TRUE(comp_instance);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-
-  char func_name[] = "run()";
-  status = wasm_component_application_execute_func(comp_instance, func_name);
-  ASSERT_TRUE(status);
+    ExpectUnsupportedWasiFixture("wasi_random.wasm");
 }
 
-TEST_F(CanonicalExecutionTest, test_wasi_clocks)
+TEST_F(CanonicalExecutionTest, rejects_wasi_0_2_9_clocks)
 {
-  bool status;
-
-  WASMComponent *component = LoadfromCandidates("wasi_clocks.wasm");
-  ASSERT_NE(component, nullptr) << "Failed to load/parse component from candidates.";
-  
-  ASSERT_TRUE(component);
-  libc_component_wasi_init(component, 0, NULL, &parse_ctx);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-  // Test component is instantiated
-  WASMComponentInstance *comp_instance = wasm_component_instantiate_internal(component, NULL, error_buf, sizeof(error_buf));
-  ASSERT_TRUE(comp_instance);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-
-  char func_name[] = "run()";
-  status = wasm_component_application_execute_func(comp_instance, func_name);
-  ASSERT_TRUE(status);
+    ExpectUnsupportedWasiFixture("wasi_clocks.wasm");
 }
 
-
-TEST_F(CanonicalExecutionTest, test_wasi_cli)
+TEST_F(CanonicalExecutionTest, rejects_wasi_0_2_9_cli)
 {
-  bool status;
-
-  WASMComponent *component = LoadfromCandidates("wasi_cli.wasm");
-  ASSERT_NE(component, nullptr) << "Failed to load/parse component from candidates.";
-  
-  ASSERT_TRUE(component);
-  libc_component_wasi_init(component, 0, NULL, &parse_ctx);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-  // Test component is instantiated
-  WASMComponentInstance *comp_instance = wasm_component_instantiate_internal(component, NULL, error_buf, sizeof(error_buf));
-  ASSERT_TRUE(comp_instance);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-
-  // Redirect stdin and stdout
-  FILE *input_file = freopen(input_path, "r", stdin);
-  ASSERT_TRUE(input_file);
-
-  FILE *output_file = freopen(output_path, "w", stdout);
-  ASSERT_TRUE(output_file);
-
-  // Call function with no arguments
-  char func_name[] = "run()";
-  status = wasm_component_application_execute_func(comp_instance, func_name);
-  ASSERT_TRUE(status);
-
-  FILE *output = fopen(output_path, "r");
-  ASSERT_TRUE(output);
-
-  char line[256];
-  fgets(line, sizeof(line), output);
-  ASSERT_TRUE(strstr(line, "Arguments (0):"));
-  fgets(line, sizeof(line), output);
-  ASSERT_TRUE(strstr(line, "Environment variables (0):"));
+    ExpectUnsupportedWasiFixture("wasi_cli.wasm");
 }
-
-TEST_F(CanonicalExecutionTest, test_wasi_cli_with_args)
-{
-  bool status;
-
-  WASMComponent *component = LoadfromCandidates("wasi_cli.wasm");
-  ASSERT_NE(component, nullptr) << "Failed to load/parse component from candidates.";
-  
-  ASSERT_TRUE(component);
-  char *argv = (char *)"arg1";
-
-  parse_ctx.env_list[0] = "MY_VAR=hello";
-  parse_ctx.env_list[1] = "ANOTHER=world";
-  parse_ctx.env_list_size = 2;
-
-  ASSERT_FALSE(libc_wasi_parse_options("inherit-env=n", &parse_ctx));
-
-  libc_component_wasi_init(component, 1, &argv, &parse_ctx);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-  // Test component is instantiated
-  WASMComponentInstance *comp_instance = wasm_component_instantiate_internal(component, NULL, error_buf, sizeof(error_buf));
-  ASSERT_TRUE(comp_instance);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-
-  // Redirect stdin and stdout
-  FILE *input_file = freopen(input_path, "r", stdin);
-  ASSERT_TRUE(input_file);
-
-  FILE *output_file = freopen(output_path, "w", stdout);
-  ASSERT_TRUE(output_file);
-
-  // Call function with no arguments
-  char func_name[] = "run()";
-  status = wasm_component_application_execute_func(comp_instance, func_name);
-  ASSERT_TRUE(status);
-
-  FILE *output = fopen(output_path, "r");
-  ASSERT_TRUE(output);
-
-  char line[256][256];
-  uint32_t i = 0;
-  while(fgets(line[i], sizeof(line[i]), output)) i++;
-
-  ASSERT_TRUE(strstr(line[0], "Arguments (1):"));
-  ASSERT_TRUE(strstr(line[1], "arg1"));
-  ASSERT_TRUE(strstr(line[2], "Environment variables (2):"));
-  ASSERT_EQ(i, 13);
-}
-
-TEST_F(CanonicalExecutionTest, test_wasi_cli_inherit_env)
-{
-  bool status;
-
-  WASMComponent *component = LoadfromCandidates("wasi_cli.wasm");
-  ASSERT_NE(component, nullptr) << "Failed to load/parse component from candidates.";
-  
-  ASSERT_TRUE(component);
-  char *argv = (char *)"arg1";
-
-  parse_ctx.env_list[0] = "MY_VAR=hello";
-  parse_ctx.env_list[1] = "ANOTHER=world";
-  parse_ctx.env_list_size = 2;
-
-  ASSERT_FALSE(libc_wasi_parse_options("inherit-env=y", &parse_ctx));
-
-  libc_component_wasi_init(component, 1, &argv, &parse_ctx);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-  // Test component is instantiated
-  WASMComponentInstance *comp_instance = wasm_component_instantiate_internal(component, NULL, error_buf, sizeof(error_buf));
-  ASSERT_TRUE(comp_instance);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-
-  // Redirect stdin and stdout
-  FILE *input_file = freopen(input_path, "r", stdin);
-  ASSERT_TRUE(input_file);
-
-  FILE *output_file = freopen(output_path, "w", stdout);
-  ASSERT_TRUE(output_file);
-
-  // Call function with no arguments
-  char func_name[] = "run()";
-  status = wasm_component_application_execute_func(comp_instance, func_name);
-  ASSERT_TRUE(status);
-
-  FILE *output = fopen(output_path, "r");
-  ASSERT_TRUE(output);
-
-  char line[256][256];
-  uint32_t i = 0;
-  while(fgets(line[i], sizeof(line[i]), output)) i++;
-
-  ASSERT_TRUE(strstr(line[0], "Arguments (1):"));
-  ASSERT_TRUE(strstr(line[1], "arg1"));
-  ASSERT_TRUE(i > 13);
-}
-
 
 TEST_F(CanonicalExecutionTest, test_tcp_server)
 {
@@ -542,74 +395,10 @@ TEST_F(CanonicalExecutionTest, test_tcp_server)
 
 }
 
-TEST_F(CanonicalExecutionTest, test_udp_server)
+TEST_F(CanonicalExecutionTest, rejects_wasi_0_2_9_udp_components)
 {
-  bool status;
-
-  WASMComponent *component_1 = LoadfromCandidates("udp_server_2.wasm");
-  ASSERT_NE(component_1, nullptr) << "Failed to load/parse component from candidates.";
-
-  libc_component_wasi_init(component_1, 0, NULL, &parse_ctx);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-  // Test component is instantiated
-  WASMComponentInstance *comp_instance_1 = wasm_component_instantiate_internal(component_1, NULL, error_buf, sizeof(error_buf));
-  ASSERT_TRUE(comp_instance_1);
-
-  WASMComponent *component_2 = LoadfromCandidates("udp_client_2.wasm");
-  ASSERT_NE(component_2, nullptr) << "Failed to load/parse component from candidates.";
-
-  ASSERT_TRUE(component_2);
-  char *argv[2] = {(char *)"-n", (char *)"5"};
-
-  libc_component_wasi_init(component_2, 2, argv, &parse_ctx);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-  // Test component is instantiated
-  WASMComponentInstance *comp_instance_2 = wasm_component_instantiate_internal(component_2, NULL, error_buf, sizeof(error_buf));
-  ASSERT_TRUE(comp_instance_2);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-
-  char func_name[] = "run()";
-
-  child_pid = fork();
-
-  ASSERT_TRUE(child_pid >= 0);
-
-  if (child_pid == 0) {
-
-      alarm(30);
-      bool child_status =
-          wasm_component_application_execute_func(comp_instance_1, func_name);
-      _exit(child_status ? 0 : 1);
-  }
-  else {
-
-      // Redirect client output to log file
-      FILE *output_file = freopen(output_path, "w", stdout);
-      ASSERT_TRUE(output_file);
-      // --- Parent PROCESS: udp-client ---
-      char line[256];
-
-      usleep(500000); // 0.5 seconds
-
-      wasm_component_application_execute_func(comp_instance_2, func_name);
-      StopChild();
-  }
-
-  FILE *output = fopen(output_path, "r");
-  ASSERT_TRUE(output);
-
-  char line[256][256];
-  uint32_t i = 0;
-  while(fgets(line[i], sizeof(line[i]), output)) i++;
-
-  ASSERT_TRUE(strstr(line[0], "Sending 5 messages to 127.0.0.1:9090")); // client connected and sending to server
-  ASSERT_TRUE(strstr(line[2], "Received echo: Message 1/5")); // first message received by server
-  ASSERT_TRUE(strstr(line[10], "Received echo: Message 5/5")); // last message received by server
-  ASSERT_TRUE(strstr(line[11], "Done")); // Transmission done
-
+    ExpectUnsupportedWasiFixture("udp_server_2.wasm");
+    ExpectUnsupportedWasiFixture("udp_client_2.wasm");
 }
 
 TEST_F(CanonicalExecutionTest, test_wasi_filesystem)
@@ -639,58 +428,9 @@ TEST_F(CanonicalExecutionTest, test_wasi_filesystem)
   ASSERT_TRUE(status);
 }
 
-TEST_F(CanonicalExecutionTest, test_wasi_ip_name_lookup)
+TEST_F(CanonicalExecutionTest, rejects_wasi_0_2_9_ip_name_lookup)
 {
-  bool status;
-
-  WASMComponent *component = LoadfromCandidates("ip_name_lookup_local.wasm");
-  ASSERT_NE(component, nullptr) << "Failed to load/parse component from candidates.";
-
-  ASSERT_TRUE(component);
-
-  libc_component_wasi_init(component, 0, NULL, &parse_ctx);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-  // Test component is instantiated
-  WASMComponentInstance *comp_instance = wasm_component_instantiate_internal(component, NULL, error_buf, sizeof(error_buf));
-  ASSERT_TRUE(comp_instance);
-
-  init_prestats(comp_instance);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-
-    // Redirect output to log file
-  FILE *output_file = freopen(output_path, "w", stdout);
-  ASSERT_TRUE(output_file);
-
-  char func_name[] = "run()";
-  status = wasm_component_application_execute_func(comp_instance, func_name);
-
-  fflush(stdout);
-  int restore_result = dup2(log_file_fd, STDOUT_FILENO);
-  close(log_file_fd);
-  log_file_fd = -1;
-  ASSERT_EQ(restore_result, STDOUT_FILENO);
-  ASSERT_TRUE(status);
-
-  FILE *output = fopen(output_path, "r");
-  ASSERT_TRUE(output);
-
-  bool saw_resolving = false;
-  bool saw_address = false;
-  bool saw_summary = false;
-  char line[256];
-  while (fgets(line, sizeof(line), output)) {
-      saw_resolving |= strstr(line, "Resolving: localhost") != NULL;
-      saw_address |= strstr(line, "  -> ") != NULL;
-      saw_summary |= strstr(line, "Resolved ") != NULL
-                     && strstr(line, " address(es) for localhost") != NULL;
-  }
-  fclose(output);
-
-  ASSERT_TRUE(saw_resolving);
-  ASSERT_TRUE(saw_address);
-  ASSERT_TRUE(saw_summary);
+    ExpectUnsupportedWasiFixture("ip_name_lookup_local.wasm");
 }
 
 // Test apps made with C WASi-SDK
@@ -983,39 +723,7 @@ TEST_F(CanonicalExecutionTest, test_udp_server_c)
   }
 }
 
-TEST_F(CanonicalExecutionTest, test_wasi_filesystem_sandboxing)
+TEST_F(CanonicalExecutionTest, rejects_wasi_0_2_9_filesystem_sandbox)
 {
-  bool status;
-  const char* file_name = "test_filesystem_paths_comp.wasm";
-  WASMComponent *component = LoadfromCandidates(file_name);
-  ASSERT_NE(component, nullptr) << "Failed to load/parse component from candidates.";
-  ASSERT_TRUE(component);
-
-  ASSERT_FALSE(libc_wasi_parse_options("inherit-env=y", &parse_ctx));
-
-  char absolute_escaped_path[PATH_MAX] =
-      CANONICAL_EXECUTION_TEST_DIR "/example.txt";
-
-  const char *wasm_argv[] = {
-      file_name, 
-      "--",                         
-      absolute_escaped_path                     
-  };
-  int wasm_argc = 3;
-
-  libc_component_wasi_init(component, wasm_argc, (char **)wasm_argv, &parse_ctx);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-
-  WASMComponentInstance *comp_instance = wasm_component_instantiate_internal(component, NULL, error_buf, sizeof(error_buf));
-  ASSERT_TRUE(comp_instance);
-
-  init_prestats(comp_instance);
-
-  bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
-
-  char func_name[] = "run()";
-  status = wasm_component_application_execute_func(comp_instance, func_name);
-  
-  ASSERT_TRUE(status);
+    ExpectUnsupportedWasiFixture("test_filesystem_paths_comp.wasm");
 }
