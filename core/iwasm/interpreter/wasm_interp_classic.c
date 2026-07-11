@@ -1371,7 +1371,12 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
                              WASMInterpFrame *prev_frame)
 {
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-    if (cur_func->canon_options) {
+    /* Synthetic host imports already receive canonical core ABI cells and
+     * must continue through the native dispatcher. A component callee always
+     * has a persistent core module instance. */
+    if (cur_func->canon_options && cur_func->component_function
+        && cur_func->component_function->core_func
+        && cur_func->component_function->core_func->module_instance) {
         // Lower opts (caller, C1)
         CanonicalOptions *lower_opts = cur_func->canon_options;
 

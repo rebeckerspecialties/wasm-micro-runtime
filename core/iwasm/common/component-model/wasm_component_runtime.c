@@ -1980,10 +1980,9 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     exec_env->core_func = cur_func;
 
 #if WASM_ENABLE_SIMD != 0 && WASM_ENABLE_FAST_INTERP != 0
-    /* fp as v128*: each step = 16 bytes; ints at byte offset MAX_REG_FLOATS*16
-     */
+    /* Each SIMD register occupies two uint64 slots in argv1. */
     fps = (V128 *)argv1;
-    ints = (uint64 *)(fps + MAX_REG_FLOATS);
+    ints = argv1 + MAX_REG_FLOATS * 2;
 #else
     /* fp as v128*: each step = 16 bytes; ints at byte offset MAX_REG_FLOATS*8
      */
