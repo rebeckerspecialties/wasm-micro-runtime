@@ -32,7 +32,7 @@ class WasiP2RandomWrapperTest : public testing::Test
 
     bool runtime_init = false;
     WASMComponentInstance *comp_instance;
-    libc_wasi_parse_context_t parse_ctx;
+    libc_wasi_parse_context_t parse_ctx = {};
 
     virtual void SetUp() {
       printf("Starting setup\n");

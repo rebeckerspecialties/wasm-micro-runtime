@@ -1840,6 +1840,13 @@ bool
 lower_own(LiftLowerContext *cx, WASMComponentResourceHandleInstance *type,
           wit_value_t value, uint32_t *out_index)
 {
+    if (!value
+        || (value->type != COMPONENT_VAL_TYPE_RESOURCE_SYNC
+            && value->type != COMPONENT_VAL_TYPE_RESOURCE_ASYNC)) {
+        set_component_exception(cx, "expected resource value for own handle");
+        return false;
+    }
+
     // 1. Get rep from wit_value
     uint32_t rep = value->value.resource_value.value;
 
@@ -1869,6 +1876,14 @@ lower_borrow(LiftLowerContext *cx, WASMComponentResourceHandleInstance *type,
              wit_value_t value, uint32_t *out_index)
 {
     bh_assert(cx->borrow_scope_type == BORROW_SCOPE_TASK);
+
+    if (!value
+        || (value->type != COMPONENT_VAL_TYPE_RESOURCE_SYNC
+            && value->type != COMPONENT_VAL_TYPE_RESOURCE_ASYNC)) {
+        set_component_exception(cx,
+                                "expected resource value for borrow handle");
+        return false;
+    }
 
     // Check if lowering a borrow to the same component that owns the resource,
     // just pass the rep directly.

@@ -20,8 +20,108 @@
 #include <sys/socket.h>
 #include <pthread.h>
 #include <limits.h>
+#include <unistd.h>
 
 // Helper function
+
+static uint32_t
+add_tcp_stream_resource(HostResourceTable *table, HostResourceType type,
+                        int32_t fd)
+{
+    HostResource *resource;
+    uint32_t rep;
+
+    if (fd < 0) {
+        return 0;
+    }
+
+    resource = host_resource_create(type, sizeof(StreamResourceType));
+    if (!resource) {
+        close(fd);
+        return 0;
+    }
+
+    ((StreamResourceType *)resource->data)->fd = (uint32_t)fd;
+    ((StreamResourceType *)resource->data)->type = STREAM_TYPE_SOCKET;
+    host_resource_set_dtor(resource, tcp_owned_stream_dtor);
+
+    rep = host_resource_table_add(table, resource);
+    if (rep == 0) {
+        destroy_host_resource(resource);
+    }
+    return rep;
+}
+
+static uint32_t
+add_udp_datagram_stream_resource(HostResourceTable *table,
+                                 HostResourceType type, int32_t fd)
+{
+    HostResource *resource;
+    uint32_t rep;
+
+    if (fd < 0) {
+        return 0;
+    }
+
+    resource = host_resource_create(type, sizeof(uint32_t));
+    if (!resource) {
+        close(fd);
+        return 0;
+    }
+
+    *(uint32_t *)resource->data = (uint32_t)fd;
+    host_resource_set_dtor(resource, udp_datagram_stream_dtor);
+
+    rep = host_resource_table_add(table, resource);
+    if (rep == 0) {
+        destroy_host_resource(resource);
+    }
+    return rep;
+}
+
+static wit_value_t
+make_resource_tuple_result(const uint32_t *reps, uint32_t count)
+{
+    wit_value_t *elems;
+    wit_value_t tuple;
+    wit_value_t result;
+    uint32_t i;
+
+    if (!reps || count == 0) {
+        return NULL;
+    }
+
+    elems = wasm_runtime_malloc(count * sizeof(wit_value_t));
+    if (!elems) {
+        return NULL;
+    }
+
+    for (i = 0; i < count; i++) {
+        elems[i] = wit_resource_ctor(reps[i]);
+        if (!elems[i]) {
+            while (i > 0) {
+                free_wit_value(elems[--i]);
+            }
+            wasm_runtime_free(elems);
+            return NULL;
+        }
+    }
+
+    tuple = wit_tuple_ctor(elems, count);
+    if (!tuple) {
+        for (i = 0; i < count; i++) {
+            free_wit_value(elems[i]);
+        }
+        wasm_runtime_free(elems);
+        return NULL;
+    }
+
+    result = wit_result_ctor(false, tuple);
+    if (!result) {
+        free_wit_value(tuple);
+    }
+    return result;
+}
 
 /**
  * @brief Helper function to convert a WASI IP socket address struct into a WIT
@@ -204,7 +304,7 @@ wasi_sockets_instance_network_instance_network_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(out);
+    wit_value_t out_val = wit_resource_ctor(out);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &out);
@@ -240,7 +340,6 @@ wasi_sockets_ip_name_lookup_resolve_addresses_wrapper(wasm_exec_env_t exec_env,
 
     wit_value_t lifted_handle = NULL;
     wit_value_t result = NULL;
-
     if (!lift_borrow(
             exec_env->cx, network_handle,
             func_type->params->params[0].type->type_specific.resource_handle,
@@ -313,7 +412,7 @@ wasi_sockets_ip_name_lookup_resolve_addresses_wrapper(wasm_exec_env_t exec_env,
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
-        wit_value_t out_val = wit_u32_ctor(out);
+        wit_value_t out_val = wit_resource_ctor(out);
         result = wit_result_ctor(false, out_val);
         goto end;
     }
@@ -474,7 +573,7 @@ wasi_sockets_ip_name_lookup_resolve_address_stream_subscribe_wrapper(
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
+    wit_value_t out_val = wit_resource_ctor(index_rep);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &index_rep);
@@ -542,7 +641,7 @@ wasi_sockets_tcp_create_socket_create_tcp_socket_wrapper(
         goto end;
     }
     else {
-        wit_value_t out_rep = wit_u32_ctor(index_rep);
+        wit_value_t out_rep = wit_resource_ctor(index_rep);
         result = wit_result_ctor(false, out_rep);
         goto end;
     }
@@ -646,9 +745,9 @@ wasi_sockets_tcp_tcp_socket_start_bind_wrapper(
     HostResourceTable *hr_table = get_global_host_resource_table();
 
     HostResource *socket_hr = host_resource_table_get(
-        hr_table, lifted_socket_handle->value.u32_value);
+        hr_table, lifted_socket_handle->value.resource_value.value);
     HostResource *network_hr = host_resource_table_get(
-        hr_table, lifted_network_handle->value.u32_value);
+        hr_table, lifted_network_handle->value.resource_value.value);
 
     if (!(socket_hr && network_hr)) {
         result = get_result_error_val(WASI_NETWORK_ERROR_CODE_INVALID_ARGUMENT);
@@ -821,9 +920,9 @@ wasi_sockets_tcp_tcp_socket_start_connect_wrapper(
     HostResourceTable *hr_table = get_global_host_resource_table();
 
     HostResource *socket_hr = host_resource_table_get(
-        hr_table, lifted_socket_handle->value.u32_value);
+        hr_table, lifted_socket_handle->value.resource_value.value);
     HostResource *network_hr = host_resource_table_get(
-        hr_table, lifted_network_handle->value.u32_value);
+        hr_table, lifted_network_handle->value.resource_value.value);
 
     if (!(socket_hr && network_hr)) {
         result = get_result_error_val(WASI_NETWORK_ERROR_CODE_INVALID_ARGUMENT);
@@ -910,27 +1009,32 @@ wasi_sockets_tcp_tcp_socket_finish_connect_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
     else {
-        HostResource *hr_input_stream = host_resource_create(
-            WASI_P2_IO_INPUT_STREAM, sizeof(StreamResourceType));
-        ((StreamResourceType *)hr_input_stream->data)->fd = input_stream_fd;
-        ((StreamResourceType *)hr_input_stream->data)->type =
-            STREAM_TYPE_SOCKET;
-        uint32_t input_stream =
-            host_resource_table_add(hr_table, hr_input_stream);
+        uint32_t input_stream = add_tcp_stream_resource(
+            hr_table, WASI_P2_IO_INPUT_STREAM, input_stream_fd);
+        if (input_stream == 0) {
+            close(output_stream_fd);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+            goto end;
+        }
 
-        HostResource *hr_output_stream = host_resource_create(
-            WASI_P2_IO_OUTPUT_STREAM, sizeof(StreamResourceType));
-        ((StreamResourceType *)hr_output_stream->data)->fd = output_stream_fd;
-        ((StreamResourceType *)hr_output_stream->data)->type =
-            STREAM_TYPE_SOCKET;
-        uint32_t output_stream =
-            host_resource_table_add(hr_table, hr_output_stream);
+        uint32_t output_stream = add_tcp_stream_resource(
+            hr_table, WASI_P2_IO_OUTPUT_STREAM, output_stream_fd);
+        if (output_stream == 0) {
+            host_resource_table_delete(hr_table, input_stream);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+            goto end;
+        }
 
-        wit_value_t elems[2];
-        elems[0] = wit_u32_ctor(input_stream);
-        elems[1] = wit_u32_ctor(output_stream);
-        wit_value_t result_tuple = wit_tuple_ctor(elems, 2);
-        result = wit_result_ctor(false, result_tuple);
+        uint32_t reps[] = { input_stream, output_stream };
+        result = make_resource_tuple_result(reps, 2);
+        if (!result) {
+            host_resource_table_delete(hr_table, output_stream);
+            host_resource_table_delete(hr_table, input_stream);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+        }
         goto end;
     }
 
@@ -1128,8 +1232,11 @@ wasi_sockets_tcp_tcp_socket_accept_wrapper(wasm_exec_env_t exec_env,
             WASI_P2_TCP_SOCKET, sizeof(wasi_socket_context_t));
 
         if (!hr_new) {
-            result = get_result_error_val(
-                WASI_NETWORK_ERROR_CODE_ADDRESS_NOT_BINDABLE);
+            close(new_socket);
+            close(input_stream);
+            close(output_stream);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
 
@@ -1141,76 +1248,43 @@ wasi_sockets_tcp_tcp_socket_accept_wrapper(wasm_exec_env_t exec_env,
 
         uint32_t out = host_resource_table_add(hr_table, hr_new);
         if (out < 1) {
-            destroy_host_resource(
-                hr_new); // Clean up the HostResource on failure
-            result = get_result_error_val(
-                WASI_NETWORK_ERROR_CODE_ADDRESS_NOT_BINDABLE);
-            goto end;
-        }
-
-        // In stream
-        HostResource *hr_incoming_stream = host_resource_create(
-            WASI_P2_IO_INPUT_STREAM, sizeof(StreamResourceType));
-        ((StreamResourceType *)hr_incoming_stream->data)->fd = input_stream;
-        ((StreamResourceType *)hr_incoming_stream->data)->type =
-            STREAM_TYPE_SOCKET;
-        host_resource_set_dtor(hr_incoming_stream, tcp_owned_stream_dtor);
-
-        if (!hr_incoming_stream) {
+            destroy_host_resource(hr_new);
+            close(input_stream);
+            close(output_stream);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
 
-        ((StreamResourceType *)hr_incoming_stream->data)->fd = input_stream;
-        ((StreamResourceType *)hr_incoming_stream->data)->type =
-            STREAM_TYPE_SOCKET;
-
-        uint32_t incoming_rep =
-            host_resource_table_add(hr_table, hr_incoming_stream);
-        if (incoming_rep < 1) {
-            destroy_host_resource(hr_incoming_stream);
+        uint32_t incoming_rep = add_tcp_stream_resource(
+            hr_table, WASI_P2_IO_INPUT_STREAM, input_stream);
+        if (incoming_rep == 0) {
+            host_resource_table_delete(hr_table, out);
+            close(output_stream);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
 
-        // Out stream
-        HostResource *hr_outgoing_stream = host_resource_create(
-            WASI_P2_IO_OUTPUT_STREAM, sizeof(StreamResourceType));
-        ((StreamResourceType *)hr_outgoing_stream->data)->fd = output_stream;
-        ((StreamResourceType *)hr_outgoing_stream->data)->type =
-            STREAM_TYPE_SOCKET;
-        host_resource_set_dtor(hr_outgoing_stream, tcp_owned_stream_dtor);
-
-        if (!hr_outgoing_stream) {
-            destroy_host_resource(hr_incoming_stream);
+        uint32_t outgoing_rep = add_tcp_stream_resource(
+            hr_table, WASI_P2_IO_OUTPUT_STREAM, output_stream);
+        if (outgoing_rep == 0) {
+            host_resource_table_delete(hr_table, incoming_rep);
+            host_resource_table_delete(hr_table, out);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
 
-        ((StreamResourceType *)hr_outgoing_stream->data)->fd = output_stream;
-        ((StreamResourceType *)hr_outgoing_stream->data)->type =
-            STREAM_TYPE_SOCKET;
-
-        uint32_t outgoing_rep =
-            host_resource_table_add(hr_table, hr_outgoing_stream);
-        if (outgoing_rep < 1) {
-            destroy_host_resource(hr_incoming_stream);
-            destroy_host_resource(hr_outgoing_stream);
+        uint32_t reps[] = { out, incoming_rep, outgoing_rep };
+        result = make_resource_tuple_result(reps, 3);
+        if (!result) {
+            host_resource_table_delete(hr_table, outgoing_rep);
+            host_resource_table_delete(hr_table, incoming_rep);
+            host_resource_table_delete(hr_table, out);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
-            goto end;
         }
-
-        wit_value_t *elems =
-            (wit_value_t *)wasm_runtime_malloc(3 * sizeof(wit_value_t));
-        elems[0] = wit_s32_ctor(out);
-        elems[1] = wit_s32_ctor(incoming_rep);
-        elems[2] = wit_s32_ctor(outgoing_rep);
-        wit_value_t result_tuple = wit_tuple_ctor(elems, 3);
-        result = wit_result_ctor(false, result_tuple);
 
         goto end;
     }
@@ -2482,7 +2556,7 @@ wasi_sockets_tcp_tcp_socket_subscribe_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
+    wit_value_t out_val = wit_resource_ctor(index_rep);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &index_rep);
@@ -2612,7 +2686,7 @@ wasi_sockets_udp_create_socket_create_udp_socket_wrapper(
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
-        wit_value_t out_rep = wit_u32_ctor(index_rep);
+        wit_value_t out_rep = wit_resource_ctor(index_rep);
         result = wit_result_ctor(false, out_rep);
         goto end;
     }
@@ -2679,9 +2753,9 @@ wasi_sockets_udp_udp_socket_start_bind_wrapper(
     HostResourceTable *hr_table = get_global_host_resource_table();
 
     HostResource *socket_hr = host_resource_table_get(
-        hr_table, lifted_socket_handle->value.u32_value);
+        hr_table, lifted_socket_handle->value.resource_value.value);
     HostResource *network_hr = host_resource_table_get(
-        hr_table, lifted_network_handle->value.u32_value);
+        hr_table, lifted_network_handle->value.resource_value.value);
 
     if (!(socket_hr && network_hr)) {
         result = get_result_error_val(WASI_NETWORK_ERROR_CODE_INVALID_ARGUMENT);
@@ -2845,59 +2919,32 @@ wasi_sockets_udp_udp_socket_stream_wrapper(
         goto end;
     }
     else {
-        // In stream
-        HostResource *hr_incoming_stream = host_resource_create(
-            WASI_P2_UDP_INCOMING_DATAGRAM_STREAM, sizeof(incoming_stream));
-        *((uint32_t *)hr_incoming_stream->data) = incoming_stream;
-        host_resource_set_dtor(hr_incoming_stream, udp_datagram_stream_dtor);
-
-        if (!hr_incoming_stream) {
+        uint32_t incoming_rep = add_udp_datagram_stream_resource(
+            hr_table, WASI_P2_UDP_INCOMING_DATAGRAM_STREAM, incoming_stream);
+        if (incoming_rep == 0) {
+            close(outgoing_stream);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
 
-        *((uint32_t *)hr_incoming_stream->data) = incoming_stream;
-
-        uint32_t incoming_rep =
-            host_resource_table_add(hr_table, hr_incoming_stream);
-        if (incoming_rep < 1) {
-            destroy_host_resource(hr_incoming_stream);
+        uint32_t outgoing_rep = add_udp_datagram_stream_resource(
+            hr_table, WASI_P2_UDP_OUTGOING_DATAGRAM_STREAM, outgoing_stream);
+        if (outgoing_rep == 0) {
+            host_resource_table_delete(hr_table, incoming_rep);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
 
-        // Out stream — fcntl(F_DUPFD_CLOEXEC) fd from udp_stream(), owned
-        HostResource *hr_outgoing_stream = host_resource_create(
-            WASI_P2_UDP_OUTGOING_DATAGRAM_STREAM, sizeof(outgoing_stream));
-        *((uint32_t *)hr_outgoing_stream->data) = outgoing_stream;
-        host_resource_set_dtor(hr_outgoing_stream, udp_datagram_stream_dtor);
-
-        if (!hr_outgoing_stream) {
-            destroy_host_resource(hr_incoming_stream);
+        uint32_t reps[] = { incoming_rep, outgoing_rep };
+        result = make_resource_tuple_result(reps, 2);
+        if (!result) {
+            host_resource_table_delete(hr_table, outgoing_rep);
+            host_resource_table_delete(hr_table, incoming_rep);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
-            goto end;
         }
-
-        *((uint32_t *)hr_outgoing_stream->data) = outgoing_stream;
-
-        uint32_t outgoing_rep =
-            host_resource_table_add(hr_table, hr_outgoing_stream);
-        if (outgoing_rep < 1) {
-            destroy_host_resource(hr_incoming_stream);
-            destroy_host_resource(hr_outgoing_stream);
-            result =
-                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
-            goto end;
-        }
-
-        wit_value_t *elems = wasm_runtime_malloc(2 * sizeof(wit_value_t));
-        elems[0] = wit_u32_ctor(incoming_rep);
-        elems[1] = wit_u32_ctor(outgoing_rep);
-        wit_value_t result_tuple = wit_tuple_ctor(elems, 2);
-        result = wit_result_ctor(false, result_tuple);
         goto end;
     }
 
@@ -3510,7 +3557,7 @@ wasi_sockets_udp_udp_socket_subscribe_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
+    wit_value_t out_val = wit_resource_ctor(index_rep);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &index_rep);
@@ -3540,6 +3587,9 @@ wasi_sockets_udp_incoming_datagram_stream_receive_wrapper(
 
     wit_value_t lifted_handle = NULL;
     wit_value_t result = NULL;
+    wasi_incoming_datagram_t *datagrams = NULL;
+    uint64_t datagrams_len = 0;
+    uint64_t i = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -3556,10 +3606,7 @@ wasi_sockets_udp_incoming_datagram_stream_receive_wrapper(
         goto end;
     }
 
-    wasi_incoming_datagram_t *datagrams = NULL;
-    uint64_t datagrams_len = 0;
     int err = 0;
-    uint64_t i;
 
     HostResourceTable *hr_table = get_global_host_resource_table();
     HostResource *hr = host_resource_table_get(
@@ -3671,7 +3718,7 @@ wasi_sockets_udp_incoming_datagram_stream_subscribe_wrapper(
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
+    wit_value_t out_val = wit_resource_ctor(index_rep);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &index_rep);
@@ -3771,6 +3818,7 @@ wasi_sockets_udp_outgoing_datagram_stream_send_wrapper(wasm_exec_env_t exec_env,
     wit_value_t lifted_handle = NULL;
 
     wasi_outgoing_datagram_t *datagrams_native = NULL;
+    uint64_t i = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -3781,8 +3829,6 @@ wasi_sockets_udp_outgoing_datagram_stream_send_wrapper(wasm_exec_env_t exec_env,
 
     uint64_t sent_count = 0;
     int err = 0;
-    uint64_t i = 0;
-
     wit_value_t datagrams_val;
     load_list_from_range(
         exec_env->cx, datagrams_ptr, datagrams_len,
@@ -4011,7 +4057,7 @@ wasi_sockets_udp_outgoing_datagram_stream_subscribe_wrapper(
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
+    wit_value_t out_val = wit_resource_ctor(index_rep);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &index_rep);

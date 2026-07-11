@@ -426,7 +426,6 @@ TEST_F(ComponentHostImportsTest,
     EXPECT_TRUE(resource->is_host);
     EXPECT_FALSE(resource->is_builtin_wasi);
     EXPECT_EQ(resource->host_drop_callback, nullptr);
-
     HostResourceTableScope table_scope;
     ASSERT_TRUE(table_scope.Initialize());
     HostResourceTable *host_table = get_global_host_resource_table();
@@ -494,6 +493,13 @@ TEST_F(ComponentHostImportsTest,
     EXPECT_TRUE(resource->is_host);
     EXPECT_FALSE(resource->is_builtin_wasi);
     EXPECT_EQ(resource->host_drop_callback, nullptr);
+    WASMComponentResourceInstance *directory_entry_stream =
+        find_resource(helper.component_inst, "wasi:filesystem/types@0.2.3",
+                      "directory-entry-stream");
+    ASSERT_NE(directory_entry_stream, nullptr);
+    EXPECT_TRUE(directory_entry_stream->is_host);
+    EXPECT_FALSE(directory_entry_stream->is_builtin_wasi);
+    EXPECT_EQ(directory_entry_stream->host_drop_callback, nullptr);
 
     ASSERT_GT(helper.component_inst->component_instances_count, 7u);
     WASMComponentInstance *filesystem_types =

@@ -20,6 +20,7 @@
 #endif
 #if WASM_ENABLE_LIBC_WASI != 0 && WASM_ENABLE_COMPONENT_MODEL != 0
 #include "../libraries/libc-wasi-p2/libc_wasi_p2_wrapper.h"
+#include "../libraries/libc-wasi-p2/wasi_p2_sockets.h"
 #endif /* WASM_ENABLE_LIBC_WASI != 0 && WASM_ENABLE_COMPONENT_MODEL */
 
 static NativeSymbolsList g_native_symbols_list = NULL;
@@ -683,6 +684,10 @@ void
 wasm_native_destroy()
 {
     NativeSymbolsNode *node, *node_next;
+
+#if WASM_ENABLE_LIBC_WASI != 0 && WASM_ENABLE_COMPONENT_MODEL != 0
+    wasi_p2_sockets_cleanup();
+#endif
 
 #if WASM_ENABLE_LIBC_WASI != 0
     if (g_wasi_context_key != NULL) {

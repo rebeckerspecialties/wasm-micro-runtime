@@ -25,7 +25,7 @@ class WasiP2FilesystemWrapperTest : public testing::Test
     ~WasiP2FilesystemWrapperTest() {}
     RuntimeInitArgs init_args;
     unsigned char *component_raw = NULL;
-    libc_wasi_parse_context_t parse_ctx;
+    libc_wasi_parse_context_t parse_ctx = {};
 
     char error_buf[128];
     char global_heap_buf[HEAP_SIZE]; // 100 MB
@@ -88,8 +88,6 @@ class WasiP2FilesystemWrapperTest : public testing::Test
         strcat(created_link, "/test_file_2.txt");
         unlink(created_link);
 
-        close(dir_fd);
-
         printf("Ending teardown\n");
     }
 
@@ -102,22 +100,11 @@ class WasiP2FilesystemWrapperTest : public testing::Test
         WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(
             (WASMModuleInstanceCommon *)
                 comp_instance->core_module_instances[0]);
-        wasi_ctx->prestats = (struct fd_prestats *)wasm_runtime_malloc(
-            sizeof(struct fd_prestats));
-        ASSERT_NE(wasi_ctx->prestats, nullptr);
-        memset(wasi_ctx->prestats, 0, sizeof(struct fd_prestats));
-        // one preopen
-        wasi_ctx->prestats->size = 10;
-        wasi_ctx->prestats->prestats = (struct fd_prestat *)wasm_runtime_malloc(
-            10 * sizeof(struct fd_prestat));
-        ASSERT_NE(wasi_ctx->prestats->prestats, nullptr);
-        memset(wasi_ctx->prestats->prestats, 0, 10 * sizeof(struct fd_prestat));
         dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
-
-        ASSERT_TRUE(dir_fd < (int32_t)wasi_ctx->prestats->size);
-        wasi_ctx->prestats->prestats[dir_fd].dir = test_dir;
-        ASSERT_NE(wasi_ctx->prestats->prestats[dir_fd].dir[0], '\0');
-        fd_table_insert_existing(wasi_ctx->curfds, dir_fd, dir_fd, false);
+        ASSERT_NE(dir_fd, -1) << strerror(errno);
+        ASSERT_TRUE(fd_prestats_insert(wasi_ctx->prestats, test_dir, dir_fd));
+        ASSERT_TRUE(
+            fd_table_insert_existing(wasi_ctx->curfds, dir_fd, dir_fd, false));
     }
 
     void test_function_execution(const char *binary_name, const char *func_name) {

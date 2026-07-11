@@ -170,6 +170,11 @@ TEST_F(WasiP2SocketsTest, Tcp_FullLifecycle) {
     wasi_sockets_tcp_finish_connect(client_sock, &client_input,
                                     &client_output, &err);
     ASSERT_EQ(err, WASI_ERROR_CODE_SUCCESS);
+    ASSERT_NE(client_input, client_sock);
+    ASSERT_NE(client_output, client_sock);
+    ASSERT_NE(client_input, client_output);
+    ASSERT_NE(fcntl(client_input, F_GETFD) & FD_CLOEXEC, 0);
+    ASSERT_NE(fcntl(client_output, F_GETFD) & FD_CLOEXEC, 0);
 
     // Poll for accept
     ASSERT_NE(listen_sock, -1);
@@ -182,11 +187,19 @@ TEST_F(WasiP2SocketsTest, Tcp_FullLifecycle) {
                             &server_output, &err);
     ASSERT_EQ(err, WASI_ERROR_CODE_SUCCESS);
     ASSERT_NE(server_sock, -1);
+    ASSERT_NE(server_input, server_sock);
+    ASSERT_NE(server_output, server_sock);
+    ASSERT_NE(server_input, server_output);
+    ASSERT_NE(fcntl(server_input, F_GETFD) & FD_CLOEXEC, 0);
+    ASSERT_NE(fcntl(server_output, F_GETFD) & FD_CLOEXEC, 0);
 
     // Get remote address
     wasi_ip_socket_address_t remote_addr;
     wasi_sockets_tcp_remote_address(server_sock, &remote_addr, &err);
     ASSERT_EQ(err, WASI_ERROR_CODE_SUCCESS);
+
+    close(client_sock);
+    close(server_sock);
 
     // Send/Recv
     char send_buf[] = "hello";
@@ -197,8 +210,9 @@ TEST_F(WasiP2SocketsTest, Tcp_FullLifecycle) {
     ASSERT_EQ(nwritten, sizeof(send_buf));
 
     // Poll for server socket readability
-    ASSERT_NE(server_sock, -1);
-    struct pollfd pfd_server = { .fd = server_sock, .events = POLLIN, .revents = 0};
+    struct pollfd pfd_server = { .fd = server_input,
+                                 .events = POLLIN,
+                                 .revents = 0 };
     ret = poll(&pfd_server, 1, 1000);
     ASSERT_GT(ret, 0);
 
@@ -206,12 +220,10 @@ TEST_F(WasiP2SocketsTest, Tcp_FullLifecycle) {
     ASSERT_EQ(nread, sizeof(send_buf));
     ASSERT_STREQ(send_buf, recv_buf);
 
-    // Shutdown
-    err = wasi_sockets_tcp_shutdown(client_sock, WASI_SHUTDOWN_TYPE_BOTH);
-    ASSERT_EQ(err, WASI_ERROR_CODE_SUCCESS);
-
-    close(client_sock);
-    close(server_sock);
+    close(client_input);
+    close(client_output);
+    close(server_input);
+    close(server_output);
     close(listen_sock);
 }
 
@@ -886,10 +898,13 @@ TEST_F(WasiP2SocketsTest, Udp_Stream) {
     ASSERT_NE(output_stream, (wasi_outgoing_datagram_stream_t)-1);
     ASSERT_NE(input_stream, sock);
     ASSERT_NE(output_stream, sock);
+    ASSERT_NE(input_stream, output_stream);
+    ASSERT_NE(fcntl(input_stream, F_GETFD) & FD_CLOEXEC, 0);
+    ASSERT_NE(fcntl(output_stream, F_GETFD) & FD_CLOEXEC, 0);
 
+    close(sock);
     close(input_stream);
     close(output_stream);
-    close(sock);
 }
 
 // Test: wasi:sockets/tcp.start-bind with an invalid socket

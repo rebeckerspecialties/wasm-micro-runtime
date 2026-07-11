@@ -25,7 +25,7 @@ class CanonicalExecutionTest : public testing::Test
     ~CanonicalExecutionTest() {}
     RuntimeInitArgs init_args;
     unsigned char *component_raw = NULL;
-    libc_wasi_parse_context_t parse_ctx;
+    libc_wasi_parse_context_t parse_ctx = {};
 
     char error_buf[128];
     char global_heap_buf[HEAP_SIZE]; // 100 MB
@@ -39,7 +39,6 @@ class CanonicalExecutionTest : public testing::Test
     WASIContext *wasi_ctx;
     char test_dir[PATH_MAX] = CANONICAL_EXECUTION_TEST_DIR;
 
-    int32_t dir_fd;
     char source_dir[8] = "/source";
     char dest_dir[6] = "/dest";
     char cwd_path[2] = "/";
@@ -122,40 +121,33 @@ class CanonicalExecutionTest : public testing::Test
         WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(
             (WASMModuleInstanceCommon *)
                 comp_instance->core_module_instances[0]);
-        wasi_ctx->prestats = (struct fd_prestats *)wasm_runtime_malloc(
-            sizeof(struct fd_prestats));
-        ASSERT_NE(wasi_ctx->prestats, nullptr);
-        memset(wasi_ctx->prestats, 0, sizeof(struct fd_prestats));
-        wasi_ctx->prestats->size = 10;
-        wasi_ctx->prestats->prestats = (struct fd_prestat *)wasm_runtime_malloc(
-            10 * sizeof(struct fd_prestat));
-        ASSERT_NE(wasi_ctx->prestats->prestats, nullptr);
-        memset(wasi_ctx->prestats->prestats, 0, 10 * sizeof(struct fd_prestat));
-
         char source_path[PATH_MAX];
         source_path[0] = '\0';
         strcat(source_path, test_dir);
         strcat(source_path, source_dir);
         int32_t source_dir_fd = open(source_path, O_RDONLY | O_DIRECTORY);
-        wasi_ctx->prestats->prestats[source_dir_fd].dir = source_dir;
-
-        fd_table_insert_existing(wasi_ctx->curfds, source_dir_fd, source_dir_fd,
-                                 false);
+        ASSERT_NE(source_dir_fd, -1) << strerror(errno);
+        ASSERT_TRUE(
+            fd_prestats_insert(wasi_ctx->prestats, source_dir, source_dir_fd));
+        ASSERT_TRUE(fd_table_insert_existing(wasi_ctx->curfds, source_dir_fd,
+                                             source_dir_fd, false));
 
         char dest_path[PATH_MAX];
         dest_path[0] = '\0';
         strcat(dest_path, test_dir);
         strcat(dest_path, dest_dir);
         int32_t dest_dir_fd = open(dest_path, O_RDONLY | O_DIRECTORY);
-        wasi_ctx->prestats->prestats[dest_dir_fd].dir = dest_dir;
-
-        fd_table_insert_existing(wasi_ctx->curfds, dest_dir_fd, dest_dir_fd,
-                                 false);
+        ASSERT_NE(dest_dir_fd, -1) << strerror(errno);
+        ASSERT_TRUE(
+            fd_prestats_insert(wasi_ctx->prestats, dest_dir, dest_dir_fd));
+        ASSERT_TRUE(fd_table_insert_existing(wasi_ctx->curfds, dest_dir_fd,
+                                             dest_dir_fd, false));
 
         int32_t cwd_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
-        wasi_ctx->prestats->prestats[cwd_fd].dir = cwd_path;
-
-        fd_table_insert_existing(wasi_ctx->curfds, cwd_fd, cwd_fd, false);
+        ASSERT_NE(cwd_fd, -1) << strerror(errno);
+        ASSERT_TRUE(fd_prestats_insert(wasi_ctx->prestats, cwd_path, cwd_fd));
+        ASSERT_TRUE(
+            fd_table_insert_existing(wasi_ctx->curfds, cwd_fd, cwd_fd, false));
     }
 };
 

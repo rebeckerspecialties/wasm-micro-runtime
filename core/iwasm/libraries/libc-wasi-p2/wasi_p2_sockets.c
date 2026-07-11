@@ -119,8 +119,8 @@ udp_socket_dtor(void *data)
     close(((wasi_socket_context_t *)data)->fd);
 }
 
-/* TCP input/output streams from tcp.accept carry a dup()'d socket fd
-   that duplicate is independently owned and must be closed on drop. */
+/* TCP input/output streams carry a duplicated socket fd that is independently
+   owned and must be closed on drop. */
 void
 tcp_owned_stream_dtor(void *data)
 {
@@ -133,6 +133,38 @@ void
 udp_datagram_stream_dtor(void *data)
 {
     close((int)*(uint32_t *)data);
+}
+
+static int
+duplicate_socket_streams(int socket_fd, int32_t *input_stream,
+                         int32_t *output_stream)
+{
+    int input_fd;
+    int output_fd;
+    int error;
+
+    if (!input_stream || !output_stream) {
+        return EINVAL;
+    }
+
+    *input_stream = -1;
+    *output_stream = -1;
+
+    input_fd = fcntl(socket_fd, F_DUPFD_CLOEXEC, 0);
+    if (input_fd < 0) {
+        return errno;
+    }
+
+    output_fd = fcntl(socket_fd, F_DUPFD_CLOEXEC, 0);
+    if (output_fd < 0) {
+        error = errno;
+        close(input_fd);
+        return error;
+    }
+
+    *input_stream = input_fd;
+    *output_stream = output_fd;
+    return 0;
 }
 
 // --- Asynchronous DNS Resolution Infrastructure ---
@@ -170,6 +202,8 @@ static HashMap *resolve_streams_map = NULL;
  * @brief A mutex to ensure thread-safe access to the `resolve_streams_map`.
  */
 static pthread_mutex_t resolve_streams_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t resolve_workers_cond = PTHREAD_COND_INITIALIZER;
+static uint32_t resolve_active_workers = 0;
 
 /**
  * @brief A simple counter to generate unique IDs for resolve-stream resources.
@@ -242,16 +276,18 @@ init_resolve_streams_map()
 void
 destroy_resolve_streams_map()
 {
-    resolve_streams_map = NULL;
+    wasi_p2_sockets_cleanup();
 }
 
 void
 wasi_sockets_drop_resolve_stream(uint32_t stream_id)
 {
-    if (!resolve_streams_map)
-        return;
     void *old_key = NULL, *old_val = NULL;
     pthread_mutex_lock(&resolve_streams_lock);
+    if (!resolve_streams_map) {
+        pthread_mutex_unlock(&resolve_streams_lock);
+        return;
+    }
     bool removed = bh_hash_map_remove(
         resolve_streams_map, (void *)(uintptr_t)stream_id, &old_key, &old_val);
     pthread_mutex_unlock(&resolve_streams_lock);
@@ -343,6 +379,12 @@ resolve_thread(void *arg)
     }
     wasm_runtime_free(args->name);
     wasm_runtime_free(args);
+
+    pthread_mutex_lock(&resolve_streams_lock);
+    bh_assert(resolve_active_workers > 0);
+    resolve_active_workers--;
+    pthread_cond_broadcast(&resolve_workers_cond);
+    pthread_mutex_unlock(&resolve_streams_lock);
     return NULL;
 }
 
@@ -356,12 +398,20 @@ resolve_thread(void *arg)
 void
 wasi_p2_sockets_cleanup(void)
 {
-    // Destroy the hash map, which will also call the destructor for each
-    // remaining resolve_stream_t.
+    pthread_mutex_lock(&resolve_streams_lock);
+    while (resolve_active_workers > 0) {
+        pthread_cond_wait(&resolve_workers_cond, &resolve_streams_lock);
+    }
+
+    // Destroy the map only after detached workers have stopped using both it
+    // and the runtime allocator.
     if (resolve_streams_map) {
         bh_hash_map_destroy(resolve_streams_map);
         resolve_streams_map = NULL;
     }
+    resolve_stream_id_counter = 0;
+    network_resource.in_use = false;
+    pthread_mutex_unlock(&resolve_streams_lock);
 }
 
 /**
@@ -523,6 +573,7 @@ wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
     struct resolve_thread_args *args = NULL;
     long id = -1;
     bool lock_held = false;
+    bool stream_inserted = false;
     int pipefd[2] = { -1, -1 };
 
     if (!is_valid_network(network)) {
@@ -596,21 +647,35 @@ wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
         *err = EINVAL;
         goto fail;
     }
+    stream_inserted = true;
 
-    // Create and detach a worker thread to perform the blocking getaddrinfo
-    // call.
+    // Create a detached worker thread to perform the blocking getaddrinfo
+    // call. Track it before creation while holding the same lock the worker
+    // needs to finish, so runtime cleanup cannot miss it.
     pthread_t th;
-    if (pthread_create(&th, NULL, resolve_thread, args) != 0) {
-        bh_hash_map_remove(resolve_streams_map, (void *)id, NULL, NULL);
-        stream = NULL; /* freed by remove */
+    pthread_attr_t thread_attr;
+    if (pthread_attr_init(&thread_attr) != 0) {
         *err = EIO;
         goto fail;
     }
+    if (pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_DETACHED)
+        != 0) {
+        pthread_attr_destroy(&thread_attr);
+        *err = EIO;
+        goto fail;
+    }
+
+    resolve_active_workers++;
+    if (pthread_create(&th, &thread_attr, resolve_thread, args) != 0) {
+        resolve_active_workers--;
+        pthread_attr_destroy(&thread_attr);
+        *err = EIO;
+        goto fail;
+    }
+    pthread_attr_destroy(&thread_attr);
+    stream->thread = th;
     args = NULL; /* ownership transferred to thread */
 
-    if (pthread_detach(th) != 0) {
-        fprintf(stderr, "wasi-sockets: warning: pthread_detach failed\n");
-    }
     *ret = id;
     *err = 0;
     pthread_mutex_unlock(&resolve_streams_lock);
@@ -618,6 +683,9 @@ wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
 
 fail:
     // Robust cleanup logic in case of any failure during setup.
+    if (lock_held && stream_inserted) {
+        bh_hash_map_remove(resolve_streams_map, (void *)id, NULL, NULL);
+    }
     if (lock_held)
         pthread_mutex_unlock(&resolve_streams_lock);
 
@@ -1065,10 +1133,9 @@ wasi_sockets_tcp_finish_connect(wasi_tcp_socket_t socket,
         *err = EWOULDBLOCK;
     }
 
-    // On success, a TCP socket can be used for both reading and writing.
+    // On success, create independently owned input and output stream fds.
     if (*err == 0) {
-        *input_stream = socket;
-        *output_stream = socket;
+        *err = duplicate_socket_streams(socket, input_stream, output_stream);
     }
 }
 
@@ -1183,11 +1250,13 @@ wasi_sockets_tcp_accept(wasi_tcp_socket_t socket, wasi_tcp_socket_t *ret,
     }
 #endif
 
-    // On success, the new socket represents a bidirectional stream.
-    *err = 0;
+    // On success, the new socket and each stream own distinct descriptors.
+    *err = duplicate_socket_streams(new_socket, input_stream, output_stream);
+    if (*err != 0) {
+        close(new_socket);
+        return;
+    }
     *ret = new_socket;
-    *input_stream = dup(new_socket);
-    *output_stream = dup(new_socket);
 }
 
 /**
@@ -1840,24 +1909,7 @@ wasi_sockets_udp_stream(wasi_udp_socket_t socket,
             return;
         }
     }
-    // Duplicate the socket descriptor to create independent handles for the
-    // input and output streams, allowing their lifecycles to be managed
-    // separately. Use F_DUPFD_CLOEXEC to atomically create a new file
-    // descriptor with the close-on-exec flag set. The O_NONBLOCK flag is
-    // inherited.
-    *input_stream = fcntl(socket, F_DUPFD_CLOEXEC, 0);
-    if (*input_stream < 0) {
-        *err = errno;
-        return;
-    }
-
-    *output_stream = fcntl(socket, F_DUPFD_CLOEXEC, 0);
-    if (*output_stream < 0) {
-        close(*input_stream);
-        *err = errno;
-        return;
-    }
-    *err = 0;
+    *err = duplicate_socket_streams(socket, input_stream, output_stream);
 }
 
 /**

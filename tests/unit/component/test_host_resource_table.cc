@@ -40,7 +40,13 @@ class HostResourceTableTest : public testing::Test
     ~HostResourceTableTest() {}
 
     virtual void SetUp() {
-        wasm_runtime_init();
+        RuntimeInitArgs init_args = {};
+        init_args.mem_alloc_type = Alloc_With_Pool;
+        init_args.mem_alloc_option.pool.heap_buf = runtime_heap_;
+        init_args.mem_alloc_option.pool.heap_size = sizeof(runtime_heap_);
+        runtime_initialized_ = wasm_runtime_full_init(&init_args);
+        ASSERT_TRUE(runtime_initialized_);
+
         bool success = instantiate_host_resource_table();
         ASSERT_TRUE(success);
         table_ = get_global_host_resource_table();
@@ -52,10 +58,16 @@ class HostResourceTableTest : public testing::Test
             destroy_host_resource_table();
             table_ = nullptr;
         }
-        wasm_runtime_destroy();
+        if (runtime_initialized_) {
+            wasm_runtime_destroy();
+            runtime_initialized_ = false;
+        }
     }
 
   protected:
+    static constexpr size_t RUNTIME_HEAP_SIZE = 1024 * 1024;
+    alignas(8) char runtime_heap_[RUNTIME_HEAP_SIZE];
+    bool runtime_initialized_ = false;
     HostResourceTable *table_;
 
     // Helper function to create a test host resource

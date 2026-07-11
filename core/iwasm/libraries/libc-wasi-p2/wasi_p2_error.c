@@ -42,7 +42,7 @@ get_stream_error_val(bool is_closed, uint32_t error_idx)
     }
     else {
         ret = wit_variant_ctor("last-operation-failed", 21,
-                               wit_u32_ctor(error_idx));
+                               wit_resource_ctor(error_idx));
     }
     return wit_result_ctor(true, ret);
 }

@@ -228,6 +228,7 @@ TEST_F(WasiP2FilesystemTest, Filesystem_ReadDirectoryWithMixedTypes) {
               WASI_DESCRIPTOR_TYPE_SYMBOLIC_LINK);
     ASSERT_EQ(found_entries["fifo_file"], WASI_DESCRIPTOR_TYPE_FIFO);
 
+    directory_entry_stream_dtor(&stream);
     close(dir_fd);
 }
 
@@ -677,6 +678,7 @@ TEST_F(WasiP2FilesystemTest, Filesystem_ReadDirectory) {
     ASSERT_EQ(err, WASI_ERROR_CODE_SUCCESS);
     ASSERT_FALSE(is_some);
 
+    directory_entry_stream_dtor(&stream);
     close(dir_fd);
 }
 

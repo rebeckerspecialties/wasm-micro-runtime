@@ -25,7 +25,7 @@ class WasiP2SocketsWrapperTest : public testing::Test
     ~WasiP2SocketsWrapperTest() {}
     RuntimeInitArgs init_args;
     unsigned char *component_raw = NULL;
-    libc_wasi_parse_context_t parse_ctx;
+    libc_wasi_parse_context_t parse_ctx = {};
 
     char error_buf[128];
     char global_heap_buf[HEAP_SIZE]; // 100 MB
@@ -110,7 +110,8 @@ TEST_F(WasiP2SocketsWrapperTest, test_call_create_udp_socket)
 {
   ASSERT_TRUE(wasm_component_application_execute_func(comp_instance, (char *)"call-create-udp-socket()"));
 
-  WASMComponentTypeInstance *ret_type = comp_instance->functions[10]->func_type->results->result;
+  WASMComponentTypeInstance *ret_type =
+      comp_instance->functions[9]->func_type->results->result;
   LiftLowerContext cx;
   cx.canonical_opts = comp_instance->core_functions[54]->canon_options;
   cx.inst = comp_instance;
@@ -446,8 +447,9 @@ TEST_F(WasiP2SocketsWrapperTest, test_call_tcp_finish_bind)
 TEST_F(WasiP2SocketsWrapperTest, test_call_tcp_start_connect)
 {
   ASSERT_TRUE(wasm_component_application_execute_func(comp_instance, (char *)"call-tcp-start-connect()"));
-  
-  WASMComponentTypeInstance *ret_type = comp_instance->functions[27]->func_type->results->result;
+
+  WASMComponentTypeInstance *ret_type =
+      comp_instance->functions[27]->func_type->results->result;
   LiftLowerContext cx;
   cx.canonical_opts = comp_instance->core_functions[71]->canon_options;
   cx.inst = comp_instance;
@@ -911,4 +913,3 @@ TEST_F(WasiP2SocketsWrapperTest, test_call_udp_lookup_resolve_next_address)
   ASSERT_NE(loaded_value, nullptr);
   ASSERT_FALSE(loaded_value->value.result_value.is_err);
 }
-

@@ -309,7 +309,7 @@ wasi_cli_get_stdin_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
+    wit_value_t out_val = wit_resource_ctor(index_rep);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &index_rep);
@@ -360,7 +360,7 @@ wasi_cli_get_stdout_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
+    wit_value_t out_val = wit_resource_ctor(index_rep);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &index_rep);
@@ -410,7 +410,7 @@ wasi_cli_get_stderr_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
+    wit_value_t out_val = wit_resource_ctor(index_rep);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &index_rep);
@@ -471,7 +471,7 @@ wasi_cli_get_terminal_stdin_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
 
-    wit_value_t wrapped_index_rep = wit_u32_ctor(index_rep);
+    wit_value_t wrapped_index_rep = wit_resource_ctor(index_rep);
     optional_result = wit_option_ctor(wrapped_index_rep);
 
 end:
@@ -534,7 +534,7 @@ wasi_cli_get_terminal_stdout_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
 
-    wit_value_t wrapped_index_rep = wit_u32_ctor(index_rep);
+    wit_value_t wrapped_index_rep = wit_resource_ctor(index_rep);
     optional_result = wit_option_ctor(wrapped_index_rep);
 
 end:
@@ -597,7 +597,7 @@ wasi_cli_get_terminal_stderr_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
 
-    wit_value_t wrapped_index_rep = wit_u32_ctor(index_rep);
+    wit_value_t wrapped_index_rep = wit_resource_ctor(index_rep);
     optional_result = wit_option_ctor(wrapped_index_rep);
 
 end:

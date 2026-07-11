@@ -110,7 +110,7 @@ wasi_filesystem_get_directories_wrapper(wasm_exec_env_t exec_env,
 
             wit_value_t *tuple_elems =
                 (wit_value_t *)wasm_runtime_malloc(2 * sizeof(wit_value_t));
-            tuple_elems[0] = wit_u32_ctor(fs_rep);
+            tuple_elems[0] = wit_resource_ctor(fs_rep);
 
             StringEncoding encoding = wasm_get_string_encoding(exec_env);
             uint8_t *encoded_str = NULL;
@@ -218,7 +218,7 @@ wasi_filesystem_read_via_stream_wrapper(wasm_exec_env_t exec_env,
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
             goto end;
         }
-        wit_value_t index_val = wit_u32_ctor(index_rep);
+        wit_value_t index_val = wit_resource_ctor(index_rep);
         result = wit_result_ctor(false, index_val);
     }
     else {
@@ -310,7 +310,7 @@ wasi_filesystem_write_via_stream_wrapper(wasm_exec_env_t exec_env,
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
             goto end;
         }
-        wit_value_t index_val = wit_u32_ctor(index_rep);
+        wit_value_t index_val = wit_resource_ctor(index_rep);
         result = wit_result_ctor(false, index_val);
     }
     else {
@@ -400,7 +400,7 @@ wasi_filesystem_append_via_stream_wrapper(wasm_exec_env_t exec_env,
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
             goto end;
         }
-        wit_value_t index_val = wit_u32_ctor(index_rep);
+        wit_value_t index_val = wit_resource_ctor(index_rep);
         result = wit_result_ctor(false, index_val);
     }
     else {
@@ -1074,7 +1074,7 @@ wasi_filesystem_read_directory_wrapper(wasm_exec_env_t exec_env,
             goto end;
         }
 
-        wit_value_t index_val = wit_u32_ctor(index_rep);
+        wit_value_t index_val = wit_resource_ctor(index_rep);
         result = wit_result_ctor(false, index_val);
     }
     else {
@@ -1594,10 +1594,10 @@ wasi_filesystem_link_at_wrapper(wasm_exec_env_t exec_env,
     char *new_path = name_val->value.string_value.chars;
 
     HostResourceTable *hr_table = get_global_host_resource_table();
-    HostResource *hr1 =
-        host_resource_table_get(hr_table, lifted_handle_old->value.u32_value);
-    HostResource *hr2 =
-        host_resource_table_get(hr_table, lifted_handle_new->value.u32_value);
+    HostResource *hr1 = host_resource_table_get(
+        hr_table, lifted_handle_old->value.resource_value.value);
+    HostResource *hr2 = host_resource_table_get(
+        hr_table, lifted_handle_new->value.resource_value.value);
 
     if (!(hr1 && hr2)) {
         wasm_runtime_set_exception(exec_env->module_inst,
@@ -1660,6 +1660,7 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
+    wit_value_t path_val = NULL;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -1674,7 +1675,6 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
         goto end;
     }
 
-    wit_value_t path_val = NULL;
     if (!load_string_from_range(exec_env->cx, path_ptr, path_len, &path_val)) {
         result = get_result_error_val(WASI_NETWORK_ERROR_CODE_INVALID_ARGUMENT);
         goto end;
@@ -1728,7 +1728,7 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
             goto end;
         }
 
-        wit_value_t index_val = wit_u32_ctor(index_rep);
+        wit_value_t index_val = wit_resource_ctor(index_rep);
         result = wit_result_ctor(false, index_val);
     }
     else {
@@ -1767,6 +1767,7 @@ wasi_filesystem_readlink_at_wrapper(wasm_exec_env_t exec_env,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
+    char *link_content = NULL;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -1781,7 +1782,6 @@ wasi_filesystem_readlink_at_wrapper(wasm_exec_env_t exec_env,
 
     char *path = name_val->value.string_value.chars;
 
-    char *link_content;
     int err = 0;
     if (!lift_borrow(
             exec_env->cx, fd,
@@ -1981,10 +1981,10 @@ wasi_filesystem_rename_at_wrapper(wasm_exec_env_t exec_env,
     char *new_path = name_val->value.string_value.chars;
 
     HostResourceTable *hr_table = get_global_host_resource_table();
-    HostResource *hr1 =
-        host_resource_table_get(hr_table, lifted_handle_old->value.u32_value);
-    HostResource *hr2 =
-        host_resource_table_get(hr_table, lifted_handle_new->value.u32_value);
+    HostResource *hr1 = host_resource_table_get(
+        hr_table, lifted_handle_old->value.resource_value.value);
+    HostResource *hr2 = host_resource_table_get(
+        hr_table, lifted_handle_new->value.resource_value.value);
 
     if (!(hr1 && hr2)) {
         wasm_runtime_set_exception(exec_env->module_inst,
@@ -2232,10 +2232,10 @@ wasi_filesystem_is_same_object_wrapper(wasm_exec_env_t exec_env,
     }
 
     HostResourceTable *hr_table = get_global_host_resource_table();
-    HostResource *hr1 =
-        host_resource_table_get(hr_table, lifted_handle_1->value.u32_value);
-    HostResource *hr2 =
-        host_resource_table_get(hr_table, lifted_handle_2->value.u32_value);
+    HostResource *hr1 = host_resource_table_get(
+        hr_table, lifted_handle_1->value.resource_value.value);
+    HostResource *hr2 = host_resource_table_get(
+        hr_table, lifted_handle_2->value.resource_value.value);
 
     if (!(hr1 && hr2)) {
         wasm_runtime_set_exception(exec_env->module_inst,
@@ -2428,7 +2428,7 @@ end:
  */
 void
 wasi_filesystem_read_directory_entry_wrapper(wasm_exec_env_t exec_env,
-                                             int64_t stream,
+                                             uint32_t stream,
                                              uint32_t offset_addr)
 {
     wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);

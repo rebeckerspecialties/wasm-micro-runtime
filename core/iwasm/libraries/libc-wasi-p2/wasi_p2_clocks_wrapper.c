@@ -159,7 +159,7 @@ wasi_monotonic_clock_subscribe_instant_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(out);
+    wit_value_t out_val = wit_resource_ctor(out);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &out);
@@ -219,7 +219,7 @@ wasi_monotonic_clock_subscribe_duration_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(out);
+    wit_value_t out_val = wit_resource_ctor(out);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &out);

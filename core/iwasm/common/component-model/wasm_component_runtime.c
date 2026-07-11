@@ -2716,9 +2716,9 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     exec_env->core_func = cur_func;
 
 #if WASM_ENABLE_SIMD != 0 && WASM_ENABLE_FAST_INTERP != 0
-    /* fp as v128*: each step = 16 bytes; integer registers follow. */
+    /* Each SIMD register occupies two uint64 slots in argv1. */
     fps = (V128 *)argv1;
-    ints = (uint64 *)(fps + COMPONENT_MAX_REG_FLOATS);
+    ints = argv1 + COMPONENT_MAX_REG_FLOATS * 2;
 #else
     /* fp slots are 8 bytes; integer registers follow. */
     fps = argv1;
@@ -2957,6 +2957,7 @@ wasm_component_runtime_set_wasi_args_ex(
     wasi_args->stdio[0] = (os_raw_file_handle)stdinfd;
     wasi_args->stdio[1] = (os_raw_file_handle)stdoutfd;
     wasi_args->stdio[2] = (os_raw_file_handle)stderrfd;
+    wasi_args->set_by_user = true;
 
     component->import_wasi_api = true;
 }
@@ -2988,6 +2989,7 @@ wasm_component_runtime_set_wasi_addr_pool(WASMComponent *component,
     if (wasi_args) {
         wasi_args->addr_pool = addr_pool;
         wasi_args->addr_count = addr_pool_size;
+        wasi_args->set_by_user = true;
     }
 }
 
@@ -3005,6 +3007,7 @@ wasm_component_runtime_set_wasi_ns_lookup_pool(WASMComponent *component,
     if (wasi_args) {
         wasi_args->ns_lookup_pool = ns_lookup_pool;
         wasi_args->ns_lookup_count = ns_lookup_pool_size;
+        wasi_args->set_by_user = true;
     }
 }
 
@@ -3020,6 +3023,7 @@ wasm_component_runtime_set_wasi_options(WASMComponent *component,
 
     if (wasi_args) {
         wasi_args->wasi_options = wasi_options;
+        wasi_args->set_by_user = true;
     }
 }
 

@@ -1262,7 +1262,7 @@ host_import_bind_resources(WASMHostImportCloneContext *clone_ctx,
 
 static void
 host_import_set_builtin_wasi_resource_provenance(
-    WASMHostImportCloneContext *clone_ctx, bool is_builtin_wasi)
+    WASMHostImportCloneContext *clone_ctx, bool allow_builtin_wasi)
 {
     for (uint32 map_idx = 0; map_idx < clone_ctx->map_capacity; map_idx++) {
         WASMHostImportCloneMapEntry *entry = &clone_ctx->map[map_idx];
@@ -1279,7 +1279,16 @@ host_import_set_builtin_wasi_resource_provenance(
         if (type
             && (type->type == COMPONENT_VAL_TYPE_RESOURCE_SYNC
                 || type->type == COMPONENT_VAL_TYPE_RESOURCE_ASYNC)) {
-            type->type_specific.resource->is_builtin_wasi = is_builtin_wasi;
+            WASMComponentResourceInstance *resource =
+                type->type_specific.resource;
+#if WASM_ENABLE_LIBC_WASI != 0
+            resource->is_builtin_wasi =
+                allow_builtin_wasi
+                && wasm_native_has_builtin_wasi_p2_resource(
+                    resource->interface_name, resource->name);
+#else
+            resource->is_builtin_wasi = false;
+#endif
         }
     }
 }
@@ -1406,6 +1415,9 @@ wasm_resolve_imports_host(WASMComponentImportSection *import_section,
                 instance_type->exports[export_idx].type;
             if (instance_type->exports[export_idx].type
                 == WASM_COMP_EXTERN_FUNC) {
+#if WASM_ENABLE_LIBC_WASI != 0
+                const NativeSymbol *wasi_symbol = NULL;
+#endif
                 if (func_export_count >= new_inst->functions_count) {
                     set_error_buf_ex(error_buf, error_buf_size,
                                      "ERROR: Import function index exceeded\n");
@@ -1460,12 +1472,18 @@ wasm_resolve_imports_host(WASMComponentImportSection *import_section,
                 new_inst->defined_core_functions_count++;
                 field_name = instance_type->exports[export_idx]
                                  .export_name->exported.simple.name->name;
+#if WASM_ENABLE_LIBC_WASI != 0
+                wasi_symbol = is_wasi ? wasm_native_get_wasi_p2_module_func(
+                                  interface_name, field_name)
+                                      : NULL;
+#endif
                 func_ptr = wasm_native_resolve_symbol_exact(
                     interface_name, field_name, func_import->func_type,
                     &func_import->signature, &func_import->attachment,
                     &func_import->call_conv_raw);
 #if WASM_ENABLE_LIBC_WASI != 0
-                if (func_ptr) {
+                if (func_ptr
+                    && (!wasi_symbol || func_ptr != wasi_symbol->func_ptr)) {
                     resolved_static_host_function = true;
                 }
 #endif
@@ -1480,9 +1498,6 @@ wasm_resolve_imports_host(WASMComponentImportSection *import_section,
                         wasm_component_deinstantiate(new_inst);
                         return false;
                     }
-                    const NativeSymbol *wasi_symbol =
-                        wasm_native_get_wasi_p2_module_func(interface_name,
-                                                            field_name);
                     if (wasi_symbol
                         && wasm_native_validate_symbol_signature(
                             func_import->func_type, wasi_symbol->signature)) {
@@ -1539,9 +1554,7 @@ wasm_resolve_imports_host(WASMComponentImportSection *import_section,
          * Resource-only and mixed static/built-in interfaces fail closed and
          * require an exact owner-drop callback. */
 #if WASM_ENABLE_LIBC_WASI != 0
-        resources_use_builtin_wasi =
-            is_wasi && !resolved_static_host_function
-            && wasm_native_has_builtin_wasi_p2_module(interface_name);
+        resources_use_builtin_wasi = is_wasi && !resolved_static_host_function;
 #endif
         host_import_set_builtin_wasi_resource_provenance(
             &clone_ctx, resources_use_builtin_wasi);

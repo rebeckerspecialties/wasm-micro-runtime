@@ -14,6 +14,7 @@
 
 extern "C" {
 #include "wasi_p2_cli.h"
+extern char **environ;
 }
 
 // The set_wasi_p2_args function is not in a public header,

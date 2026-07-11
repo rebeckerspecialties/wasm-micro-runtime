@@ -33,6 +33,10 @@ wasm_check_wasi_p2_version(const char *required_interface);
 bool
 wasm_native_has_builtin_wasi_p2_module(const char *module_name);
 
+bool
+wasm_native_has_builtin_wasi_p2_resource(const char *interface_name,
+                                         const char *resource_name);
+
 void
 wasm_native_unregister_wasi_p2_modules();
 

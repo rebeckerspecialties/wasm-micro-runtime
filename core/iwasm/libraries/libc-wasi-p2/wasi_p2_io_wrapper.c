@@ -336,7 +336,7 @@ wasi_io_streams_input_stream_read_wrapper(wasm_exec_env_t exec_env,
         wit_value_t *elems = (wit_value_t *)wasm_runtime_malloc(
             sizeof(wit_value_t) * wasi_ret.u.ok.buf_len);
         for (idx = 0; idx < wasi_ret.u.ok.buf_len; idx++) {
-            elems[idx] = wit_u32_ctor(wasi_ret.u.ok.buf[idx]);
+            elems[idx] = wit_u8_ctor(wasi_ret.u.ok.buf[idx]);
         }
         wit_value_t result_list = wit_list_ctor(elems, wasi_ret.u.ok.buf_len);
         result = wit_result_ctor(false, result_list);
@@ -426,7 +426,7 @@ wasi_io_streams_input_stream_blocking_read_wrapper(wasm_exec_env_t exec_env,
         wit_value_t *elems = (wit_value_t *)wasm_runtime_malloc(
             sizeof(wit_value_t) * wasi_ret.u.ok.buf_len);
         for (idx = 0; idx < wasi_ret.u.ok.buf_len; idx++) {
-            elems[idx] = wit_u32_ctor(wasi_ret.u.ok.buf[idx]);
+            elems[idx] = wit_u8_ctor(wasi_ret.u.ok.buf[idx]);
         }
         wit_value_t result_list = wit_list_ctor(elems, wasi_ret.u.ok.buf_len);
         result = wit_result_ctor(false, result_list);
@@ -647,7 +647,7 @@ wasi_io_streams_input_stream_subscribe_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
+    wit_value_t out_val = wit_resource_ctor(index_rep);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &index_rep);
@@ -1115,7 +1115,7 @@ wasi_io_streams_output_stream_subscribe_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
+    wit_value_t out_val = wit_resource_ctor(index_rep);
     lower_own(exec_env->cx,
               func_type->results->result[0].type_specific.resource_handle,
               out_val, &index_rep);
@@ -1294,8 +1294,8 @@ wasi_io_streams_output_stream_splice_wrapper(wasm_exec_env_t exec_env,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    wit_value_t lifted_output_handle;
-    wit_value_t lifted_input_handle;
+    wit_value_t lifted_output_handle = NULL;
+    wit_value_t lifted_input_handle = NULL;
     wit_value_t result = NULL;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
@@ -1328,7 +1328,7 @@ wasi_io_streams_output_stream_splice_wrapper(wasm_exec_env_t exec_env,
 
     HostResourceTable *hr_table = get_global_host_resource_table();
     HostResource *hr_stream_out = host_resource_table_get(
-        hr_table, lifted_output_handle->value.u32_value);
+        hr_table, lifted_output_handle->value.resource_value.value);
 
     if (!hr_stream_out) {
         wasm_runtime_set_exception(exec_env->module_inst,
@@ -1339,8 +1339,8 @@ wasi_io_streams_output_stream_splice_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
 
-    HostResource *hr_input_stream =
-        host_resource_table_get(hr_table, lifted_input_handle->value.u32_value);
+    HostResource *hr_input_stream = host_resource_table_get(
+        hr_table, lifted_input_handle->value.resource_value.value);
 
     if (!hr_input_stream) {
         wasm_runtime_set_exception(exec_env->module_inst,
@@ -1400,8 +1400,8 @@ wasi_io_streams_output_stream_blocking_splice_wrapper(
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    wit_value_t lifted_output_handle;
-    wit_value_t lifted_input_handle;
+    wit_value_t lifted_output_handle = NULL;
+    wit_value_t lifted_input_handle = NULL;
     wit_value_t result = NULL;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
@@ -1434,7 +1434,7 @@ wasi_io_streams_output_stream_blocking_splice_wrapper(
 
     HostResourceTable *hr_table = get_global_host_resource_table();
     HostResource *hr_stream_out = host_resource_table_get(
-        hr_table, lifted_output_handle->value.u32_value);
+        hr_table, lifted_output_handle->value.resource_value.value);
 
     if (!hr_stream_out) {
         wasm_runtime_set_exception(exec_env->module_inst,
@@ -1445,8 +1445,8 @@ wasi_io_streams_output_stream_blocking_splice_wrapper(
         goto end;
     }
 
-    HostResource *hr_input_stream =
-        host_resource_table_get(hr_table, lifted_input_handle->value.u32_value);
+    HostResource *hr_input_stream = host_resource_table_get(
+        hr_table, lifted_input_handle->value.resource_value.value);
 
     if (!hr_input_stream) {
         wasm_runtime_set_exception(exec_env->module_inst,

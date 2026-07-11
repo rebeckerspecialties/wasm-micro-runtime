@@ -1351,9 +1351,13 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
         saved_component_inst = exec_env->component_inst;
         saved_raw_core_func = exec_env->core_func;
         /* Resource handles belong to the component that owns the calling
-         * core instance.  Custom-data lookup performs its own root walk. */
+         * core instance. Custom-data lookup performs its own root walk. Keep
+         * only the persistent component-owned core function in the exec env;
+         * cur_func may be a synchronous call-indirect proxy on this stack. */
         exec_env->component_inst = module_inst->comp_instance;
-        exec_env->core_func = cur_func;
+        exec_env->core_func = cur_func->component_function
+                                  ? cur_func->component_function->core_func
+                                  : NULL;
         if (cur_func->canon_options && cur_func->canon_options->lift_lower_opts
             && cur_func->canon_options->lift_lower_opts->lift_opts
             && cur_func->canon_options->lift_lower_opts->lift_opts->memory
@@ -1459,10 +1463,14 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
     uintptr_t aux_stack_origin_bottom = 0;
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-    /* Raw host imports already receive the canonical core ABI cells.  They
-     * must follow the prelinked import chain to the native dispatcher rather
-     * than re-entering the component-to-component lift/lower path. */
-    if (cur_func->canon_options && !func_import->call_conv_raw) {
+    /* Raw and synthetic host imports already receive the canonical core ABI
+     * cells. They must follow the prelinked import chain to the native
+     * dispatcher rather than re-entering component-to-component adaptation.
+     * A real component callee always has a core module instance. */
+    if (cur_func->canon_options && !func_import->call_conv_raw
+        && cur_func->component_function
+        && cur_func->component_function->core_func
+        && cur_func->component_function->core_func->module_instance) {
         // Lower opts (caller, C1)
         CanonicalOptions *lower_opts = cur_func->canon_options;
 

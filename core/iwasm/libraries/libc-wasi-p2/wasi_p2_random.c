@@ -60,6 +60,12 @@ wasi_random_get_random_bytes(uint64_t len, wasi_list_u8_t *ret)
         return;
     }
 
+    if (len == 0) {
+        ret->buf = NULL;
+        ret->buf_len = 0;
+        return;
+    }
+
     ret->buf = wasm_runtime_malloc(len);
     if (!ret->buf) {
         ret->buf_len = 0;
@@ -150,6 +156,12 @@ wasi_random_get_insecure_random_bytes(uint64_t len, wasi_list_u8_t *ret)
     }
 
     ensure_insecure_seed_initialized();
+
+    if (len == 0) {
+        ret->buf = NULL;
+        ret->buf_len = 0;
+        return;
+    }
 
     ret->buf = wasm_runtime_malloc(len);
     if (!ret->buf) {

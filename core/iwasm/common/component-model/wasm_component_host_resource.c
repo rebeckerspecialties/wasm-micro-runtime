@@ -56,16 +56,7 @@ destroy_u32_key_hash_map(void *key)
 static void
 destroy_host_resource_hash_map(void *value)
 {
-    HostResource *hr = (HostResource *)value;
-    if (hr) {
-        if (hr->data) {
-            if (hr->dtor) {
-                hr->dtor(hr->data);
-            }
-            BH_FREE(hr->data);
-        }
-        BH_FREE(hr);
-    }
+    destroy_host_resource((HostResource *)value);
 }
 
 bool

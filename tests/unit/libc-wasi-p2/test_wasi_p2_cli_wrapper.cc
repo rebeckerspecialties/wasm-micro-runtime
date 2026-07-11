@@ -30,7 +30,7 @@ class WasiP2CliWrapperTest : public testing::Test
 
     bool runtime_init = false;
     WASMComponentInstance *comp_instance;
-    libc_wasi_parse_context_t parse_ctx;
+    libc_wasi_parse_context_t parse_ctx = {};
 
     char *argv[2] = {(char *)"arg1", (char *)"arg2"};
 

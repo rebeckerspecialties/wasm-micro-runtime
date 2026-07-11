@@ -60,6 +60,26 @@ TEST_F(WasiP2WrapperTest, LookupAllWasiP2Symbols)
     EXPECT_EQ(func_ptr, nullptr);
 }
 
+TEST_F(WasiP2WrapperTest, BuiltinResourceRegistryIsExactAndVersioned)
+{
+    EXPECT_TRUE(wasm_native_has_builtin_wasi_p2_resource(
+        "wasi:sockets/network@0.2.3", "network"));
+    EXPECT_TRUE(wasm_native_has_builtin_wasi_p2_resource(
+        "wasi:filesystem/types@0.2.3", "descriptor"));
+
+    EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
+        "wasi:sockets/network@0.2.3", "unknown"));
+    EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
+        "wasi:unknown/network@0.2.3", "network"));
+    EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
+        "wasi:sockets/network", "network"));
+    EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
+        "wasi:sockets/network@0.3.0", "network"));
+    EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(nullptr, "network"));
+    EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
+        "wasi:sockets/network@0.2.3", nullptr));
+}
+
 // Test to ensure that WASI P2 symbols are not resolved in the WASI P1 namespace.
 TEST_F(WasiP2WrapperTest, LookupWasiP2SymbolsInWasiP1NamespaceShouldFail)
 {
