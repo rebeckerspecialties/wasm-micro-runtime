@@ -1378,6 +1378,57 @@ wasm_runtime_get_exception(wasm_module_inst_t module_inst);
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 WASM_RUNTIME_API_EXTERN const char *
 wasm_component_runtime_get_exception(WASMComponentInstance *comp_inst);
+
+/**
+ * Validate a range in the canonical memory active for a component host
+ * callback.
+ *
+ * This API is only valid while synchronously handling a component host import
+ * on the callback thread. The exec_env must be the one supplied to that
+ * callback.
+ *
+ * Bounds are always checked as a wasm32 range, including when configurable
+ * bounds checks are disabled. Empty ranges are valid at the end of memory.
+ *
+ * @param exec_env the execution environment supplied to the host callback
+ * @param app_offset the wasm32 offset of the first byte
+ * @param size the number of bytes in the range
+ * @return true on success, false for an invalid callback context or range. An
+ *         out-of-bounds range raises a WebAssembly exception.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_validate_memory_range(wasm_exec_env_t exec_env,
+                                     uint32_t app_offset, uint32_t size);
+
+/**
+ * Validate and translate a mutable range in the canonical memory active for a
+ * component host callback.
+ *
+ * This performs the same complete range validation, and follows the same
+ * callback rules, as wasm_component_validate_memory_range(). The returned
+ * pointer is borrowed: it must not be retained after the callback returns or
+ * across a call that can re-enter WebAssembly or grow the canonical memory.
+ *
+ * @param p_native_addr output for the translated mutable address
+ *
+ * @return true on success, false for an invalid callback context, output
+ *         pointer, or range. On failure, p_native_addr is set to NULL when it
+ *         is non-NULL. An out-of-bounds range raises a WebAssembly exception.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_get_memory_range(wasm_exec_env_t exec_env, uint32_t app_offset,
+                                uint32_t size, uint8_t **p_native_addr);
+
+/**
+ * Const-qualified variant of wasm_component_get_memory_range().
+ *
+ * The callback, lifetime, and bounds rules are identical to the mutable API.
+ * Const qualification limits host access only; guest memory remains mutable.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_get_memory_range_const(wasm_exec_env_t exec_env,
+                                      uint32_t app_offset, uint32_t size,
+                                      const uint8_t **p_native_addr);
 #endif
 
 /**

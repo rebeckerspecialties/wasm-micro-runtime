@@ -62,6 +62,9 @@ add_custom_command(TARGET component-execution POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps/*.wasm
     ${CMAKE_CURRENT_BINARY_DIR}/
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/../component/wasm-apps/complex_with_host.wasm
+    ${CMAKE_CURRENT_BINARY_DIR}/complex_with_host.wasm
 )
 
 gtest_discover_tests(component-execution)
