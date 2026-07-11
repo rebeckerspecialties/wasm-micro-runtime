@@ -318,7 +318,7 @@ wasm_component_load(uint8_t *buf, uint32_t size, const LoadArgs *load_args,
         return NULL;
     }
     memset(component, 0, sizeof(*component));
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     wasi_args_set_defaults(&component->wasi_args);
 #endif
 

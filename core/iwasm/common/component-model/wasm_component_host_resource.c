@@ -63,8 +63,7 @@ bool
 instantiate_host_resource_table()
 {
     if (g_host_resource_table != NULL) {
-        LOG_WARNING("Global host resource table already initialized\n");
-        return false;
+        return true;
     }
 
     if (os_mutex_init(&host_resource_id_lock) != BHT_OK) {

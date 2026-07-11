@@ -26,7 +26,8 @@ endif ()
 
 file (GLOB source_all ${PLATFORM_SHARED_DIR}/*.c)
 
-if (NOT WAMR_BUILD_LIBC_WASI EQUAL 1)
+if (NOT WAMR_BUILD_LIBC_WASI EQUAL 1
+    AND NOT WAMR_BUILD_LIBC_WASI_P2 EQUAL 1)
   add_definitions(-DSGX_DISABLE_WASI)
 else()
   list(APPEND source_all
@@ -42,4 +43,3 @@ file (GLOB source_all_untrusted ${PLATFORM_SHARED_DIR}/untrusted/*.c)
 set (PLATFORM_SHARED_SOURCE ${source_all})
 
 set (PLATFORM_SHARED_SOURCE_UNTRUSTED ${source_all_untrusted})
-

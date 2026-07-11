@@ -1405,7 +1405,7 @@ wasm_component_instantiate_internal_ex(
     uint32 section_idx = 0;
     WASMComponentSection *section = NULL;
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     if (!comp_instance->parent) {
         const WASIArguments *wasi_args = &component->wasi_args;
         if (component->wasi_args.set_by_user
@@ -1428,7 +1428,7 @@ wasm_component_instantiate_internal_ex(
                 wasi_args->addr_count, wasi_args->ns_lookup_pool,
                 wasi_args->ns_lookup_count, wasi_args->argv, wasi_args->argc,
                 wasi_args->stdio[0], wasi_args->stdio[1], wasi_args->stdio[2],
-                error_buf, error_buf_size)) {
+                wasi_args->wasi_options, error_buf, error_buf_size)) {
             set_error_buf_ex(error_buf, error_buf_size,
                              "ERROR: Failed to initiate component wasi args\n");
             wasm_component_deinstantiate(comp_instance);
@@ -2053,7 +2053,7 @@ wasm_component_terminate(WASMComponentInstance *comp_instance)
     }
 }
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
 void
 wasm_component_runtime_destroy_wasi(WASMComponentInstance *comp_instance)
 {
@@ -2154,7 +2154,7 @@ wasm_component_deinstantiate(WASMComponentInstance *comp_instance)
         }
     }
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     if (comp_instance->wasi_ctx && !comp_instance->parent) {
         // destroy component wasi context
         wasm_component_runtime_destroy_wasi(comp_instance);
@@ -3020,7 +3020,7 @@ fail:
     return ret;
 }
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
 
 bool
 wasm_component_runtime_init_wasi(
@@ -3030,19 +3030,39 @@ wasm_component_runtime_init_wasi(
     uint32 addr_pool_size, const char *ns_lookup_pool[],
     uint32 ns_lookup_pool_size, char *argv[], uint32 argc,
     os_raw_file_handle stdinfd, os_raw_file_handle stdoutfd,
-    os_raw_file_handle stderrfd, char *error_buf, uint32 error_buf_size)
+    os_raw_file_handle stderrfd, const libc_wasi_options_t *wasi_options,
+    char *error_buf, uint32 error_buf_size)
 {
-
     WASIContext *wasi_ctx = NULL;
+    libc_wasi_options_t *owned_options =
+        wasm_runtime_malloc(sizeof(*owned_options));
+
+    if (!owned_options) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Failed to allocate WASI Preview 2 options");
+        return false;
+    }
+    if (wasi_options) {
+        *owned_options = *wasi_options;
+    }
+    else {
+        memset(owned_options, 0, sizeof(*owned_options));
+        owned_options->cli = 1;
+        owned_options->common = 1;
+        owned_options->preview2 = 1;
+    }
+
     wasi_ctx = wasm_runtime_init_wasi_internal(
         dir_list, dir_count, map_dir_list, map_dir_count, env, env_count,
         addr_pool, addr_pool_size, ns_lookup_pool, ns_lookup_pool_size, argv,
         argc, stdinfd, stdoutfd, stderrfd, error_buf, error_buf_size);
 
     if (!wasi_ctx) {
+        wasm_runtime_free(owned_options);
         LOG_DEBUG("Component wasi args init failed\n");
         return false;
     }
+    wasi_ctx->wasi_options = owned_options;
     comp_instance->wasi_ctx = wasi_ctx;
     return true;
 }
@@ -3171,5 +3191,5 @@ wasm_component_runtime_lookup_wasi_start_function(
     return NULL;
 }
 
-#endif /*WASM_ENABLE_LIBC_WASI != 0*/
+#endif /* WASM_ENABLE_LIBC_WASI_P2 != 0 */
 #endif /* WASM_ENABLE_COMPONENT_MODEL != 0*/

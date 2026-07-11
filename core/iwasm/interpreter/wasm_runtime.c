@@ -3062,7 +3062,7 @@ wasm_instantiate_internal(WASMModule *module, WASMModuleInstance *parent,
         prelinked_imports ? module->import_memory_count : 0;
     module_inst->prelinked_import_table_count =
         prelinked_imports ? module->import_table_count : 0;
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     if (component_inst) {
         wasm_runtime_set_wasi_ctx((WASMModuleInstanceCommon *)module_inst,
                                   component_inst->wasi_ctx);

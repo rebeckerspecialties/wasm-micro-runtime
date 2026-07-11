@@ -13,7 +13,7 @@
 #include "wasm_runtime_common.h"
 #include "wasm_export.h"
 #include <stdio.h>
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
 #include "../../libraries/libc-wasi-p2/libc_wasi_p2_wrapper.h"
 #endif
 
@@ -1281,7 +1281,7 @@ host_import_set_builtin_wasi_resource_provenance(
                 || type->type == COMPONENT_VAL_TYPE_RESOURCE_ASYNC)) {
             WASMComponentResourceInstance *resource =
                 type->type_specific.resource;
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
             resource->is_builtin_wasi =
                 allow_builtin_wasi
                 && wasm_native_has_builtin_wasi_p2_resource(
@@ -1318,7 +1318,7 @@ wasm_resolve_imports_host(WASMComponentImportSection *import_section,
         uint32 clone_map_capacity;
         uint64 clone_storage_size;
         bool is_wasi = false;
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
         bool resolved_static_host_function = false;
 #endif
         bool resources_use_builtin_wasi = false;
@@ -1415,7 +1415,7 @@ wasm_resolve_imports_host(WASMComponentImportSection *import_section,
                 instance_type->exports[export_idx].type;
             if (instance_type->exports[export_idx].type
                 == WASM_COMP_EXTERN_FUNC) {
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
                 const NativeSymbol *wasi_symbol = NULL;
 #endif
                 if (func_export_count >= new_inst->functions_count) {
@@ -1472,7 +1472,7 @@ wasm_resolve_imports_host(WASMComponentImportSection *import_section,
                 new_inst->defined_core_functions_count++;
                 field_name = instance_type->exports[export_idx]
                                  .export_name->exported.simple.name->name;
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
                 wasi_symbol = is_wasi ? wasm_native_get_wasi_p2_module_func(
                                   interface_name, field_name)
                                       : NULL;
@@ -1481,7 +1481,7 @@ wasm_resolve_imports_host(WASMComponentImportSection *import_section,
                     interface_name, field_name, func_import->func_type,
                     &func_import->signature, &func_import->attachment,
                     &func_import->call_conv_raw);
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
                 if (func_ptr
                     && (!wasi_symbol || func_ptr != wasi_symbol->func_ptr)) {
                     resolved_static_host_function = true;
@@ -1489,7 +1489,7 @@ wasm_resolve_imports_host(WASMComponentImportSection *import_section,
 #endif
 
                 if (!func_ptr && is_wasi) {
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
                     if (!wasm_check_wasi_p2_version(interface_name)) {
                         set_error_buf_ex(
                             error_buf, error_buf_size,
@@ -1553,7 +1553,7 @@ wasm_resolve_imports_host(WASMComponentImportSection *import_section,
          * built-in WASI fallback may use that table during resource.drop.
          * Resource-only and mixed static/built-in interfaces fail closed and
          * require an exact owner-drop callback. */
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
         resources_use_builtin_wasi = is_wasi && !resolved_static_host_function;
 #endif
         host_import_set_builtin_wasi_resource_provenance(

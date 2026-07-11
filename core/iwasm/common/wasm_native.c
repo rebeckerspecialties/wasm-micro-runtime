@@ -18,16 +18,17 @@
 #if WASM_ENABLE_WASI_NN != 0 || WASM_ENABLE_WASI_EPHEMERAL_NN != 0
 #include "wasi_nn_host.h"
 #endif
-#if WASM_ENABLE_LIBC_WASI != 0 && WASM_ENABLE_COMPONENT_MODEL != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
+#include "component-model/wasm_component_host_resource.h"
 #include "../libraries/libc-wasi-p2/libc_wasi_p2_wrapper.h"
 #include "../libraries/libc-wasi-p2/wasi_p2_sockets.h"
-#endif /* WASM_ENABLE_LIBC_WASI != 0 && WASM_ENABLE_COMPONENT_MODEL */
+#endif /* WASM_ENABLE_LIBC_WASI_P2 */
 
 static NativeSymbolsList g_native_symbols_list = NULL;
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 static void *g_wasi_context_key;
-#endif /* WASM_ENABLE_LIBC_WASI */
+#endif /* WASM_ENABLE_LIBC_WASI || WASM_ENABLE_LIBC_WASI_P2 */
 
 uint32
 get_libc_builtin_export_apis(NativeSymbol **p_libc_builtin_apis);
@@ -502,7 +503,7 @@ wasm_native_inherit_contexts(WASMModuleInstanceCommon *child,
 }
 #endif /* WASM_ENABLE_MODULE_INST_CONTEXT != 0 */
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 WASIContext *
 wasm_runtime_get_wasi_ctx(WASMModuleInstanceCommon *module_inst_comm)
 {
@@ -524,7 +525,7 @@ wasi_context_dtor(WASMModuleInstanceCommon *inst, void *ctx)
     }
     wasm_runtime_destroy_wasi(inst);
 }
-#endif /* end of WASM_ENABLE_LIBC_WASI */
+#endif /* WASM_ENABLE_LIBC_WASI || WASM_ENABLE_LIBC_WASI_P2 */
 
 #if WASM_ENABLE_QUICK_AOT_ENTRY != 0
 static bool
@@ -558,11 +559,19 @@ wasm_native_init()
         goto fail;
 #endif /* WASM_ENABLE_SPEC_TEST */
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
+    if (!instantiate_host_resource_table())
+        goto fail;
+#endif
+
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     g_wasi_context_key = wasm_native_create_context_key(wasi_context_dtor);
     if (g_wasi_context_key == NULL) {
         goto fail;
     }
+#endif /* WASM_ENABLE_LIBC_WASI || WASM_ENABLE_LIBC_WASI_P2 */
+
+#if WASM_ENABLE_LIBC_WASI != 0
     n_native_symbols = get_libc_wasi_export_apis(&native_symbols);
     if (!wasm_native_register_natives("wasi_unstable", native_symbols,
                                       n_native_symbols))
@@ -652,13 +661,13 @@ wasm_native_init()
 
 #if WASM_ENABLE_QUICK_AOT_ENTRY != 0
     if (!quick_aot_entry_init()) {
-#if WASM_ENABLE_SPEC_TEST != 0 || WASM_ENABLE_LIBC_BUILTIN != 0          \
-    || WASM_ENABLE_BASE_LIB != 0 || WASM_ENABLE_LIBC_EMCC != 0           \
-    || WASM_ENABLE_LIB_RATS != 0 || WASM_ENABLE_WASI_NN != 0             \
-    || WASM_ENABLE_APP_FRAMEWORK != 0 || WASM_ENABLE_LIBC_WASI != 0      \
-    || WASM_ENABLE_LIB_PTHREAD != 0 || WASM_ENABLE_LIB_WASI_THREADS != 0 \
-    || WASM_ENABLE_WASI_NN != 0 || WASM_ENABLE_WASI_EPHEMERAL_NN != 0    \
-    || WASM_ENABLE_SHARED_HEAP != 0
+#if WASM_ENABLE_SPEC_TEST != 0 || WASM_ENABLE_LIBC_BUILTIN != 0      \
+    || WASM_ENABLE_BASE_LIB != 0 || WASM_ENABLE_LIBC_EMCC != 0       \
+    || WASM_ENABLE_LIB_RATS != 0 || WASM_ENABLE_WASI_NN != 0         \
+    || WASM_ENABLE_APP_FRAMEWORK != 0 || WASM_ENABLE_LIBC_WASI != 0  \
+    || WASM_ENABLE_LIBC_WASI_P2 != 0 || WASM_ENABLE_LIB_PTHREAD != 0 \
+    || WASM_ENABLE_LIB_WASI_THREADS != 0 || WASM_ENABLE_WASI_NN != 0 \
+    || WASM_ENABLE_WASI_EPHEMERAL_NN != 0 || WASM_ENABLE_SHARED_HEAP != 0
         goto fail;
 #else
         return false;
@@ -667,13 +676,13 @@ wasm_native_init()
 #endif
 
     return true;
-#if WASM_ENABLE_SPEC_TEST != 0 || WASM_ENABLE_LIBC_BUILTIN != 0          \
-    || WASM_ENABLE_BASE_LIB != 0 || WASM_ENABLE_LIBC_EMCC != 0           \
-    || WASM_ENABLE_LIB_RATS != 0 || WASM_ENABLE_WASI_NN != 0             \
-    || WASM_ENABLE_APP_FRAMEWORK != 0 || WASM_ENABLE_LIBC_WASI != 0      \
-    || WASM_ENABLE_LIB_PTHREAD != 0 || WASM_ENABLE_LIB_WASI_THREADS != 0 \
-    || WASM_ENABLE_WASI_NN != 0 || WASM_ENABLE_WASI_EPHEMERAL_NN != 0    \
-    || WASM_ENABLE_SHARED_HEAP != 0
+#if WASM_ENABLE_SPEC_TEST != 0 || WASM_ENABLE_LIBC_BUILTIN != 0      \
+    || WASM_ENABLE_BASE_LIB != 0 || WASM_ENABLE_LIBC_EMCC != 0       \
+    || WASM_ENABLE_LIB_RATS != 0 || WASM_ENABLE_WASI_NN != 0         \
+    || WASM_ENABLE_APP_FRAMEWORK != 0 || WASM_ENABLE_LIBC_WASI != 0  \
+    || WASM_ENABLE_LIBC_WASI_P2 != 0 || WASM_ENABLE_LIB_PTHREAD != 0 \
+    || WASM_ENABLE_LIB_WASI_THREADS != 0 || WASM_ENABLE_WASI_NN != 0 \
+    || WASM_ENABLE_WASI_EPHEMERAL_NN != 0 || WASM_ENABLE_SHARED_HEAP != 0
 fail:
     wasm_native_destroy();
     return false;
@@ -685,11 +694,12 @@ wasm_native_destroy()
 {
     NativeSymbolsNode *node, *node_next;
 
-#if WASM_ENABLE_LIBC_WASI != 0 && WASM_ENABLE_COMPONENT_MODEL != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     wasi_p2_sockets_cleanup();
+    destroy_host_resource_table();
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     if (g_wasi_context_key != NULL) {
         wasm_native_destroy_context_key(g_wasi_context_key);
         g_wasi_context_key = NULL;

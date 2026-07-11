@@ -1567,7 +1567,7 @@ typedef struct WASMComponent {
     WASMComponentHostResourceDropRegistration *host_resource_drops;
     uint32_t host_resource_drop_count;
     uint32_t host_resource_drop_capacity;
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIArguments wasi_args;
     bool import_wasi_api;
 #endif

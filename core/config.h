@@ -149,6 +149,10 @@
 #define WASM_ENABLE_LIBC_WASI 0
 #endif
 
+#ifndef WASM_ENABLE_LIBC_WASI_P2
+#define WASM_ENABLE_LIBC_WASI_P2 0
+#endif
+
 #ifndef WASM_ENABLE_UVWASI
 #define WASM_ENABLE_UVWASI 0
 #endif

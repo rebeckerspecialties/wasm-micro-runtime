@@ -8,5 +8,8 @@
 // wasm-tools strip /tmp/wasip2_command.wasm -o wasip2_command.wasm
 
 fn main() {
+    assert_eq!(std::env::args_os().count(), 0);
+    assert_eq!(std::env::vars_os().count(), 0);
     println!("wamr wasm32-wasip2 smoke");
+    eprintln!("wamr wasm32-wasip2 stderr smoke");
 }

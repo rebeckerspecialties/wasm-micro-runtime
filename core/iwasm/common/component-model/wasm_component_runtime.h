@@ -403,7 +403,7 @@ typedef struct WASMComponentInstance {
     WASMComponent *component; // Reference to component definition
 
     WASMComponentResourceTable *table;
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIContext *wasi_ctx;
 #endif
     // Index spaces:
@@ -653,7 +653,7 @@ wasm_component_lookup_function_qualified(
     const WASMComponentInstance *component_inst, const char *interface_name,
     const char *function_name);
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
 
 bool
 wasm_component_runtime_init_wasi(
@@ -663,7 +663,8 @@ wasm_component_runtime_init_wasi(
     uint32 addr_pool_size, const char *ns_lookup_pool[],
     uint32 ns_lookup_pool_size, char *argv[], uint32 argc,
     os_raw_file_handle stdinfd, os_raw_file_handle stdoutfd,
-    os_raw_file_handle stderrfd, char *error_buf, uint32 error_buf_size);
+    os_raw_file_handle stderrfd, const libc_wasi_options_t *wasi_options,
+    char *error_buf, uint32 error_buf_size);
 
 void
 wasm_component_runtime_set_wasi_args(WASMComponent *component,

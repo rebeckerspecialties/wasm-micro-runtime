@@ -19,6 +19,31 @@ if (NOT DEFINED SHARED_PLATFORM_CONFIG)
     set (SHARED_PLATFORM_CONFIG ${SHARED_DIR}/platform/${WAMR_BUILD_PLATFORM}/shared_platform.cmake)
 endif ()
 
+# Preview 2 used to be pulled in implicitly with the Preview 1 libc-wasi
+# implementation.  Keep that behavior for component-model builds unless the
+# embedding application makes an explicit choice, while allowing Preview 2 to
+# be enabled without exposing Preview 1 imports.
+if (NOT DEFINED WAMR_BUILD_LIBC_WASI_P2)
+    if (WAMR_BUILD_COMPONENT_MODEL EQUAL 1
+        AND WAMR_BUILD_LIBC_WASI EQUAL 1)
+        set (WAMR_BUILD_LIBC_WASI_P2 1)
+    else ()
+        set (WAMR_BUILD_LIBC_WASI_P2 0)
+    endif ()
+endif ()
+
+if (WAMR_BUILD_LIBC_WASI_P2 EQUAL 1
+    AND NOT WAMR_BUILD_COMPONENT_MODEL EQUAL 1)
+    message (FATAL_ERROR
+        "WAMR_BUILD_LIBC_WASI_P2 requires WAMR_BUILD_COMPONENT_MODEL")
+endif ()
+
+if (WAMR_BUILD_LIBC_WASI_P2 EQUAL 1
+    AND WAMR_BUILD_LIBC_UVWASI EQUAL 1)
+    message (FATAL_ERROR
+        "WAMR_BUILD_LIBC_WASI_P2 does not support the uvwasi backend")
+endif ()
+
 if (DEFINED EXTRA_SDK_INCLUDE_PATH)
     message(STATUS, "EXTRA_SDK_INCLUDE_PATH = ${EXTRA_SDK_INCLUDE_PATH} ")
     include_directories (
@@ -100,9 +125,11 @@ if (WAMR_BUILD_LIBC_UVWASI EQUAL 1)
     set (WAMR_BUILD_MODULE_INST_CONTEXT 1)
 elseif (WAMR_BUILD_LIBC_WASI EQUAL 1)
     include (${IWASM_DIR}/libraries/libc-wasi/libc_wasi.cmake)
-    if (WAMR_BUILD_COMPONENT_MODEL EQUAL 1)
-        include (${IWASM_DIR}/libraries/libc-wasi-p2/libc_wasi_p2.cmake)
-    endif ()
+    set (WAMR_BUILD_MODULE_INST_CONTEXT 1)
+endif ()
+
+if (WAMR_BUILD_LIBC_WASI_P2 EQUAL 1)
+    include (${IWASM_DIR}/libraries/libc-wasi-p2/libc_wasi_p2.cmake)
     set (WAMR_BUILD_MODULE_INST_CONTEXT 1)
 endif ()
 

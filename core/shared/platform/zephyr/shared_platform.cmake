@@ -15,7 +15,8 @@ if(${CONFIG_MINIMAL_LIBC})
     set (source_all ${source_all} ${PLATFORM_COMMON_MATH_SOURCE})
 endif()
 
-if (NOT WAMR_BUILD_LIBC_WASI EQUAL 1)
+if (NOT WAMR_BUILD_LIBC_WASI EQUAL 1
+    AND NOT WAMR_BUILD_LIBC_WASI_P2 EQUAL 1)
     list(REMOVE_ITEM source_all ${PLATFORM_SHARED_DIR}/zephyr_socket.c)
     list(REMOVE_ITEM source_all ${PLATFORM_SHARED_DIR}/zephyr_file.c)
     list(REMOVE_ITEM source_all ${PLATFORM_SHARED_DIR}/zephyr_clock.c)

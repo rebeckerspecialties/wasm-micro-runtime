@@ -66,6 +66,7 @@ component_flags=(
   -DWASM_ENABLE_COMPONENT_MODEL=1
   -DWASM_ENABLE_INTERP=1
   -DWASM_ENABLE_FAST_INTERP=1
+  -DWASM_ENABLE_LIBC_WASI_P2=1
   -DWASM_ENABLE_THREAD_MGR=1
   -I "$repo_root/core/iwasm/common"
   -I "$repo_root/core/iwasm/common/component-model"
@@ -109,6 +110,11 @@ xcrun --sdk macosx clang "${common_flags[@]}" \
   "$repo_root/tests/apple-app-store-interpreter/component_wasip2_command_smoke.c" \
   "${link_flags[@]}" -o "$build_dir/component-wasip2-command-smoke"
 
+xcrun --sdk macosx clang "${common_flags[@]}" \
+  "${component_flags[@]}" \
+  "$repo_root/tests/apple-app-store-interpreter/component_wasip2_defaults_smoke.c" \
+  "${link_flags[@]}" -o "$build_dir/component-wasip2-defaults-smoke"
+
 xcrun --sdk macosx clang --analyze -Xanalyzer -analyzer-werror \
   "${common_flags[@]}" \
   "$repo_root/tests/apple-app-store-interpreter/smoke.c" \
@@ -129,6 +135,10 @@ xcrun --sdk macosx clang --analyze -Xanalyzer -analyzer-werror \
   "${common_flags[@]}" "${component_flags[@]}" \
   "$repo_root/tests/apple-app-store-interpreter/component_wasip2_command_smoke.c" \
   -o "$build_dir/component-wasip2-command-smoke.plist"
+xcrun --sdk macosx clang --analyze -Xanalyzer -analyzer-werror \
+  "${common_flags[@]}" "${component_flags[@]}" \
+  "$repo_root/tests/apple-app-store-interpreter/component_wasip2_defaults_smoke.c" \
+  -o "$build_dir/component-wasip2-defaults-smoke.plist"
 
 codesign --force --sign - --options runtime "$build_dir/embed-smoke"
 codesign --force --sign - --options runtime "$build_dir/component-smoke"
@@ -138,8 +148,11 @@ codesign --force --sign - --options runtime \
   "$build_dir/component-host-import-smoke"
 codesign --force --sign - --options runtime \
   "$build_dir/component-wasip2-command-smoke"
+codesign --force --sign - --options runtime \
+  "$build_dir/component-wasip2-defaults-smoke"
 "$build_dir/embed-smoke"
 "$build_dir/component-smoke" "$fixture"
 "$build_dir/component-termination-smoke"
 "$build_dir/component-host-import-smoke" "$host_fixture"
 "$build_dir/component-wasip2-command-smoke" "$wasip2_fixture"
+"$build_dir/component-wasip2-defaults-smoke" "$wasip2_fixture"

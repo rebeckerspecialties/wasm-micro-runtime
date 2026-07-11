@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 # Cache initializer for the Apple App Store embedding profile.  The product
-# supplies its Preview 2 host interfaces as statically linked native symbols,
-# so libc-wasi and every dynamically loaded/guest-threading facility stay off.
+# supplies custom host interfaces as statically linked native symbols and uses
+# WAMR's Preview 2 implementation for standard wasi:0.2 imports. Preview 1 and
+# every dynamically loaded/guest-threading facility stay off.
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
 set(CMAKE_C_FLAGS_RELEASE
@@ -23,6 +24,7 @@ set(WAMR_BUILD_WAMR_COMPILER 0 CACHE BOOL "" FORCE)
 set(WAMR_BUILD_COMPONENT_MODEL 1 CACHE BOOL "" FORCE)
 set(WAMR_BUILD_MULTI_MEMORY 0 CACHE BOOL "" FORCE)
 set(WAMR_BUILD_LIBC_WASI 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_LIBC_WASI_P2 1 CACHE BOOL "" FORCE)
 set(WAMR_BUILD_LIBC_UVWASI 0 CACHE BOOL "" FORCE)
 set(WAMR_BUILD_LIBC_BUILTIN 0 CACHE BOOL "" FORCE)
 

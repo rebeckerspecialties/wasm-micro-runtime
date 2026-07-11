@@ -45,13 +45,16 @@ reject_member() {
 require_member '(^|/)wasm_interp_fast\.c\.o$' "fast interpreter object"
 require_member '(^|/)wasm_component_runtime\.c\.o$' "component runtime object"
 require_member '(^|/)wasm_component_application\.c\.o$' "component application object"
+require_member '(^|/)libc_wasi_p2_wrapper\.c\.o$' \
+  "Preview 2 wrapper object"
 require_member '(^|/)thread_manager\.c\.o$' "native thread-manager object"
 
 reject_member '(^|/)wasm_interp_classic\.c\.o$' "classic interpreter object"
 reject_member '(^|/)(aot_|jit_|fast_jit|llvm_jit|compilation)' \
   "AOT, JIT, or compiler object"
-reject_member '(^|/)(libc_wasi|libc_wasi_p2|lib_pthread|lib_wasi_threads)' \
-  "built-in WASI or guest-thread library object"
+reject_member '(^|/)libc_wasi_wrapper\.c\.o$' "Preview 1 wrapper object"
+reject_member '(^|/)(lib_pthread|lib_wasi_threads)' \
+  "guest-thread library object"
 
 if ! grep -Fq -- '-flto=full' "$compile_commands"; then
   echo "compile database does not contain the required -flto=full" >&2
@@ -81,13 +84,22 @@ reject_compile_source() {
 require_compile_source '/interpreter/wasm_interp_fast.c'
 require_compile_source '/common/component-model/'
 require_compile_source '/libraries/thread-mgr/thread_manager.c'
+require_compile_source '/libraries/libc-wasi-p2/libc_wasi_p2_wrapper.c'
 reject_compile_source '/interpreter/wasm_interp_classic.c'
 reject_compile_source '/aot/'
 reject_compile_source '/compilation/'
 reject_compile_source '/fast-jit/'
-reject_compile_source '/libraries/libc-wasi/'
-reject_compile_source '/libraries/libc-wasi-p2/'
+reject_compile_source '/libraries/libc-wasi/libc_wasi_wrapper.c'
 reject_compile_source '/libraries/lib-pthread/'
 reject_compile_source '/libraries/lib-wasi-threads/'
 
-echo "verified static wasm32-wasip2 fast-interpreter full-LTO archive"
+if ! grep -Fq -- '-DWASM_ENABLE_LIBC_WASI_P2=1' "$compile_commands"; then
+  echo "compile database does not enable Preview 2" >&2
+  exit 1
+fi
+if grep -Fq -- '-DWASM_ENABLE_LIBC_WASI=1' "$compile_commands"; then
+  echo "compile database unexpectedly enables Preview 1" >&2
+  exit 1
+fi
+
+echo "verified Preview 2-only wasm32-wasip2 fast-interpreter full-LTO archive"

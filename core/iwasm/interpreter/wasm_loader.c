@@ -6894,9 +6894,9 @@ create_module(char *name, char *error_buf, uint32 error_buf_size)
     }
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     wasi_args_set_defaults(&module->wasi_args);
-#endif /* WASM_ENABLE_LIBC_WASI != 0 */
+#endif /* WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0 */
 
     (void)ret;
     return module;
