@@ -304,6 +304,35 @@ TEST_F(ComponentExecutionTest, NestedHostResourceUsesCallingComponentTable)
     EXPECT_TRUE(state.saw_root_custom_data);
 }
 
+TEST_F(ComponentExecutionTest, TestRepeatedLoadExecuteAndUnload)
+{
+    for (uint32_t i = 0; i < 8; i++) {
+        ASSERT_TRUE(helper->read_wasm_file("add.wasm"));
+        ASSERT_TRUE(helper->load_component());
+        ASSERT_TRUE(helper->instantiate_component());
+
+        uint32 argc = 0;
+        uint32 *argv = (uint32 *)wasm_runtime_malloc(sizeof(uint32) * 10);
+        ASSERT_NE(argv, nullptr);
+
+        bool ret = wasm_component_application_execute_func_ex(
+            helper->component_inst, (char *)"add(3,4)", &argc, &argv);
+        ASSERT_TRUE(ret);
+        ASSERT_EQ(wasm_component_runtime_get_exception(helper->component_inst),
+                  nullptr);
+        ASSERT_GT(argc, 0U);
+        EXPECT_EQ(argv[0], 7U);
+
+        wasm_runtime_free(argv);
+        wasm_component_deinstantiate(helper->component_inst);
+        helper->component_inst = nullptr;
+        helper->component_instantiated = false;
+        helper->reset_component();
+        BH_FREE(helper->component_raw);
+        helper->component_raw = nullptr;
+    }
+}
+
 // Call non-existent function
 TEST_F(ComponentExecutionTest, TestCallNonExistentFunction)
 {
