@@ -1284,6 +1284,10 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     WASMComponentInstance *saved_component_inst = NULL;
     WASMModuleInstanceCommon *saved_raw_module_inst = NULL;
     WASMFunctionInstance *saved_raw_core_func = NULL;
+    WASMMemoryInstance *saved_raw_memory = NULL;
+    LiftLowerContext *saved_raw_cx = NULL;
+    void *saved_raw_attachment = NULL;
+    LiftLowerContext raw_cx = { 0 };
     bool component_raw_call = false;
 #endif
 #if WASM_ENABLE_GC != 0
@@ -1348,8 +1352,14 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     component_raw_call =
         func_import->call_conv_raw && module_inst->comp_instance != NULL;
     if (component_raw_call) {
+        CanonicalOptions *raw_canon_options = NULL;
+        WASMMemoryInstance *raw_memory = NULL;
+
         saved_component_inst = exec_env->component_inst;
         saved_raw_core_func = exec_env->core_func;
+        saved_raw_memory = exec_env->memory;
+        saved_raw_cx = exec_env->cx;
+        saved_raw_attachment = exec_env->attachment;
         /* Resource handles belong to the component that owns the calling
          * core instance. Custom-data lookup performs its own root walk. Keep
          * only the persistent component-owned core function in the exec env;
@@ -1358,16 +1368,25 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
         exec_env->core_func = cur_func->component_function
                                   ? cur_func->component_function->core_func
                                   : NULL;
-        if (cur_func->canon_options && cur_func->canon_options->lift_lower_opts
-            && cur_func->canon_options->lift_lower_opts->lift_opts
-            && cur_func->canon_options->lift_lower_opts->lift_opts->memory
-            && cur_func->canon_options->lift_lower_opts->lift_opts->memory
-                   ->module_instance) {
+        raw_canon_options =
+            exec_env->core_func && exec_env->core_func->canon_options
+                ? exec_env->core_func->canon_options
+                : cur_func->canon_options;
+        if (raw_canon_options && raw_canon_options->lift_lower_opts
+            && raw_canon_options->lift_lower_opts->lift_opts) {
+            raw_memory = raw_canon_options->lift_lower_opts->lift_opts->memory;
+        }
+        raw_cx.canonical_opts = raw_canon_options;
+        raw_cx.inst = module_inst->comp_instance;
+        raw_cx.borrow_scope_type = BORROW_SCOPE_NONE;
+        raw_cx.borrow_scope.task = NULL;
+        exec_env->memory = raw_memory;
+        exec_env->cx = &raw_cx;
+        if (raw_memory && raw_memory->module_instance) {
             saved_raw_module_inst = wasm_runtime_get_module_inst(exec_env);
             wasm_exec_env_set_module_inst(
                 exec_env,
-                (WASMModuleInstanceCommon *)cur_func->canon_options
-                    ->lift_lower_opts->lift_opts->memory->module_instance);
+                (WASMModuleInstanceCommon *)raw_memory->module_instance);
         }
     }
     if (cur_func->canon_options && cur_func->component_function
@@ -1405,6 +1424,9 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
         if (saved_raw_module_inst) {
             wasm_exec_env_restore_module_inst(exec_env, saved_raw_module_inst);
         }
+        exec_env->attachment = saved_raw_attachment;
+        exec_env->cx = saved_raw_cx;
+        exec_env->memory = saved_raw_memory;
         exec_env->core_func = saved_raw_core_func;
         exec_env->component_inst = saved_component_inst;
     }

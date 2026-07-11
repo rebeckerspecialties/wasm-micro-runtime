@@ -39,12 +39,14 @@ struct MemoryProbeState {
 MemoryProbeState *memory_probe_state;
 
 void
-host_log(wasm_exec_env_t exec_env, uint32_t level, uint32_t contents_offset,
-         uint32_t contents_size)
+host_log(wasm_exec_env_t exec_env, uint64_t *canonical_cells)
 {
     MemoryProbeState *state = memory_probe_state;
     uint8_t *mutable_data = nullptr;
     const uint8_t *const_data = nullptr;
+    uint32_t level = static_cast<uint32_t>(canonical_cells[0]);
+    uint32_t contents_offset = static_cast<uint32_t>(canonical_cells[1]);
+    uint32_t contents_size = static_cast<uint32_t>(canonical_cells[2]);
 
     (void)level;
 
@@ -99,9 +101,9 @@ host_log(wasm_exec_env_t exec_env, uint32_t level, uint32_t contents_offset,
         exec_env, contents_offset, contents_size, nullptr);
 }
 
-std::array<NativeSymbol, 1> host_symbols = {
+std::array<NativeSymbol, 1> host_symbols = { {
     { "log", reinterpret_cast<void *>(host_log), "(iii)", nullptr },
-};
+} };
 
 class ComponentHostMemoryTest : public testing::Test
 {
@@ -160,7 +162,7 @@ TEST_F(ComponentHostMemoryTest, ResolvesMutableAndConstCallbackRanges)
     const auto *stale_const = reinterpret_cast<const uint8_t *>(1);
 
     LoadComponent();
-    ASSERT_TRUE(ExecuteProbe(&state));
+    EXPECT_TRUE(ExecuteProbe(&state));
 
     EXPECT_TRUE(state.callback_called);
     EXPECT_TRUE(state.validate_succeeded);

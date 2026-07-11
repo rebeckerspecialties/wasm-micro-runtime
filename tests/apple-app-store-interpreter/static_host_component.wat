@@ -10,17 +10,30 @@
     (instance $host (type $host-type)))
 
   (alias export $host "bump" (func $bump))
-  (core func $lowered-bump (canon lower (func $bump)))
+
+  (core module $memory-provider
+    (memory (export "memory") 1))
+  (core instance $memory-instance
+    (instantiate $memory-provider))
+  (alias core export $memory-instance "memory" (core memory $memory))
+  (core instance $memory-export
+    (export "memory" (memory $memory)))
+
+  (core func $lowered-bump
+    (canon lower (func $bump) (memory $memory)))
   (core instance $lowered-host
     (export "bump" (func $lowered-bump)))
 
   (core module $guest
+    (import "env" "memory" (memory 1))
     (import "host" "bump" (func $bump (param i32) (result i32)))
+    (data (i32.const 32) "wamr")
     (func (export "call") (param $value i32) (result i32)
       local.get $value
       call $bump))
   (core instance $guest-instance
     (instantiate $guest
+      (with "env" (instance $memory-export))
       (with "host" (instance $lowered-host))))
 
   (alias core export $guest-instance "call" (core func $call))

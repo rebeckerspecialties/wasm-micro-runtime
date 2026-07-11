@@ -2317,12 +2317,19 @@ get_active_component_callback_memory(WASMExecEnv *exec_env)
     WASMMemoryInstance *memory = NULL;
 
     if (!exec_env || !exec_env->component_inst || !exec_env->core_func
-        || !exec_env->core_func->canon_options
+        || !exec_env->cx || !exec_env->cx->canonical_opts
         || !exec_env->core_func->component_function || !exec_env->memory) {
         return NULL;
     }
 
-    memory = canon_get_memory(exec_env->core_func->canon_options);
+    if (exec_env->cx->inst != exec_env->component_inst
+        || (exec_env->core_func->canon_options
+            && exec_env->cx->canonical_opts
+                   != exec_env->core_func->canon_options)) {
+        return NULL;
+    }
+
+    memory = canon_get_memory(exec_env->cx->canonical_opts);
     return memory == exec_env->memory ? memory : NULL;
 }
 
@@ -2370,8 +2377,7 @@ get_component_callback_memory_range(WASMExecEnv *exec_env, uint32 app_offset,
     }
 
 fail:
-    wasm_set_exception((WASMModuleInstance *)module_inst_comm,
-                       "out of bounds memory access");
+    wasm_runtime_set_exception(module_inst_comm, "out of bounds memory access");
     return false;
 }
 
