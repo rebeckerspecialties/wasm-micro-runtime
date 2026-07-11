@@ -1100,7 +1100,7 @@ wasm_runtime_register_module_internal(const char *module_name,
                                       char *error_buf, uint32 error_buf_size);
 
 void
-wasm_runtime_unregister_module(const WASMModuleCommon *module);
+wasm_runtime_unregister_module(WASMModuleCommon *module);
 
 WASMModuleCommon *
 wasm_runtime_find_module_registered(const char *module_name);

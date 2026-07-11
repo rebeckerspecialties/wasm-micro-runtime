@@ -1273,7 +1273,7 @@ wasm_runtime_register_module(const char *module_name, WASMModuleCommon *module,
 }
 
 void
-wasm_runtime_unregister_module(const WASMModuleCommon *module)
+wasm_runtime_unregister_module(WASMModuleCommon *module)
 {
     WASMRegisteredModule *registered_module = NULL;
 
@@ -1656,11 +1656,12 @@ void
 wasm_runtime_unload(WASMModuleCommon *module)
 {
 #if WASM_ENABLE_MULTI_MODULE != 0
-    /**
-     * since we will unload and free all module when runtime_destroy()
-     * we don't want users to unwillingly disrupt it
-     */
-    return;
+    /* Registered modules are owned by the runtime and released by
+     * wasm_runtime_destroy().  An explicitly unregistered module is owned by
+     * the caller again and can be unloaded below. */
+    if (wasm_runtime_find_module_registered_by_reference(module)) {
+        return;
+    }
 #endif
 
 #if WASM_ENABLE_INTERP != 0
