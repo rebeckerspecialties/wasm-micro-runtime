@@ -1353,10 +1353,12 @@ wasm_component_instantiate_internal(
                         error_buf, error_buf_size);
 #endif
                 if (import_failed) {
-                    set_error_buf_ex(
-                        error_buf, error_buf_size,
-                        "ERROR: Import section %d instantiation failed\n",
-                        section->id);
+                    if (!error_buf || error_buf[0] == '\0') {
+                        set_error_buf_ex(
+                            error_buf, error_buf_size,
+                            "ERROR: Import section %d instantiation failed\n",
+                            section->id);
+                    }
                     wasm_component_deinstantiate(comp_instance);
                     comp_instance = NULL;
                     goto done;
