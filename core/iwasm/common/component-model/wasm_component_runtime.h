@@ -618,6 +618,10 @@ wasm_component_prepare_export_call_qualified(WASMComponentInstance *comp_inst,
                                              uint32 error_buf_size);
 
 bool
+wasm_component_prepared_call_requires_post_return(
+    const WASMComponentPreparedCall *prepared_call);
+
+bool
 wasm_component_call_prepared(WASMComponentPreparedCall *prepared_call,
                              uint32 num_results, wasm_val_t results[],
                              uint32 num_args, const wasm_val_t args[]);
@@ -729,6 +733,9 @@ wasm_component_get_custom_data(WASMComponentInstance *comp_instance);
 
 void *
 wasm_component_get_custom_data_from_exec_env(wasm_exec_env_t exec_env);
+
+bool
+wasm_component_exec_env_is_callback(wasm_exec_env_t exec_env);
 
 bool
 wasm_component_host_resource_new(wasm_exec_env_t exec_env,

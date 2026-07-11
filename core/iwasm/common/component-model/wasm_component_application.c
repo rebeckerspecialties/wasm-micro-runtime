@@ -412,6 +412,13 @@ prepared_cells_to_results(const WASMComponentPreparedCall *prepared_call,
 }
 
 bool
+wasm_component_prepared_call_requires_post_return(
+    const WASMComponentPreparedCall *prepared_call)
+{
+    return prepared_call && prepared_call->post_return_func;
+}
+
+bool
 wasm_component_call_prepared(WASMComponentPreparedCall *prepared_call,
                              uint32 num_results, wasm_val_t results[],
                              uint32 num_args, const wasm_val_t args[])

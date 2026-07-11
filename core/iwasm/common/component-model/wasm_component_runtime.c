@@ -1734,6 +1734,14 @@ wasm_component_get_custom_data_from_exec_env(wasm_exec_env_t exec_env)
     return wasm_component_get_custom_data(comp_instance);
 }
 
+bool
+wasm_component_exec_env_is_callback(wasm_exec_env_t exec_env)
+{
+    WASMExecEnv *internal_exec_env = (WASMExecEnv *)exec_env;
+
+    return internal_exec_env && internal_exec_env->component_callback_active;
+}
+
 typedef struct HostResourceMatch {
     const char *interface_name;
     const char *resource_name;

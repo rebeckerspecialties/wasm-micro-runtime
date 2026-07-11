@@ -1229,6 +1229,7 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     WASMMemoryInstance *saved_raw_memory = NULL;
     LiftLowerContext *saved_raw_cx = NULL;
     void *saved_raw_attachment = NULL;
+    bool saved_component_callback_active = false;
     LiftLowerContext raw_cx = { 0 };
     bool component_raw_call = false;
 #endif
@@ -1302,6 +1303,7 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
         saved_raw_memory = exec_env->memory;
         saved_raw_cx = exec_env->cx;
         saved_raw_attachment = exec_env->attachment;
+        saved_component_callback_active = exec_env->component_callback_active;
         /* Resource handles belong to the component that owns the calling
          * core instance. Custom-data lookup performs its own root walk. Keep
          * only the persistent component-owned core function in the exec env;
@@ -1324,6 +1326,7 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
         raw_cx.borrow_scope.task = NULL;
         exec_env->memory = raw_memory;
         exec_env->cx = &raw_cx;
+        exec_env->component_callback_active = true;
         if (raw_memory && raw_memory->module_instance) {
             saved_raw_module_inst = wasm_runtime_get_module_inst(exec_env);
             wasm_exec_env_set_module_inst(
@@ -1371,6 +1374,7 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
         exec_env->memory = saved_raw_memory;
         exec_env->core_func = saved_raw_core_func;
         exec_env->component_inst = saved_component_inst;
+        exec_env->component_callback_active = saved_component_callback_active;
     }
 #endif
 

@@ -1490,6 +1490,21 @@ wasm_component_prepare_export_call_qualified(WASMComponentInstance *comp_inst,
                                              uint32_t error_buf_size);
 
 /**
+ * Report whether this export declares a canonical post-return function.
+ *
+ * This property is available immediately after preparation, before calling
+ * the export. A successful call requires
+ * wasm_component_prepared_call_post_return() exactly when this returns true.
+ * Embedders which cannot safely lift guest-backed results may use this query
+ * to reject the prepared call before executing it.
+ *
+ * @return true when successful calls require post-return, false otherwise
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_prepared_call_requires_post_return(
+    const WASMComponentPreparedCall *prepared_call);
+
+/**
  * Call a prepared component export with canonical flattened values.
  *
  * The argument/result counts and kinds must exactly match the prepared core
@@ -1575,6 +1590,16 @@ wasm_component_get_custom_data(WASMComponentInstance *comp_inst);
 
 WASM_RUNTIME_API_EXTERN void *
 wasm_component_get_custom_data_from_exec_env(wasm_exec_env_t exec_env);
+
+/**
+ * Report whether exec_env is currently handling a raw component host import.
+ *
+ * The result is true only for the dynamic extent of the callback on its
+ * calling thread. It does not require canonical memory or non-NULL custom
+ * data, and becomes false as soon as the callback returns.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_exec_env_is_callback(wasm_exec_env_t exec_env);
 
 /**
  * Create a canonical own-resource handle from a host representation.

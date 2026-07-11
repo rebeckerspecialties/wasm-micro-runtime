@@ -36,6 +36,7 @@ typedef struct MemoryProbeState {
     bool bounds_rejected;
     bool overflow_rejected;
     bool failed_outputs_cleared;
+    bool callback_kind;
 } MemoryProbeState;
 
 static bool saw_custom_data;
@@ -54,6 +55,7 @@ bump_raw(wasm_exec_env_t exec_env, uint64_t *canonical_cells)
 
     saw_custom_data = custom_data && *custom_data == CUSTOM_DATA_COOKIE;
     memory_probe.callback_exec_env = exec_env;
+    memory_probe.callback_kind = wasm_component_exec_env_is_callback(exec_env);
 
     if (memory_probe.mode == PROBE_INVALID_RANGES) {
         uint8_t *mutable_sentinel = (uint8_t *)(uintptr_t)1;
@@ -100,6 +102,7 @@ rejects_non_callback_context(wasm_exec_env_t exec_env)
     const uint8_t *const_sentinel = (const uint8_t *)(uintptr_t)1;
 
     return !wasm_component_validate_memory_range(exec_env, 0, 0)
+           && !wasm_component_exec_env_is_callback(exec_env)
            && !wasm_component_get_memory_range(exec_env, 0, 0,
                                                &mutable_sentinel)
            && !wasm_component_get_memory_range_const(exec_env, 0, 0,
@@ -244,6 +247,8 @@ main(int argc, char **argv)
     prepared_call = wasm_component_prepare_export_call(instance, "call", error,
                                                        sizeof(error));
     if (!prepared_call
+        || wasm_component_prepared_call_requires_post_return(NULL)
+        || wasm_component_prepared_call_requires_post_return(prepared_call)
         || !wasm_component_call_prepared(prepared_call, 1, &result, 1,
                                          &argument)
         || !wasm_component_prepared_call_post_return(prepared_call)) {
@@ -258,9 +263,10 @@ main(int argc, char **argv)
                 result.kind, result.of.i32, saw_custom_data);
         goto deinstantiate;
     }
-    if (!memory_probe.valid_const || !memory_probe.valid_mutable
-        || !memory_probe.pointers_match || !memory_probe.mutable_round_trip
-        || !memory_probe.empty_at_end || !memory_probe.null_output_rejected) {
+    if (!memory_probe.callback_kind || !memory_probe.valid_const
+        || !memory_probe.valid_mutable || !memory_probe.pointers_match
+        || !memory_probe.mutable_round_trip || !memory_probe.empty_at_end
+        || !memory_probe.null_output_rejected) {
         fprintf(stderr,
                 "valid component callback memory probe failed: "
                 "const=%d mutable=%d match=%d round-trip=%d end=%d null=%d\n",
