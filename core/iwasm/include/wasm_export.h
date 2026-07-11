@@ -573,6 +573,21 @@ wasm_runtime_register_module(const char *module_name, wasm_module_t module,
                              char *error_buf, uint32_t error_buf_size);
 
 /**
+ * Remove a module from the multi-module registry without unloading it.
+ *
+ * A registered module is owned by the runtime, so wasm_runtime_unload() does
+ * not release it.  After this call removes the module from the registry, the
+ * caller owns the module again and should release it with
+ * wasm_runtime_unload().  Unload parent modules before dependencies that they
+ * reference.  Calling this function for NULL or an unregistered module has no
+ * effect.
+ *
+ * @param module the module to remove from the registry
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_unregister_module(wasm_module_t module);
+
+/**
  * Check if there is already a loaded module named module_name in the
  * runtime. Repeatedly loading a module with the same name is not allowed.
  *
@@ -637,6 +652,11 @@ wasm_runtime_load_from_sections(wasm_section_list_t section_list, bool is_aot,
 
 /**
  * Unload a WASM module.
+ *
+ * When the multi-module feature is enabled, this function leaves registered
+ * modules intact because the runtime owns them.  Call
+ * wasm_runtime_unregister_module() first to transfer ownership back to the
+ * caller and unload the module immediately.
  *
  * @param module the module to be unloaded
  */
