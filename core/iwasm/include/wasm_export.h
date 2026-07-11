@@ -674,7 +674,7 @@ wasm_runtime_get_module_hash(wasm_module_t module);
  * @param env_count     The number of elements in env.
  * @param argv          The list of command line arguments.
  * @param argc          The number of elements in argv.
- * @param stdin_handle  The raw host handle to back WASI STDIN_FILENO.
+ * @param stdinfd       The raw host handle to back WASI STDIN_FILENO.
  *                      If an invalid handle is specified (e.g. -1 on POSIX,
  *                      INVALID_HANDLE_VALUE on Windows), the platform default
  *                      for STDIN is used.
@@ -1980,7 +1980,7 @@ wasm_runtime_sum_wasm_exec_time(wasm_module_inst_t module_inst);
  * Return execution time in ms of a given wasm function with
  * func_name. If the function is not found, return 0.
  *
- * @param module_inst the WASM module instance to profile
+ * @param inst the WASM module instance to profile
  * @param func_name could be an export name or a name in the
  *                  name section
  */
@@ -2005,7 +2005,7 @@ wasm_runtime_set_max_thread_num(uint32_t num);
  * Spawn a new exec_env, the spawned exec_env
  *   can be used in other threads
  *
- * @param num the original exec_env
+ * @param exec_env the original exec_env
  *
  * @return the spawned exec_env if success, NULL otherwise
  */
