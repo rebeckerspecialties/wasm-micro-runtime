@@ -505,6 +505,25 @@ wasm_check_wasi_p2_version(const char *required_interface)
     return true;
 }
 
+bool
+wasm_native_has_builtin_wasi_p2_module(const char *module_name)
+{
+    wasi_p2_module_t *modules = NULL;
+    uint32_t count;
+
+    if (!module_name) {
+        return false;
+    }
+
+    count = get_libc_wasi_p2_export_apis(&modules);
+    for (uint32_t i = 0; i < count; i++) {
+        if (is_module_equal(modules[i].module_name, module_name)) {
+            return wasm_check_wasi_p2_version(module_name);
+        }
+    }
+    return false;
+}
+
 /**
  * @brief Get the exported APIs for the WASI P2 modules.
  * @details This function returns a pointer to the array of WASI P2 modules
@@ -615,8 +634,9 @@ wasm_native_unregister_wasi_p2_module(const char *module_name)
  * @param func_name The name of the function to find.
  * @return A pointer to the native symbol if found, otherwise NULL.
  */
-static const NativeSymbol *
-find_wasi_p2_module_func(const char *module_name, const char *func_name)
+const NativeSymbol *
+wasm_native_get_wasi_p2_module_func(const char *module_name,
+                                    const char *func_name)
 {
     wasi_p2_module_t *modules = NULL;
     uint32_t wasi_p2_module_count = get_libc_wasi_p2_export_apis(&modules);
@@ -644,7 +664,7 @@ wasm_native_register_wasi_p2_module_func(const char *module_name,
                                          const char *func_name)
 {
     const NativeSymbol *symbol =
-        find_wasi_p2_module_func(module_name, func_name);
+        wasm_native_get_wasi_p2_module_func(module_name, func_name);
     if (symbol) {
         return wasm_native_register_natives(module_name, (NativeSymbol *)symbol,
                                             1);
@@ -662,7 +682,7 @@ wasm_native_unregister_wasi_p2_module_func(const char *module_name,
                                            const char *func_name)
 {
     const NativeSymbol *symbol =
-        find_wasi_p2_module_func(module_name, func_name);
+        wasm_native_get_wasi_p2_module_func(module_name, func_name);
     if (symbol) {
         wasm_native_unregister_natives(module_name, (NativeSymbol *)symbol);
     }

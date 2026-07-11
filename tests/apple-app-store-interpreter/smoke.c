@@ -79,7 +79,6 @@ main(void)
     wasm_function_inst_t spin = NULL;
     uint32_t argv[1] = { 0 };
     pthread_t spin_thread;
-    bool spin_thread_started = false;
     int exit_code = 1;
 
     static NativeSymbol native_symbols[] = {
@@ -157,8 +156,6 @@ main(void)
         fprintf(stderr, "spin thread creation failed\n");
         goto cleanup;
     }
-    spin_thread_started = true;
-
     const struct timespec settle_time = {
         .tv_sec = 0,
         .tv_nsec = 20 * 1000 * 1000,
@@ -166,7 +163,6 @@ main(void)
     nanosleep(&settle_time, NULL);
     wasm_runtime_terminate(module_inst);
     pthread_join(spin_thread, NULL);
-    spin_thread_started = false;
 
     const char *exception = wasm_runtime_get_exception(module_inst);
     if (!spin_call.thread_env_initialized || spin_call.call_succeeded
@@ -179,10 +175,6 @@ main(void)
     exit_code = 0;
 
 cleanup:
-    if (spin_thread_started) {
-        wasm_runtime_terminate(module_inst);
-        pthread_join(spin_thread, NULL);
-    }
     if (spin_exec_env)
         wasm_runtime_destroy_exec_env(spin_exec_env);
     if (exec_env)

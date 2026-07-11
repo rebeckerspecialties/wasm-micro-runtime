@@ -26,6 +26,10 @@ HostResourceTable *g_host_resource_table = NULL;
 
 // Counter starts at 1
 static uint32_t next_id_counter = 1;
+/* Table initialization/destruction require a quiescent runtime. This lock
+ * protects ID allocation while component instances are running. */
+static korp_mutex host_resource_id_lock;
+static bool host_resource_id_lock_inited = false;
 
 // Hash function for uint32_t keys
 static uint32
@@ -72,6 +76,13 @@ instantiate_host_resource_table()
         return false;
     }
 
+    if (os_mutex_init(&host_resource_id_lock) != BHT_OK) {
+        LOG_ERROR("Failed to create host resource ID lock.\n");
+        return false;
+    }
+    host_resource_id_lock_inited = true;
+    next_id_counter = 1;
+
     // Create HashMap: size, with lock for thread safety, hash_func, key_equal,
     // key_destroy, value_destroy
     g_host_resource_table = bh_hash_map_create(
@@ -80,6 +91,8 @@ instantiate_host_resource_table()
 
     if (!g_host_resource_table) {
         LOG_ERROR("Failed to create host resource table.\n");
+        os_mutex_destroy(&host_resource_id_lock);
+        host_resource_id_lock_inited = false;
         return false;
     }
 
@@ -96,6 +109,14 @@ destroy_host_resource_table()
     // HashMap destroy will call destroy functions for all keys/values
     bh_hash_map_destroy(g_host_resource_table);
     g_host_resource_table = NULL;
+
+    if (host_resource_id_lock_inited) {
+        os_mutex_lock(&host_resource_id_lock);
+        next_id_counter = 1;
+        os_mutex_unlock(&host_resource_id_lock);
+        os_mutex_destroy(&host_resource_id_lock);
+        host_resource_id_lock_inited = false;
+    }
 }
 
 HostResourceTable *
@@ -109,9 +130,17 @@ host_resource_table_get_next_id(HostResourceType type)
 {
     uint32_t id = 0;
 
+    if (!host_resource_id_lock_inited) {
+        LOG_ERROR("Host resource table is not initialized.\n");
+        return 0;
+    }
+
+    os_mutex_lock(&host_resource_id_lock);
+
     // Check if counter would overflow the 24-bit space
     if (next_id_counter > HOST_RESOURCE_ID_MASK) {
         LOG_ERROR("Host resource ID counter overflow.\n");
+        os_mutex_unlock(&host_resource_id_lock);
         return 0;
     }
 
@@ -119,6 +148,8 @@ host_resource_table_get_next_id(HostResourceType type)
     id = (type << HOST_RESOURCE_TYPE_SHIFT) | next_id_counter;
 
     next_id_counter++;
+
+    os_mutex_unlock(&host_resource_id_lock);
 
     return id;
 }

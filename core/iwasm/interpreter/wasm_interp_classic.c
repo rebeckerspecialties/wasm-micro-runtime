@@ -1222,6 +1222,12 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     void *native_func_pointer = NULL;
     char buf[128];
     bool ret;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    WASMComponentInstance *saved_component_inst = NULL;
+    WASMModuleInstanceCommon *saved_raw_module_inst = NULL;
+    WASMFunctionInstance *saved_raw_core_func = NULL;
+    bool component_raw_call = false;
+#endif
 #if WASM_ENABLE_GC != 0
     WASMFuncType *func_type;
     uint8 *frame_ref;
@@ -1281,7 +1287,29 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     }
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-    if (cur_func->canon_options && cur_func->component_function) {
+    component_raw_call =
+        func_import->call_conv_raw && module_inst->comp_instance != NULL;
+    if (component_raw_call) {
+        saved_component_inst = exec_env->component_inst;
+        saved_raw_core_func = exec_env->core_func;
+        /* Resource handles belong to the component that owns the calling
+         * core instance.  Custom-data lookup performs its own root walk. */
+        exec_env->component_inst = module_inst->comp_instance;
+        exec_env->core_func = cur_func;
+        if (cur_func->canon_options && cur_func->canon_options->lift_lower_opts
+            && cur_func->canon_options->lift_lower_opts->lift_opts
+            && cur_func->canon_options->lift_lower_opts->lift_opts->memory
+            && cur_func->canon_options->lift_lower_opts->lift_opts->memory
+                   ->module_instance) {
+            saved_raw_module_inst = wasm_runtime_get_module_inst(exec_env);
+            wasm_exec_env_set_module_inst(
+                exec_env,
+                (WASMModuleInstanceCommon *)cur_func->canon_options
+                    ->lift_lower_opts->lift_opts->memory->module_instance);
+        }
+    }
+    if (cur_func->canon_options && cur_func->component_function
+        && !func_import->call_conv_raw) {
         ret = wasm_runtime_invoke_native_p2(exec_env, cur_func, frame->lp,
                                             cur_func->param_cell_num, argv_ret);
     }
@@ -1309,6 +1337,16 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
             func_import->signature, func_import->attachment, frame->lp,
             cur_func->param_cell_num, argv_ret);
     }
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    if (component_raw_call) {
+        if (saved_raw_module_inst) {
+            wasm_exec_env_restore_module_inst(exec_env, saved_raw_module_inst);
+        }
+        exec_env->core_func = saved_raw_core_func;
+        exec_env->component_inst = saved_component_inst;
+    }
+#endif
 
     if (!ret)
         return;
@@ -1370,8 +1408,13 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
                              WASMFunctionInstance *cur_func,
                              WASMInterpFrame *prev_frame)
 {
+    WASMFunctionImport *func_import = cur_func->u.func_import;
+
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-    if (cur_func->canon_options) {
+    /* Raw host imports already receive the canonical core ABI cells.  They
+     * must follow the prelinked import chain to the native dispatcher rather
+     * than re-entering the component-to-component lift/lower path. */
+    if (cur_func->canon_options && !func_import->call_conv_raw) {
         // Lower opts (caller, C1)
         CanonicalOptions *lower_opts = cur_func->canon_options;
 
@@ -1789,9 +1832,9 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
 #endif
     WASMModuleInstance *sub_module_inst = cur_func->import_module_inst;
     WASMFunctionInstance *sub_func_inst = cur_func->import_func_inst;
-    WASMFunctionImport *func_import = cur_func->u.func_import;
     uint8 *ip = prev_frame->ip;
     char buf[128];
+    uint32 import_depth = 0;
     WASMExecEnv *sub_module_exec_env = NULL;
     uintptr_t aux_stack_origin_boundary = 0;
     uintptr_t aux_stack_origin_bottom = 0;
@@ -1810,6 +1853,19 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
                  func_import->module_name, func_import->field_name);
         wasm_set_exception(module_inst, buf);
         return;
+    }
+
+    /* Resolve component import-to-import hops before entering another
+     * interpreter loop.  Reusing the same caller frame for a nested import
+     * entry corrupts loop recovery; a final native import must still execute
+     * with its defining module selected for memory/component context. */
+    while (sub_func_inst->is_import_func && sub_func_inst->import_func_inst) {
+        if (++import_depth > 1024 || !sub_func_inst->import_module_inst) {
+            wasm_set_exception(module_inst, "cyclic component function import");
+            return;
+        }
+        sub_module_inst = sub_func_inst->import_module_inst;
+        sub_func_inst = sub_func_inst->import_func_inst;
     }
 
     /* Switch exec_env but keep using the same one by replacing necessary
@@ -1835,9 +1891,16 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
        this function */
     prev_frame->ip = NULL;
 
-    /* call function of sub-module*/
-    wasm_interp_call_func_bytecode(sub_module_inst, exec_env, sub_func_inst,
-                                   prev_frame);
+    /* Call the resolved function without another import-to-import bytecode
+       entry. */
+    if (sub_func_inst->is_import_func) {
+        wasm_interp_call_func_native(sub_module_inst, exec_env, sub_func_inst,
+                                     prev_frame);
+    }
+    else {
+        wasm_interp_call_func_bytecode(sub_module_inst, exec_env, sub_func_inst,
+                                       prev_frame);
+    }
 
     /* restore ip and other replaced */
     prev_frame->ip = ip;
@@ -1978,7 +2041,7 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
 static inline uint8 *
 get_global_addr(uint8 *global_data, WASMGlobalInstance *global)
 {
-#if WASM_ENABLE_MULTI_MODULE == 0
+#if WASM_ENABLE_MULTI_MODULE == 0 && WASM_ENABLE_COMPONENT_MODEL == 0
     return global_data + global->data_offset;
 #else
     return global->import_global_inst
@@ -2020,6 +2083,10 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #endif
     WASMFuncType **wasm_types = (WASMFuncType **)module->module->types;
     WASMGlobalInstance *globals = module->e->globals, *global;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    WASMFunctionInstance table_func_proxy;
+    WASMFunctionImport table_func_proxy_import;
+#endif
     uint8 *global_data = module->global_data;
     uint8 opcode_IMPDEP = WASM_OP_IMPDEP;
     WASMInterpFrame *frame = NULL;
@@ -2847,39 +2914,52 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                 /* clang-format off */
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-                if (tbl_inst->elem_type == VALUE_TYPE_EXTERNREF) {
-                    cur_func = (WASMFunctionInstance *) tbl_inst->elems[val];
-                    goto call_func_from_interp;
+                if (tbl_inst->component_func_refs) {
+                    WASMFunctionInstance *source =
+                        tbl_inst->component_func_refs[val];
+                    if (!source) {
+                        wasm_set_exception(module, "uninitialized element");
+                        goto got_exception;
+                    }
+                    if (source->module_instance == module) {
+                        cur_func = source;
+                    }
+                    else if (!wasm_component_build_table_func_proxy(
+                                 module, source, &table_func_proxy,
+                                 &table_func_proxy_import)) {
+                        wasm_set_exception(module, "unknown function");
+                        goto got_exception;
+                    }
+                    else {
+                        cur_func = &table_func_proxy;
+                    }
                 }
+                else
 #endif
+                {
 #if WASM_ENABLE_GC == 0
-                fidx = tbl_inst->elems[val];
-                if (fidx == (uint32)-1) {
-                    wasm_set_exception(module, "uninitialized element");
-                    goto got_exception;
-                }
+                    fidx = tbl_inst->elems[val];
+                    if (fidx == (uint32)-1) {
+                        wasm_set_exception(module, "uninitialized element");
+                        goto got_exception;
+                    }
 #else
-                func_obj = (WASMFuncObjectRef)tbl_inst->elems[val];
-                if (!func_obj) {
-                    wasm_set_exception(module, "uninitialized element");
-                    goto got_exception;
-                }
-                fidx = wasm_func_obj_get_func_idx_bound(func_obj);
+                    func_obj = (WASMFuncObjectRef)tbl_inst->elems[val];
+                    if (!func_obj) {
+                        wasm_set_exception(module, "uninitialized element");
+                        goto got_exception;
+                    }
+                    fidx = wasm_func_obj_get_func_idx_bound(func_obj);
 #endif
-                /* clang-format on */
+                    if (fidx >= module->e->function_count) {
+                        wasm_set_exception(module, "unknown function");
+                        goto got_exception;
+                    }
 
-                /*
-                 * we might be using a table injected by host or
-                 * another module. In that case, we don't validate
-                 * the elem value while loading
-                 */
-                if (fidx >= module->e->function_count) {
-                    wasm_set_exception(module, "unknown function");
-                    goto got_exception;
+                    /* Non-imported tables keep module-relative indexes. */
+                    cur_func = module->e->functions + fidx;
                 }
-
-                /* always call module own functions */
-                cur_func = module->e->functions + fidx;
+                /* clang-format on */
 
                 if (cur_func->is_import_func)
                     cur_func_type = cur_func->u.func_import->func_type;
@@ -2888,7 +2968,10 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                     /* clang-format off */
 #if WASM_ENABLE_GC == 0
-                if (cur_type != cur_func_type) {
+                if (!wasm_type_equal((WASMType *)cur_type,
+                                     (WASMType *)cur_func_type,
+                                     module->module->types,
+                                     module->module->type_count)) {
                     wasm_set_exception(module, "indirect call type mismatch");
                     goto got_exception;
                 }
@@ -3010,6 +3093,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     goto got_exception;
                 }
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                if (!wasm_component_table_get_is_local(module, tbl_inst,
+                                                       (uint32)elem_idx)) {
+                    wasm_set_exception(module, "foreign function reference in "
+                                               "table.get");
+                    goto got_exception;
+                }
+#endif
 #if WASM_ENABLE_GC == 0
                 PUSH_I32(tbl_inst->elems[elem_idx]);
 #else
@@ -3045,6 +3136,23 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 }
 
                 tbl_inst->elems[elem_idx] = elem_val;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                if (tbl_inst->component_func_refs) {
+#if WASM_ENABLE_GC == 0
+                    fidx = (uint32)elem_val;
+#else
+                    fidx = elem_val == NULL_REF
+                               ? UINT32_MAX
+                               : wasm_func_obj_get_func_idx_bound(
+                                   (WASMFuncObjectRef)elem_val);
+#endif
+                    if (!wasm_component_set_table_func_ref(
+                            module, tbl_inst, (uint32)elem_idx, fidx)) {
+                        wasm_set_exception(module, "unknown function");
+                        goto got_exception;
+                    }
+                }
+#endif
                 HANDLE_OP_END();
             }
 
@@ -6444,6 +6552,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                 table_elems[i] = NULL_REF;
                             }
 #endif
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                            if (!wasm_component_set_table_func_ref(
+                                    module, tbl_inst, (uint32)d + (uint32)i,
+                                    init_values[i].u.unary.v.ref_index)) {
+                                wasm_set_exception(module, "unknown function");
+                                goto got_exception;
+                            }
+#endif
                         }
                         break;
                     }
@@ -6501,6 +6617,16 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                             goto got_exception;
                         }
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                        if (!wasm_component_prepare_table_copy(
+                                module, dst_tbl_inst, (uint32)d, src_tbl_inst,
+                                (uint32)s, (uint32)n)) {
+                            wasm_set_exception(
+                                module,
+                                "foreign function reference in table.copy");
+                            goto got_exception;
+                        }
+#endif
                         /* if s >= d, copy from front to back */
                         /* if s < d, copy from back to front */
                         /* merge all together */
@@ -6605,6 +6731,21 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                         for (; n != 0; elem_idx++, n--) {
                             tbl_inst->elems[elem_idx] = fill_val;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+#if WASM_ENABLE_GC == 0
+                            fidx = (uint32)fill_val;
+#else
+                            fidx = fill_val == NULL_REF
+                                       ? UINT32_MAX
+                                       : wasm_func_obj_get_func_idx_bound(
+                                           (WASMFuncObjectRef)fill_val);
+#endif
+                            if (!wasm_component_set_table_func_ref(
+                                    module, tbl_inst, (uint32)elem_idx, fidx)) {
+                                wasm_set_exception(module, "unknown function");
+                                goto got_exception;
+                            }
+#endif
                         }
                         break;
                     }

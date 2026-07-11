@@ -78,7 +78,6 @@ get_libc_emcc_export_apis(NativeSymbol **p_libc_emcc_apis);
 uint32
 get_lib_rats_export_apis(NativeSymbol **p_lib_rats_apis);
 
-#if WASM_ENABLE_COMPONENT_MODEL == 0
 static bool
 compare_type_with_signature(uint8 type, const char signature)
 {
@@ -86,6 +85,12 @@ compare_type_with_signature(uint8 type, const char signature)
 
     if (VALUE_TYPE_F64 <= type && type <= VALUE_TYPE_I32
         && signature == num_sig_map[type - VALUE_TYPE_F64]) {
+        return true;
+    }
+
+    /* P2 wrapper signatures use '~' for the i32 length paired with a
+       preceding pointer/offset parameter. */
+    if (type == VALUE_TYPE_I32 && signature == '~') {
         return true;
     }
 
@@ -108,8 +113,9 @@ compare_type_with_signature(uint8 type, const char signature)
     return false;
 }
 
-static bool
-check_symbol_signature(const WASMFuncType *type, const char *signature)
+bool
+wasm_native_validate_symbol_signature(const WASMFuncType *type,
+                                      const char *signature)
 {
     const char *p = signature, *p_end;
     char sig;
@@ -176,8 +182,6 @@ check_symbol_signature(const WASMFuncType *type, const char *signature)
 
     return true;
 }
-#endif
-
 static int
 native_symbol_cmp(const void *native_symbol1, const void *native_symbol2)
 {
@@ -222,11 +226,11 @@ lookup_symbol(NativeSymbol *native_symbols, uint32 n_native_symbols,
  * allow func_type and all outputs, like p_signature, p_attachment and
  * p_call_conv_raw to be NULL
  */
-void *
-wasm_native_resolve_symbol(const char *module_name, const char *field_name,
-                           const WASMFuncType *func_type,
-                           const char **p_signature, void **p_attachment,
-                           bool *p_call_conv_raw)
+static void *
+resolve_symbol(const char *module_name, const char *field_name,
+               const WASMFuncType *func_type, const char **p_signature,
+               void **p_attachment, bool *p_call_conv_raw,
+               bool require_exact_names)
 {
     NativeSymbolsNode *node, *node_next;
     const char *signature = NULL;
@@ -235,11 +239,13 @@ wasm_native_resolve_symbol(const char *module_name, const char *field_name,
     node = g_native_symbols_list;
     while (node) {
         node_next = node->next;
-        if (is_module_registered(module_name, node->module_name)) {
+        if ((require_exact_names && strcmp(module_name, node->module_name) == 0)
+            || (!require_exact_names
+                && is_module_registered(module_name, node->module_name))) {
             if ((func_ptr =
                      lookup_symbol(node->native_symbols, node->n_native_symbols,
                                    field_name, &signature, &attachment))
-                || (field_name[0] == '_'
+                || (!require_exact_names && field_name[0] == '_'
                     && (func_ptr = lookup_symbol(
                             node->native_symbols, node->n_native_symbols,
                             field_name + 1, &signature, &attachment))))
@@ -253,19 +259,22 @@ wasm_native_resolve_symbol(const char *module_name, const char *field_name,
 
     if (func_ptr) {
         if (signature && signature[0] != '\0') {
-#if WASM_ENABLE_COMPONENT_MODEL == 0
             /* signature is not empty, check its format */
-            if (!func_type || !check_symbol_signature(func_type, signature)) {
+            if (func_type
+                && !wasm_native_validate_symbol_signature(func_type,
+                                                          signature)) {
 #if WASM_ENABLE_WAMR_COMPILER == 0
                 /* Output warning except running aot compiler */
-                LOG_WARNING("failed to check signature '%s' and resolve "
-                            "pointer params for import function (%s, %s)\n",
-                            signature, module_name, field_name);
+                LOG_WARNING(
+                    "failed to check signature '%s' against %u params/%u "
+                    "results for import function (%s, %s)\n",
+                    signature, func_type ? func_type->param_count : 0,
+                    func_type ? func_type->result_count : 0, module_name,
+                    field_name);
 #endif
                 return NULL;
             }
             else
-#endif /*WASM_ENABLE_COMPONENT_MODEL == 0*/
                 /* Save signature for runtime to do pointer check and
                    address conversion */
                 *p_signature = signature;
@@ -279,6 +288,27 @@ wasm_native_resolve_symbol(const char *module_name, const char *field_name,
     }
 
     return func_ptr;
+}
+
+void *
+wasm_native_resolve_symbol(const char *module_name, const char *field_name,
+                           const WASMFuncType *func_type,
+                           const char **p_signature, void **p_attachment,
+                           bool *p_call_conv_raw)
+{
+    return resolve_symbol(module_name, field_name, func_type, p_signature,
+                          p_attachment, p_call_conv_raw, false);
+}
+
+void *
+wasm_native_resolve_symbol_exact(const char *module_name,
+                                 const char *field_name,
+                                 const WASMFuncType *func_type,
+                                 const char **p_signature, void **p_attachment,
+                                 bool *p_call_conv_raw)
+{
+    return resolve_symbol(module_name, field_name, func_type, p_signature,
+                          p_attachment, p_call_conv_raw, true);
 }
 
 static bool

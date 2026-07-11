@@ -355,14 +355,15 @@ TEST_F(ComponentInstantiationStoreTest, TestStoreRecordInMemory) {
     ASSERT_NE(fields, nullptr);
 
     // Initialize field "x" = 12345
-    fields[0].key = strdup("x");
-    fields[0].key_size = 1;
-    fields[0].value = wit_u32_ctor(12345);
+    char key_x[] = "x";
+    init_record_field(&fields[0], key_x, sizeof(key_x) - 1,
+                      wit_u32_ctor(12345));
+    ASSERT_NE(fields[0].key, nullptr);
 
     // Initialize field "y" = 42
-    fields[1].key = strdup("y");
-    fields[1].key_size = 1;
-    fields[1].value = wit_u8_ctor(42);
+    char key_y[] = "y";
+    init_record_field(&fields[1], key_y, sizeof(key_y) - 1, wit_u8_ctor(42));
+    ASSERT_NE(fields[1].key, nullptr);
 
     wit_value_t value_to_store = wit_record_ctor(fields, 2);
     ASSERT_NE(value_to_store, nullptr);

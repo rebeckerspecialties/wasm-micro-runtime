@@ -1346,7 +1346,7 @@ wasm_debug_instance_get_global(WASMDebugInstance *instance, int32 frame_index,
     }
     global = globals + global_index;
 
-#if WASM_ENABLE_MULTI_MODULE == 0
+#if WASM_ENABLE_MULTI_MODULE == 0 && WASM_ENABLE_COMPONENT_MODEL == 0
     global_addr = global_data + global->data_offset;
 #else
     global_addr = global->import_global_inst

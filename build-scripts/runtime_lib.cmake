@@ -169,7 +169,12 @@ endif ()
 
 ####################### Common sources #######################
 if (NOT MSVC)
-    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu99 -ffunction-sections -fdata-sections")
+    if (WAMR_BUILD_COMPONENT_MODEL EQUAL 1)
+        set (WAMR_C_LANGUAGE_STANDARD "gnu11")
+    else ()
+        set (WAMR_C_LANGUAGE_STANDARD "gnu99")
+    endif ()
+    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=${WAMR_C_LANGUAGE_STANDARD} -ffunction-sections -fdata-sections")
 endif ()
 
 # include the build config template file

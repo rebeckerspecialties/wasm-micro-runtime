@@ -3639,7 +3639,7 @@ interp_global_set(const WASMModuleInstance *inst_interp, uint16 global_idx_rt,
     const WASMGlobalInstance *global_interp =
         inst_interp->e->globals + global_idx_rt;
     uint8 val_type_rt = global_interp->type;
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
     uint8 *data = global_interp->import_global_inst
                       ? global_interp->import_module_inst->global_data
                             + global_interp->import_global_inst->data_offset
@@ -3658,7 +3658,7 @@ interp_global_get(const WASMModuleInstance *inst_interp, uint16 global_idx_rt,
 {
     WASMGlobalInstance *global_interp = inst_interp->e->globals + global_idx_rt;
     uint8 val_type_rt = global_interp->type;
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
     uint8 *data = global_interp->import_global_inst
                       ? global_interp->import_module_inst->global_data
                             + global_interp->import_global_inst->data_offset
@@ -4032,10 +4032,13 @@ own wasm_ref_t *
 wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
 {
     uint32 ref_idx = NULL_REF;
+    WASMModuleInstanceCommon *ref_inst_comm_rt;
 
     if (!table || !table->inst_comm_rt) {
         return NULL;
     }
+
+    ref_inst_comm_rt = table->inst_comm_rt;
 
 #if WASM_ENABLE_INTERP != 0
     if (table->inst_comm_rt->module_type == Wasm_Module_Bytecode) {
@@ -4045,7 +4048,29 @@ wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
         if (index >= table_interp->cur_size) {
             return NULL;
         }
-        ref_idx = (uint32)table_interp->elems[index];
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (table_interp->component_func_refs) {
+            WASMFunctionInstance *func_ref =
+                table_interp->component_func_refs[index];
+
+            if (!func_ref) {
+                return NULL;
+            }
+            if (!func_ref->module_instance || !func_ref->module_instance->e
+                || func_ref->func_idx
+                       >= func_ref->module_instance->e->function_count) {
+                return NULL;
+            }
+
+            ref_idx = func_ref->func_idx;
+            ref_inst_comm_rt =
+                (WASMModuleInstanceCommon *)func_ref->module_instance;
+        }
+        else
+#endif
+        {
+            ref_idx = (uint32)table_interp->elems[index];
+        }
     }
 #endif
 
@@ -4081,7 +4106,7 @@ wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
 #endif
     {
         return wasm_ref_new_internal(table->store, WASM_REF_func, ref_idx,
-                                     table->inst_comm_rt);
+                                     ref_inst_comm_rt);
     }
 }
 
@@ -4091,6 +4116,9 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
 {
     uint32 *p_ref_idx = NULL;
     uint32 function_count = 0;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0
+    WASMFunctionInstance **p_component_func_ref = NULL;
+#endif
 
     if (!table || !table->inst_comm_rt) {
         return false;
@@ -4119,6 +4147,11 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
         p_ref_idx = (uint32 *)(table_interp->elems + index);
         function_count =
             ((WASMModuleInstance *)table->inst_comm_rt)->e->function_count;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (table_interp->component_func_refs) {
+            p_component_func_ref = &table_interp->component_func_refs[index];
+        }
+#endif
     }
 #endif
 
@@ -4154,15 +4187,48 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
     {
         if (ref) {
             if (NULL_REF != ref->ref_idx_rt) {
-                if (ref->ref_idx_rt >= function_count) {
-                    return false;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0
+                if (p_component_func_ref) {
+                    WASMModuleInstance *ref_module_inst;
+
+                    if (!ref->inst_comm_rt
+                        || ref->inst_comm_rt->module_type
+                               != Wasm_Module_Bytecode) {
+                        return false;
+                    }
+                    ref_module_inst = (WASMModuleInstance *)ref->inst_comm_rt;
+                    if (!ref_module_inst->e
+                        || ref->ref_idx_rt
+                               >= ref_module_inst->e->function_count) {
+                        return false;
+                    }
+                    *p_component_func_ref =
+                        &ref_module_inst->e->functions[ref->ref_idx_rt];
+                }
+                else
+#endif
+                {
+                    if (ref->inst_comm_rt != table->inst_comm_rt
+                        || ref->ref_idx_rt >= function_count) {
+                        return false;
+                    }
                 }
             }
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0
+            else if (p_component_func_ref) {
+                *p_component_func_ref = NULL;
+            }
+#endif
             *p_ref_idx = ref->ref_idx_rt;
             wasm_ref_delete(ref);
         }
         else {
             *p_ref_idx = NULL_REF;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0
+            if (p_component_func_ref) {
+                *p_component_func_ref = NULL;
+            }
+#endif
         }
     }
 

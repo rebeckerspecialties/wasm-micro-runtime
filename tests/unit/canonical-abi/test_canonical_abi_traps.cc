@@ -196,3 +196,85 @@ TEST_F(CanonicalAbiTrapTest, ListRangeMisalignedTraps)
     if (out)
         free_wit_value(out);
 }
+
+// --- load traps --------------------------------------------------------------
+
+TEST_F(CanonicalAbiTrapTest, LoadPtrWidthOverflowTrapsBeforeReading)
+{
+    LiftLowerContext *c = build_cx(ENCODING_UTF_8);
+    WASMComponentTypeInstance u32 = prim_type(WASM_COMP_PRIMVAL_U32);
+    wit_value_t out = nullptr;
+
+    c->inst->cur_exception[0] = '\0';
+    bool ok = load(c, 0xFFFFFFFCu, &u32, &out);
+    EXPECT_FALSE(ok) << "load pointer+width overflow must trap";
+    EXPECT_NE(strstr(c->inst->cur_exception, "memory_data_size"), nullptr)
+        << "expected the bounds-check trap, got: " << c->inst->cur_exception;
+    if (out)
+        free_wit_value(out);
+}
+
+TEST_F(CanonicalAbiTrapTest, LoadCleanOutOfBoundsTraps)
+{
+    LiftLowerContext *c = build_cx(ENCODING_UTF_8);
+    WASMComponentTypeInstance u32 = prim_type(WASM_COMP_PRIMVAL_U32);
+    wit_value_t out = nullptr;
+
+    bool ok = load(c, mem_size, &u32, &out);
+    EXPECT_FALSE(ok) << "load past the end of memory must trap";
+    if (out)
+        free_wit_value(out);
+}
+
+TEST_F(CanonicalAbiTrapTest, LoadMisalignedTrapsInReleasePath)
+{
+    LiftLowerContext *c = build_cx(ENCODING_UTF_8);
+    WASMComponentTypeInstance u32 = prim_type(WASM_COMP_PRIMVAL_U32);
+    wit_value_t out = nullptr;
+
+    bool ok = load(c, 2, &u32, &out);
+    EXPECT_FALSE(ok) << "misaligned load pointer must trap";
+    if (out)
+        free_wit_value(out);
+}
+
+// --- store traps -------------------------------------------------------------
+
+TEST_F(CanonicalAbiTrapTest, StorePtrWidthOverflowTrapsBeforeWriting)
+{
+    LiftLowerContext *c = build_cx(ENCODING_UTF_8);
+    WASMComponentTypeInstance u32 = prim_type(WASM_COMP_PRIMVAL_U32);
+    wit_value_t value = wit_u32_ctor(0xA5A5A5A5u);
+
+    ASSERT_NE(value, nullptr);
+    c->inst->cur_exception[0] = '\0';
+    bool ok = store(c, 0xFFFFFFFCu, &u32, value);
+    EXPECT_FALSE(ok) << "store pointer+width overflow must trap";
+    EXPECT_NE(strstr(c->inst->cur_exception, "memory_data_size"), nullptr)
+        << "expected the bounds-check trap, got: " << c->inst->cur_exception;
+    free_wit_value(value);
+}
+
+TEST_F(CanonicalAbiTrapTest, StoreCleanOutOfBoundsTraps)
+{
+    LiftLowerContext *c = build_cx(ENCODING_UTF_8);
+    WASMComponentTypeInstance u32 = prim_type(WASM_COMP_PRIMVAL_U32);
+    wit_value_t value = wit_u32_ctor(0xA5A5A5A5u);
+
+    ASSERT_NE(value, nullptr);
+    bool ok = store(c, mem_size, &u32, value);
+    EXPECT_FALSE(ok) << "store past the end of memory must trap";
+    free_wit_value(value);
+}
+
+TEST_F(CanonicalAbiTrapTest, StoreMisalignedTrapsInReleasePath)
+{
+    LiftLowerContext *c = build_cx(ENCODING_UTF_8);
+    WASMComponentTypeInstance u32 = prim_type(WASM_COMP_PRIMVAL_U32);
+    wit_value_t value = wit_u32_ctor(0xA5A5A5A5u);
+
+    ASSERT_NE(value, nullptr);
+    bool ok = store(c, 2, &u32, value);
+    EXPECT_FALSE(ok) << "misaligned store pointer must trap";
+    free_wit_value(value);
+}

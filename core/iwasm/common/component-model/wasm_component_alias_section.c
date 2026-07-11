@@ -33,6 +33,10 @@ parse_single_alias(const uint8_t **payload, const uint8_t *end,
     }
 
     // Read tag
+    if (p >= end) {
+        set_error_buf_ex(error_buf, error_buf_size, "Missing alias target tag");
+        return false;
+    }
     uint8_t tag = *p++;
 
     // Parse alias target using switch
@@ -143,16 +147,14 @@ wasm_component_parse_alias_section(const uint8_t **payload,
 
     out->count = alias_count;
     if (alias_count > 0) {
-        out->aliases = wasm_runtime_malloc(sizeof(WASMComponentAliasDefinition)
-                                           * alias_count);
+        out->aliases = wasm_component_checked_calloc(
+            alias_count, sizeof(WASMComponentAliasDefinition), p, end, 1,
+            "component alias", error_buf, error_buf_size);
         if (!out->aliases) {
             if (consumed_len)
                 *consumed_len = (uint32_t)(p - *payload);
             return false;
         }
-        // Zero-initialize the aliases array
-        memset(out->aliases, 0,
-               sizeof(WASMComponentAliasDefinition) * alias_count);
 
         for (uint32_t i = 0; i < alias_count; ++i) {
             // Allocate memory for the sort field

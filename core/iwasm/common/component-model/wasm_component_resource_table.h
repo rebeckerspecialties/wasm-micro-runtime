@@ -39,8 +39,19 @@ typedef struct WASMComponentResourceTable {
 bool
 wasm_component_table_add(WASMComponentResourceTable *table, void *ptr,
                          WASMTableElementType type, uint32_t *out);
+
+/** Remove an element without dropping its underlying representation. */
 bool
 wasm_component_table_remove(WASMComponentResourceTable *table, uint32_t index);
+
+/**
+ * Remove and drop a resource handle. Unlike wasm_component_table_remove(),
+ * this destroys an owned representation and is therefore not suitable for an
+ * ownership transfer.
+ */
+bool
+wasm_component_table_drop_resource(WASMComponentResourceTable *table,
+                                   uint32_t index);
 
 void *
 wasm_component_table_get(WASMComponentResourceTable *table, uint32_t index,

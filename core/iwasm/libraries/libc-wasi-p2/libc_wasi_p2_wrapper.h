@@ -30,6 +30,9 @@ wasm_native_register_wasi_p2_modules();
 bool
 wasm_check_wasi_p2_version(const char *required_interface);
 
+bool
+wasm_native_has_builtin_wasi_p2_module(const char *module_name);
+
 void
 wasm_native_unregister_wasi_p2_modules();
 
@@ -42,6 +45,10 @@ wasm_native_unregister_wasi_p2_module(const char *module_name);
 bool
 wasm_native_register_wasi_p2_module_func(const char *module_name,
                                          const char *func_name);
+
+const NativeSymbol *
+wasm_native_get_wasi_p2_module_func(const char *module_name,
+                                    const char *func_name);
 
 void
 wasm_native_unregister_wasi_p2_module_func(const char *module_name,

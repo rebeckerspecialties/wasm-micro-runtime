@@ -923,6 +923,7 @@ lift_own(LiftLowerContext *cx, uint32_t index,
 
     // 2. Validate it's an own handle
     trap_if(!handle->own);
+    trap_if(handle->rt != type->resource);
 
     // 3. Get the rep
     uint32_t rep = handle->rep;
@@ -964,9 +965,9 @@ load(LiftLowerContext *cx, uint32_t ptr, WASMComponentTypeInstance *type,
 {
     if (!type)
         return false;
-    bh_assert(ptr == align_to(ptr, type->alignment));
-    bh_assert((uint64_t)(ptr + type->elem_size)
-              <= get_mem_from_cx(cx)->memory_data_size);
+    trap_if(ptr != align_to(ptr, type->alignment));
+    trap_if((uint64_t)ptr + type->elem_size
+            > get_mem_from_cx(cx)->memory_data_size);
 
     switch (type->type) {
         case COMPONENT_VAL_TYPE_PRIMVAL:
@@ -1058,8 +1059,12 @@ store_int(LiftLowerContext *cx, uint32_t ptr, uint32_t nbytes, uint64_t val)
 {
     WASMMemoryInstance *mem = get_mem_from_cx(cx);
     bh_assert(nbytes >= 1 && nbytes <= 8);
+    trap_if(nbytes < 1 || nbytes > 8);
+    /* Widen before adding and validate before forming the host pointer.  Both
+     * operands are 32-bit, so casting the sum lets a guest pointer near
+     * UINT32_MAX wrap past this check in release builds. */
+    trap_if((uint64)ptr + nbytes > mem->memory_data_size);
     uint8_t *dst = mem->memory_data + ptr;
-    trap_if((uint64)(ptr + nbytes) > mem->memory_data_size);
 
     for (uint32_t i = 0; i < nbytes; i++) {
         dst[i] = (uint8_t)(val >> (i * 8));
@@ -2012,9 +2017,9 @@ store(LiftLowerContext *cx, uint32_t ptr, WASMComponentTypeInstance *type,
 {
     if (!type)
         return false;
-    bh_assert(ptr == align_to(ptr, type->alignment));
-    bh_assert((uint64_t)(ptr + type->elem_size)
-              <= get_mem_from_cx(cx)->memory_data_size);
+    trap_if(ptr != align_to(ptr, type->alignment));
+    trap_if((uint64_t)ptr + type->elem_size
+            > get_mem_from_cx(cx)->memory_data_size);
 
     switch (type->type) {
         case COMPONENT_VAL_TYPE_PRIMVAL:

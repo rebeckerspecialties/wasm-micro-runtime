@@ -64,12 +64,11 @@ parse_value(const uint8_t **payload, const uint8_t *end,
                          "Failed to allocate memory for value type");
         return false;
     }
+    memset(val_type, 0, sizeof(*val_type));
     if (!parse_valtype(&p, end, val_type, error_buf, error_buf_size)) {
         wasm_runtime_free(val_type);
         return false;
     }
-
-    out->val_type = val_type;
 
     uint64_t core_data_len_u32_leb = 0;
     if (!read_leb((uint8_t **)&p, end, 32, false, &core_data_len_u32_leb,
@@ -474,6 +473,7 @@ parse_value(const uint8_t **payload, const uint8_t *end,
     }
 
     // Keep a borrowed pointer to the raw value bytes window
+    out->val_type = val_type;
     out->core_data = v_start;
 
     *payload = p;
@@ -513,18 +513,14 @@ wasm_component_parse_values_section(const uint8_t **payload,
     out->count = value_count;
 
     if (value_count > 0) {
-        out->values =
-            wasm_runtime_malloc(sizeof(WASMComponentValue) * value_count);
+        out->values = wasm_component_checked_calloc(
+            value_count, sizeof(WASMComponentValue), p, end, 1,
+            "component value", error_buf, error_buf_size);
         if (!out->values) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for values");
             if (consumed_len)
                 *consumed_len = (uint32_t)(p - *payload);
             return false;
         }
-
-        // Initialize all values to zero to avoid garbage data
-        memset(out->values, 0, sizeof(WASMComponentValue) * value_count);
 
         for (uint32_t i = 0; i < value_count; ++i) {
             if (!parse_value(&p, end, &out->values[i], error_buf,

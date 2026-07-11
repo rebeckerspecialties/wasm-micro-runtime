@@ -62,6 +62,445 @@ wasm_component_set_exception(WASMComponentInstance *comp_inst,
     }
 }
 
+/*
+ * A prepared call owns all scratch storage required to bridge wasm_val_t to
+ * the interpreter's cell ABI.  This is deliberately opaque to embedders: a
+ * generated binding resolves it once and can then call without WAVE parsing,
+ * WIT-value allocation, or per-call runtime allocation.
+ */
+struct WASMComponentPreparedCall {
+    WASMComponentInstance *component_inst;
+    WASMFunctionInstance *core_func;
+    WASMExecEnv *exec_env;
+    WASMFunctionInstance *post_return_func;
+    WASMExecEnv *post_return_exec_env;
+    uint32 param_count;
+    uint32 result_count;
+    uint32 param_cell_count;
+    uint32 result_cell_count;
+    wasm_valkind_t param_kinds[MAX_FLAT_TYPES];
+    wasm_valkind_t result_kinds[MAX_FLAT_TYPES];
+    uint32 argv_cells[MAX_FLAT_TYPES * 2];
+    bool post_return_pending;
+};
+
+static void
+set_prepared_call_error(WASMComponentInstance *component_inst, char *error_buf,
+                        uint32 error_buf_size, const char *message)
+{
+    if (component_inst) {
+        wasm_component_set_exception(component_inst, message);
+    }
+    if (error_buf && error_buf_size > 0) {
+        snprintf(error_buf, error_buf_size, "%s", message);
+    }
+}
+
+static bool
+prepared_call_kind(uint8 value_type, wasm_valkind_t *kind, uint32 *cell_count)
+{
+    switch (value_type) {
+        case VALUE_TYPE_I32:
+            *kind = WASM_I32;
+            *cell_count = 1;
+            return true;
+        case VALUE_TYPE_I64:
+            *kind = WASM_I64;
+            *cell_count = 2;
+            return true;
+        case VALUE_TYPE_F32:
+            *kind = WASM_F32;
+            *cell_count = 1;
+            return true;
+        case VALUE_TYPE_F64:
+            *kind = WASM_F64;
+            *cell_count = 2;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool
+prepare_flat_signature(WASMFuncType *type, wasm_valkind_t param_kinds[],
+                       wasm_valkind_t result_kinds[], uint32 *param_cells,
+                       uint32 *result_cells)
+{
+    uint32 i, cells;
+
+    if (!type || type->param_count > MAX_FLAT_TYPES
+        || type->result_count > MAX_FLAT_TYPES) {
+        return false;
+    }
+
+    *param_cells = 0;
+    for (i = 0; i < type->param_count; i++) {
+        if (!prepared_call_kind(type->types[i], &param_kinds[i], &cells)) {
+            return false;
+        }
+        *param_cells += cells;
+    }
+
+    *result_cells = 0;
+    for (i = 0; i < type->result_count; i++) {
+        if (!prepared_call_kind(type->types[type->param_count + i],
+                                &result_kinds[i], &cells)) {
+            return false;
+        }
+        *result_cells += cells;
+    }
+
+    return *param_cells == type->param_cell_num
+           && *result_cells == type->ret_cell_num
+           && *param_cells <= MAX_FLAT_TYPES * 2
+           && *result_cells <= MAX_FLAT_TYPES * 2;
+}
+
+static WASMComponentPreparedCall *
+prepare_export_call(WASMComponentInstance *component_inst,
+                    const char *interface_name, const char *export_name,
+                    char *error_buf, uint32 error_buf_size)
+{
+    WASMComponentFunctionInstance *target_func;
+    WASMComponentPreparedCall *prepared_call = NULL;
+    WASMFuncType *type, *post_return_type;
+    uint32 module_type, post_param_cells = 0, post_result_cells = 0;
+    wasm_valkind_t post_param_kinds[MAX_FLAT_TYPES];
+    wasm_valkind_t post_result_kinds[MAX_FLAT_TYPES];
+
+    if (!component_inst || !export_name) {
+        set_prepared_call_error(component_inst, error_buf, error_buf_size,
+                                "component: invalid prepared call arguments");
+        return NULL;
+    }
+
+    target_func =
+        interface_name
+            ? wasm_component_lookup_function_qualified(
+                component_inst, interface_name, export_name)
+            : wasm_component_lookup_function(component_inst, export_name);
+    if (!target_func || !target_func->core_func
+        || !target_func->core_func->module_instance) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            interface_name
+                ? "component: qualified prepared export lookup failed"
+                : "component: prepared export lookup failed");
+        return NULL;
+    }
+
+    if (target_func->canon_options && target_func->canon_options->async) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: prepared calls require a synchronous export");
+        return NULL;
+    }
+
+    prepared_call = wasm_runtime_malloc(sizeof(*prepared_call));
+    if (!prepared_call) {
+        set_prepared_call_error(component_inst, error_buf, error_buf_size,
+                                "component: failed to allocate prepared call");
+        return NULL;
+    }
+    memset(prepared_call, 0, sizeof(*prepared_call));
+
+    prepared_call->component_inst = component_inst;
+    prepared_call->core_func = target_func->core_func;
+    module_type = target_func->core_func->module_instance->module_type;
+    type = wasm_runtime_get_function_type(target_func->core_func, module_type);
+    if (!prepare_flat_signature(type, prepared_call->param_kinds,
+                                prepared_call->result_kinds,
+                                &prepared_call->param_cell_count,
+                                &prepared_call->result_cell_count)) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: export has a non-flat or unsupported core signature");
+        goto fail;
+    }
+    prepared_call->param_count = type->param_count;
+    prepared_call->result_count = type->result_count;
+
+    prepared_call->exec_env = wasm_runtime_get_exec_env_singleton(
+        (WASMModuleInstanceCommon *)target_func->core_func->module_instance);
+    if (!prepared_call->exec_env) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: failed to create prepared execution environment");
+        goto fail;
+    }
+
+    if (target_func->canon_options
+        && target_func->canon_options->post_return_func) {
+        prepared_call->post_return_func =
+            target_func->canon_options->post_return_func;
+        module_type =
+            prepared_call->post_return_func->module_instance->module_type;
+        post_return_type = wasm_runtime_get_function_type(
+            prepared_call->post_return_func, module_type);
+        if (!prepare_flat_signature(post_return_type, post_param_kinds,
+                                    post_result_kinds, &post_param_cells,
+                                    &post_result_cells)
+            || post_return_type->param_count != prepared_call->result_count
+            || post_return_type->result_count != 0
+            || post_param_cells != prepared_call->result_cell_count
+            || post_result_cells != 0
+            || memcmp(post_param_kinds, prepared_call->result_kinds,
+                      prepared_call->result_count
+                          * sizeof(prepared_call->result_kinds[0]))
+                   != 0) {
+            set_prepared_call_error(component_inst, error_buf, error_buf_size,
+                                    "component: post-return signature does not "
+                                    "match export results");
+            goto fail;
+        }
+        prepared_call->post_return_exec_env =
+            wasm_runtime_get_exec_env_singleton(
+                (WASMModuleInstanceCommon *)
+                    prepared_call->post_return_func->module_instance);
+        if (!prepared_call->post_return_exec_env) {
+            set_prepared_call_error(component_inst, error_buf, error_buf_size,
+                                    "component: failed to create post-return "
+                                    "execution environment");
+            goto fail;
+        }
+    }
+
+    wasm_component_set_exception(component_inst, NULL);
+    if (error_buf && error_buf_size > 0) {
+        error_buf[0] = '\0';
+    }
+    return prepared_call;
+
+fail:
+    wasm_runtime_free(prepared_call);
+    return NULL;
+}
+
+WASMComponentPreparedCall *
+wasm_component_prepare_export_call(WASMComponentInstance *component_inst,
+                                   const char *export_name, char *error_buf,
+                                   uint32 error_buf_size)
+{
+    return prepare_export_call(component_inst, NULL, export_name, error_buf,
+                               error_buf_size);
+}
+
+WASMComponentPreparedCall *
+wasm_component_prepare_export_call_qualified(
+    WASMComponentInstance *component_inst, const char *interface_name,
+    const char *export_name, char *error_buf, uint32 error_buf_size)
+{
+    if (!interface_name) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: invalid qualified prepared call arguments");
+        return NULL;
+    }
+    return prepare_export_call(component_inst, interface_name, export_name,
+                               error_buf, error_buf_size);
+}
+
+static bool
+prepared_values_to_cells(WASMComponentPreparedCall *prepared_call,
+                         const wasm_val_t values[], uint32 value_count,
+                         const wasm_valkind_t kinds[])
+{
+    uint32 i, cell_index = 0;
+
+    for (i = 0; i < value_count; i++) {
+        if (values[i].kind != kinds[i]) {
+            wasm_component_set_exception(
+                prepared_call->component_inst,
+                "component: prepared call value kind does not match signature");
+            return false;
+        }
+        switch (kinds[i]) {
+            case WASM_I32:
+                prepared_call->argv_cells[cell_index++] =
+                    (uint32)values[i].of.i32;
+                break;
+            case WASM_I64:
+            {
+                union {
+                    uint64 val;
+                    uint32 parts[2];
+                } value;
+                value.val = (uint64)values[i].of.i64;
+                prepared_call->argv_cells[cell_index++] = value.parts[0];
+                prepared_call->argv_cells[cell_index++] = value.parts[1];
+                break;
+            }
+            case WASM_F32:
+            {
+                union {
+                    float32 val;
+                    uint32 part;
+                } value;
+                value.val = values[i].of.f32;
+                prepared_call->argv_cells[cell_index++] = value.part;
+                break;
+            }
+            case WASM_F64:
+            {
+                union {
+                    float64 val;
+                    uint32 parts[2];
+                } value;
+                value.val = values[i].of.f64;
+                prepared_call->argv_cells[cell_index++] = value.parts[0];
+                prepared_call->argv_cells[cell_index++] = value.parts[1];
+                break;
+            }
+            default:
+                bh_assert(0);
+                return false;
+        }
+    }
+    return true;
+}
+
+static void
+prepared_cells_to_results(const WASMComponentPreparedCall *prepared_call,
+                          wasm_val_t results[])
+{
+    uint32 i, cell_index = 0;
+
+    for (i = 0; i < prepared_call->result_count; i++) {
+        results[i].kind = prepared_call->result_kinds[i];
+        switch (prepared_call->result_kinds[i]) {
+            case WASM_I32:
+                results[i].of.i32 =
+                    (int32)prepared_call->argv_cells[cell_index++];
+                break;
+            case WASM_I64:
+            {
+                union {
+                    uint64 val;
+                    uint32 parts[2];
+                } value;
+                value.parts[0] = prepared_call->argv_cells[cell_index++];
+                value.parts[1] = prepared_call->argv_cells[cell_index++];
+                results[i].of.i64 = (int64)value.val;
+                break;
+            }
+            case WASM_F32:
+            {
+                union {
+                    float32 val;
+                    uint32 part;
+                } value;
+                value.part = prepared_call->argv_cells[cell_index++];
+                results[i].of.f32 = value.val;
+                break;
+            }
+            case WASM_F64:
+            {
+                union {
+                    float64 val;
+                    uint32 parts[2];
+                } value;
+                value.parts[0] = prepared_call->argv_cells[cell_index++];
+                value.parts[1] = prepared_call->argv_cells[cell_index++];
+                results[i].of.f64 = value.val;
+                break;
+            }
+            default:
+                bh_assert(0);
+                break;
+        }
+    }
+}
+
+bool
+wasm_component_call_prepared(WASMComponentPreparedCall *prepared_call,
+                             uint32 num_results, wasm_val_t results[],
+                             uint32 num_args, const wasm_val_t args[])
+{
+    const char *exception;
+
+    if (!prepared_call) {
+        return false;
+    }
+    if (prepared_call->post_return_pending) {
+        wasm_component_set_exception(
+            prepared_call->component_inst,
+            "component: post-return is required before the next prepared call");
+        return false;
+    }
+    if (num_args != prepared_call->param_count
+        || num_results != prepared_call->result_count || (num_args > 0 && !args)
+        || (num_results > 0 && !results)) {
+        wasm_component_set_exception(prepared_call->component_inst,
+                                     "component: prepared call argument/result "
+                                     "count does not match signature");
+        return false;
+    }
+    if (!prepared_values_to_cells(prepared_call, args, num_args,
+                                  prepared_call->param_kinds)) {
+        return false;
+    }
+
+    wasm_component_set_exception(prepared_call->component_inst, NULL);
+    if (!wasm_runtime_call_wasm(
+            prepared_call->exec_env,
+            (WASMFunctionInstanceCommon *)prepared_call->core_func,
+            prepared_call->param_cell_count, prepared_call->argv_cells)) {
+        exception = wasm_runtime_get_exception(
+            (WASMModuleInstanceCommon *)
+                prepared_call->core_func->module_instance);
+        wasm_component_set_exception(
+            prepared_call->component_inst,
+            exception ? exception : "component: prepared core call failed");
+        return false;
+    }
+
+    prepared_cells_to_results(prepared_call, results);
+    prepared_call->post_return_pending =
+        prepared_call->post_return_func != NULL;
+    return true;
+}
+
+bool
+wasm_component_prepared_call_post_return(
+    WASMComponentPreparedCall *prepared_call)
+{
+    const char *exception;
+
+    if (!prepared_call) {
+        return false;
+    }
+    if (!prepared_call->post_return_pending) {
+        return true;
+    }
+
+    /* A post-return invocation is consumed even when it traps. */
+    prepared_call->post_return_pending = false;
+    wasm_component_set_exception(prepared_call->component_inst, NULL);
+    if (!wasm_runtime_call_wasm(
+            prepared_call->post_return_exec_env,
+            (WASMFunctionInstanceCommon *)prepared_call->post_return_func,
+            prepared_call->result_cell_count, prepared_call->argv_cells)) {
+        exception = wasm_runtime_get_exception(
+            (WASMModuleInstanceCommon *)
+                prepared_call->post_return_func->module_instance);
+        wasm_component_set_exception(
+            prepared_call->component_inst,
+            exception ? exception : "component: post-return failed");
+        return false;
+    }
+    return true;
+}
+
+void
+wasm_component_destroy_prepared_call(WASMComponentPreparedCall *prepared_call)
+{
+    if (!prepared_call) {
+        return;
+    }
+    bh_assert(!prepared_call->post_return_pending);
+    wasm_runtime_free(prepared_call);
+}
+
 static void
 print_wit_value(wit_value_t value)
 {

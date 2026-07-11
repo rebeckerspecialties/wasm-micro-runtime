@@ -11,7 +11,8 @@
 WASMComponentResourceTable *
 wasm_component_table_init(uint32_t initial_size, uint32_t resize_percent)
 {
-    if (initial_size == 0 || resize_percent == 0) {
+    if (initial_size == 0 || initial_size > WASM_COMPONENT_TABLE_MAX_LENGTH
+        || resize_percent == 0) {
         return NULL;
     }
 
@@ -61,9 +62,14 @@ wasm_component_table_destroy(WASMComponentResourceTable *table)
         if (table->array[i]) {
             WASMTableElement *elem = table->array[i];
 
+            /* Clear the slot before calling user-defined destructor code so a
+             * reentrant lookup cannot observe a half-dropped handle. */
+            table->array[i] = NULL;
+
             // Destroy the underlying object based on type
             if (elem->type == WASM_TABLE_ELEM_RESOURCE_HANDLE && elem->ptr) {
-                wasm_destroy_resource_handle((WASMResourceHandle *)elem->ptr);
+                (void)wasm_drop_resource_handle(
+                    (WASMResourceHandle *)elem->ptr);
             }
             // TODO: Add destructors for other element types
 
@@ -108,7 +114,16 @@ wasm_component_table_remove(WASMComponentResourceTable *table, uint32_t index)
         return false;
     }
 
+    if (table->free_count >= table->array_size) {
+        return false; // Should not happen
+    }
+
     WASMTableElement *elem = table->array[index];
+
+    /* Detach first. wasm_component_table_remove() transfers ownership and must
+     * only destroy the table's handle wrapper, never the representation. */
+    table->array[index] = NULL;
+    table->free_list[table->free_count++] = index;
 
     // Destroy the underlying object based on type
     if (elem->type == WASM_TABLE_ELEM_RESOURCE_HANDLE && elem->ptr) {
@@ -118,18 +133,33 @@ wasm_component_table_remove(WASMComponentResourceTable *table, uint32_t index)
 
     wasm_runtime_free(elem);
 
-    // Remove element from table
-    table->array[index] = NULL;
+    return true;
+}
 
-    // Add to free list
-    if (table->free_count >= table->array_size) {
-        return false; // Should not happen
+bool
+wasm_component_table_drop_resource(WASMComponentResourceTable *table,
+                                   uint32_t index)
+{
+    WASMTableElement *elem;
+    bool success;
+
+    if (!table || index == 0 || index >= table->next_index
+        || table->array[index] == NULL
+        || table->array[index]->type != WASM_TABLE_ELEM_RESOURCE_HANDLE
+        || table->free_count >= table->array_size) {
+        return false;
     }
 
-    table->free_list[table->free_count] = index;
-    table->free_count++;
+    elem = table->array[index];
 
-    return true;
+    /* Commit the removal before invoking destructor code. Even when teardown
+     * reports an error, this handle must not be dropped a second time. */
+    table->array[index] = NULL;
+    table->free_list[table->free_count++] = index;
+
+    success = wasm_drop_resource_handle((WASMResourceHandle *)elem->ptr);
+    wasm_runtime_free(elem);
+    return success;
 }
 
 static bool
@@ -138,34 +168,50 @@ wasm_component_table_resize(WASMComponentResourceTable *table)
     if (!table)
         return false;
 
-    // Calculate new size based on resize_percent
-    uint32_t new_size =
-        table->array_size + (table->array_size * table->resize_percent / 100);
+    /* Calculate in 64 bits so a hostile resize percentage cannot wrap. */
+    uint64_t growth = (uint64_t)table->array_size * table->resize_percent / 100;
+    uint64_t requested_size = (uint64_t)table->array_size + growth;
 
     // Ensure minimum growth (at least 1 more slot)
-    if (new_size <= table->array_size) {
-        new_size = table->array_size + 1;
+    if (requested_size <= table->array_size) {
+        requested_size = (uint64_t)table->array_size + 1;
     }
 
-    if (new_size > WASM_COMPONENT_TABLE_MAX_LENGTH) {
+    if (requested_size > WASM_COMPONENT_TABLE_MAX_LENGTH) {
         return false;
     }
 
-    // Reallocate both array and free_list to same size
-    WASMTableElement **new_array = (WASMTableElement **)wasm_runtime_realloc(
-        (void *)table->array, sizeof(WASMTableElement *) * new_size);
-    uint32_t *new_free_list =
-        wasm_runtime_realloc(table->free_list, sizeof(uint32_t) * new_size);
+    uint32_t new_size = (uint32_t)requested_size;
+    uint32_t array_bytes = (uint32_t)(sizeof(WASMTableElement *) * new_size);
+    uint32_t free_list_bytes = (uint32_t)(sizeof(uint32_t) * new_size);
+
+    /* Allocate-copy-commit keeps both old buffers valid unless the complete
+     * resize succeeds. Two realloc calls cannot provide that guarantee. */
+    WASMTableElement **new_array =
+        (WASMTableElement **)wasm_runtime_malloc(array_bytes);
+    uint32_t *new_free_list = wasm_runtime_malloc(free_list_bytes);
 
     if (!new_array || !new_free_list) {
+        if (new_array) {
+            wasm_runtime_free((void *)new_array);
+        }
+        if (new_free_list) {
+            wasm_runtime_free(new_free_list);
+        }
         return false;
     }
 
+    memcpy((void *)new_array, (const void *)table->array,
+           sizeof(WASMTableElement *) * table->array_size);
+    memcpy(new_free_list, table->free_list,
+           sizeof(uint32_t) * table->array_size);
     memset((void *)&new_array[table->array_size], 0,
            sizeof(WASMTableElement *) * (new_size - table->array_size));
     memset(&new_free_list[table->array_size], 0,
            sizeof(uint32_t) * (new_size - table->array_size));
 
+    wasm_runtime_free((void *)table->array);
+    wasm_runtime_free(table->free_list);
     table->array = new_array;
     table->free_list = new_free_list;
     table->array_size = new_size;

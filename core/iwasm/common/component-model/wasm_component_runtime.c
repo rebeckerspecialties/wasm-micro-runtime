@@ -9,6 +9,7 @@
 #include "wasm_component.h"
 #include "wasm_loader.h"
 #include "wasm_component_runtime.h"
+#include "wasm_component_canon.h"
 #include "bh_log.h"
 #include "stdio.h"
 #include "wasm_component_canonical.h"
@@ -438,17 +439,29 @@ compute_elem_size(WASMComponentTypeInstance *type)
     }
 }
 
-/// @brief Calculate size needed for the default value types defined in this
-/// component
-/// @param def_val_type
-/// @return
-uint32
-wasm_get_def_val_type_size(WASMComponentDefValType *def_val_type)
+static bool
+component_layout_add(uint64 *total, uint64 count, uint64 element_size)
 {
-    if (!def_val_type) {
-        return 0;
+    if (!total
+        || (element_size != 0
+            && count > (UINT64_MAX - *total) / element_size)) {
+        return false;
     }
-    uint32 size = sizeof(WASMComponentTypeInstance);
+    *total += count * element_size;
+    return true;
+}
+
+bool
+wasm_get_def_val_type_size(WASMComponentDefValType *def_val_type, uint64 *size)
+{
+    uint64 total = 0;
+
+    if (!def_val_type || !size
+        || !component_layout_add(&total, 1,
+                                 sizeof(WASMComponentTypeInstance))) {
+        return false;
+    }
+
     switch (def_val_type->tag) {
         case WASM_COMP_DEF_VAL_PRIMVAL: // pvt:<primvaltype>
         // Flags type
@@ -460,75 +473,123 @@ wasm_get_def_val_type_size(WASMComponentDefValType *def_val_type)
             break;
         // Record type (labeled fields)
         case WASM_COMP_DEF_VAL_RECORD: // 0x72 lt*:vec(<labelvaltype>)
-            size += (uint32)(sizeof(WASMComponentRecordInstance)
-                             + (def_val_type->def_val.record->count
-                                * sizeof(WASMComponentLabelValTypeInstance)));
-            LOG_DEBUG("Detected size of Record is %d", size);
+            if (!def_val_type->def_val.record
+                || (def_val_type->def_val.record->count > 0
+                    && !def_val_type->def_val.record->fields)
+                || !component_layout_add(&total, 1,
+                                         sizeof(WASMComponentRecordInstance))
+                || !component_layout_add(
+                    &total, def_val_type->def_val.record->count,
+                    sizeof(WASMComponentLabelValTypeInstance))) {
+                return false;
+            }
             break;
         // Variant type (labeled cases)
         case WASM_COMP_DEF_VAL_VARIANT: // 0x71 case*:vec(<case>)
-            size += (uint32)(sizeof(WASMComponentVariantInstance)
-                             + (def_val_type->def_val.variant->count
-                                * sizeof(WASMComponentCaseValInstance)));
-            LOG_DEBUG("Detected size of Variant is %d", size);
+            if (!def_val_type->def_val.variant
+                || (def_val_type->def_val.variant->count > 0
+                    && !def_val_type->def_val.variant->cases)
+                || !component_layout_add(&total, 1,
+                                         sizeof(WASMComponentVariantInstance))
+                || !component_layout_add(
+                    &total, def_val_type->def_val.variant->count,
+                    sizeof(WASMComponentCaseValInstance))) {
+                return false;
+            }
             break;
         // List types
         case WASM_COMP_DEF_VAL_LIST: // 0x70 t:<valtype>
-            size += sizeof(WASMComponentListInstance);
-            LOG_DEBUG("Detected size of list is %d", size);
+            if (!def_val_type->def_val.list
+                || !component_layout_add(&total, 1,
+                                         sizeof(WASMComponentListInstance))) {
+                return false;
+            }
             break;
         case WASM_COMP_DEF_VAL_LIST_LEN: // 0x67 t:<valtype> len:<u32>
-            size += sizeof(WASMComponentListLenInstance);
-            LOG_DEBUG("Detected size of fixed size list is %d", size);
+            if (!def_val_type->def_val.list_len
+                || !component_layout_add(
+                    &total, 1, sizeof(WASMComponentListLenInstance))) {
+                return false;
+            }
             break;
         // Tuple type
         case WASM_COMP_DEF_VAL_TUPLE: // 0x6f t*:vec(<valtype>)
-            size += (uint32)(sizeof(WASMComponentTupleInstance)
-                             + (def_val_type->def_val.tuple->count
-                                * sizeof(WASMComponentTypeInstance *)));
-            LOG_DEBUG("Detected size of Tuple is %d", size);
+            if (!def_val_type->def_val.tuple
+                || (def_val_type->def_val.tuple->count > 0
+                    && !def_val_type->def_val.tuple->element_types)
+                || !component_layout_add(&total, 1,
+                                         sizeof(WASMComponentTupleInstance))
+                || !component_layout_add(&total,
+                                         def_val_type->def_val.tuple->count,
+                                         sizeof(WASMComponentTypeInstance *))) {
+                return false;
+            }
             break;
         // Option type
         case WASM_COMP_DEF_VAL_OPTION: // 0x6b t:<valtype>
-            size += sizeof(WASMComponentOptionInstance);
-            LOG_DEBUG("Detected size of option is %d", size);
+            if (!def_val_type->def_val.option
+                || !component_layout_add(&total, 1,
+                                         sizeof(WASMComponentOptionInstance))) {
+                return false;
+            }
             break;
         // Result type
         case WASM_COMP_DEF_VAL_RESULT: // 0x6a t?:<valtype>? u?:<valtype>?
-            size += sizeof(WASMComponentResultInstance);
-            LOG_DEBUG("Detected size of result is %d", size);
+            if (!def_val_type->def_val.result
+                || !component_layout_add(&total, 1,
+                                         sizeof(WASMComponentResultInstance))) {
+                return false;
+            }
             break;
         // Handle types
         case WASM_COMP_DEF_VAL_OWN:    // 0x69 i:<typeidx>
         case WASM_COMP_DEF_VAL_BORROW: // 0x68 i:<typeidx>
-            size += sizeof(WASMComponentResourceInstance);
+            if ((def_val_type->tag == WASM_COMP_DEF_VAL_OWN
+                 && !def_val_type->def_val.owned)
+                || (def_val_type->tag == WASM_COMP_DEF_VAL_BORROW
+                    && !def_val_type->def_val.borrow)
+                || !component_layout_add(
+                    &total, 1, sizeof(WASMComponentResourceHandleInstance))) {
+                return false;
+            }
             break;
         // Async types
         case WASM_COMP_DEF_VAL_STREAM: // 0x66 t?:<valtype>?
         case WASM_COMP_DEF_VAL_FUTURE: // 0x65 t?:<valtype>?
             LOG_WARNING("Not yet supported\n");
             break;
+        default:
+            return false;
     }
-    return size;
+    *size = total;
+    return true;
 }
 
 /// @brief Calculate size needed for the function types defined in this
 /// component
 /// @param func_type
 /// @return
-uint32
-wasm_get_func_type_size(WASMComponentFuncType *func_type)
+bool
+wasm_get_func_type_size(WASMComponentFuncType *func_type, uint64 *size)
 {
-    if (!func_type) {
-        return 0;
+    uint64 total = 0;
+
+    if (!func_type || !func_type->params || !func_type->results || !size
+        || (func_type->params->count > 0 && !func_type->params->params)
+        || !component_layout_add(&total, 1,
+                                 sizeof(WASMComponentFuncTypeInstance))
+        || !component_layout_add(&total, 1,
+                                 sizeof(WASMComponentParamListInstance))
+        || !component_layout_add(&total, func_type->params->count,
+                                 sizeof(WASMComponentLabelValTypeInstance))
+        || !component_layout_add(&total, 1,
+                                 sizeof(WASMComponentResultListInstance))
+        || !component_layout_add(&total, 1,
+                                 sizeof(WASMComponentTypeInstance))) {
+        return false;
     }
-    uint32 size = (uint32)(sizeof(WASMComponentFuncTypeInstance)
-                           + sizeof(WASMComponentParamListInstance)
-                           + (func_type->params->count
-                              * sizeof(WASMComponentLabelValTypeInstance))
-                           + sizeof(WASMComponentResultListInstance)
-                           + sizeof(WASMComponentTypeInstance));
-    return size;
+    *size = total;
+    return true;
 }
 
 /// @brief Calculates total size required by component instance type (including
@@ -537,15 +598,20 @@ wasm_get_func_type_size(WASMComponentFuncType *func_type)
 /// @param instance_type_size OUT: structure that will hold the index counts +
 /// total defined types memory size
 /// @return
-uint32
+bool
 wasm_get_inst_decl_size(WASMComponentInstType *instance_type,
-                        WASMComponentInstanceDeclTypeSize *instance_type_size)
+                        WASMComponentInstanceDeclTypeSize *instance_type_size,
+                        uint64 *size)
 {
-    if (!instance_type) {
-        return 0;
+    uint64 total = 0, types_size = 0, funcs_count = 0, types_count = 0,
+           exports_count = 0, resource_count = 0, method_count = 0;
+    uint32 idx = 0;
+
+    if (!instance_type || !size
+        || (instance_type->count > 0 && !instance_type->instance_decls)) {
+        return false;
     }
-    uint32 size = 0, types_size = 0, funcs_count = 0, types_count = 0,
-           exports_count = 0, resource_count = 0, idx = 0;
+
     for (idx = 0; idx < instance_type->count; idx++) {
         WASMComponentInstDecl *instance_decl =
             &instance_type->instance_decls[idx];
@@ -555,15 +621,34 @@ wasm_get_inst_decl_size(WASMComponentInstType *instance_type,
                 break;
             case WASM_COMP_COMPONENT_DECL_INSTANCE_TYPE:
                 // The new types defined in this instance type
+                if (!instance_decl->decl.type) {
+                    return false;
+                }
                 switch (instance_decl->decl.type->tag) {
                     case WASM_COMP_DEF_TYPE:
-                        types_size += wasm_get_def_val_type_size(
-                            instance_decl->decl.type->type.def_val_type);
+                    {
+                        uint64 nested_size = 0;
+                        if (!wasm_get_def_val_type_size(
+                                instance_decl->decl.type->type.def_val_type,
+                                &nested_size)
+                            || !component_layout_add(&types_size, 1,
+                                                     nested_size)) {
+                            return false;
+                        }
                         break;
+                    }
                     case WASM_COMP_FUNC_TYPE:
-                        types_size += wasm_get_func_type_size(
-                            instance_decl->decl.type->type.func_type);
+                    {
+                        uint64 nested_size = 0;
+                        if (!wasm_get_func_type_size(
+                                instance_decl->decl.type->type.func_type,
+                                &nested_size)
+                            || !component_layout_add(&types_size, 1,
+                                                     nested_size)) {
+                            return false;
+                        }
                         break;
+                    }
                     default:
                         LOG_WARNING("Instance declaration type only supports "
                                     "types and functions for now \n");
@@ -573,6 +658,10 @@ wasm_get_inst_decl_size(WASMComponentInstType *instance_type,
                 break;
             case WASM_COMP_COMPONENT_DECL_INSTANCE_ALIAS:
                 // Increase index count for the aliased sort
+                if (!instance_decl->decl.alias
+                    || !instance_decl->decl.alias->sort) {
+                    return false;
+                }
                 switch (instance_decl->decl.alias->sort->sort) {
                     case WASM_COMP_SORT_FUNC:
                         funcs_count++;
@@ -589,22 +678,34 @@ wasm_get_inst_decl_size(WASMComponentInstType *instance_type,
             case WASM_COMP_COMPONENT_DECL_INSTANCE_EXPORTDECL:
                 // Increase index count + export count for export definition
                 exports_count++;
+                if (!instance_decl->decl.export_decl
+                    || !instance_decl->decl.export_decl->extern_desc) {
+                    return false;
+                }
                 switch (instance_decl->decl.export_decl->extern_desc->type) {
                     case WASM_COMP_EXTERN_FUNC:
                         funcs_count++;
                         break;
                     case WASM_COMP_EXTERN_TYPE:
                         types_count++;
+                        if (!instance_decl->decl.export_decl->extern_desc
+                                 ->extern_desc.type.type_bound) {
+                            return false;
+                        }
                         if (instance_decl->decl.export_decl->extern_desc
                                 ->extern_desc.type.type_bound->tag
                             == WASM_COMP_TYPEBOUND_TYPE) {
-                            types_size +=
-                                sizeof(WASMComponentTypeInstance)
-                                + sizeof(WASMComponentResourceInstance)
-                                + 3
-                                      * sizeof(
-                                          WASMFunctionInstance); // sub resource
-                                                                 // definition
+                            if (!component_layout_add(
+                                    &types_size, 1,
+                                    sizeof(WASMComponentTypeInstance))
+                                || !component_layout_add(
+                                    &types_size, 1,
+                                    sizeof(WASMComponentResourceInstance))
+                                || !component_layout_add(
+                                    &types_size, 3,
+                                    sizeof(WASMFunctionInstance))) {
+                                return false;
+                            }
                             resource_count++;
                         }
                         break;
@@ -620,24 +721,40 @@ wasm_get_inst_decl_size(WASMComponentInstType *instance_type,
         }
     }
 
+    if (types_count > UINT32_MAX || funcs_count > UINT32_MAX
+        || exports_count > UINT32_MAX || resource_count > UINT32_MAX) {
+        return false;
+    }
+
+    method_count = funcs_count;
+    if (!component_layout_add(&method_count, resource_count, 3)
+        || !component_layout_add(&total, 1, sizeof(WASMComponentTypeInstance))
+        || !component_layout_add(&total, 1,
+                                 sizeof(WASMComponentInstTypeInstance))
+        || !component_layout_add(&total, 1, types_size)
+        || !component_layout_add(&total, types_count,
+                                 sizeof(WASMComponentTypeInstance))
+        || !component_layout_add(&total, funcs_count,
+                                 sizeof(WASMComponentFunctionInstance))
+        || !component_layout_add(&total, exports_count,
+                                 sizeof(WASMComponentExportInstance))
+        || !component_layout_add(&total, method_count,
+                                 sizeof(WASMFunctionInstance))
+        || !component_layout_add(&total, method_count,
+                                 sizeof(WASMFunctionImport))) {
+        return false;
+    }
+
     if (instance_type_size) {
         // Needed for instantiating the WASMComponentInstTypeInstance structure
-        instance_type_size->exports_count = exports_count;
-        instance_type_size->func_count = funcs_count;
-        instance_type_size->types_count = types_count;
+        instance_type_size->exports_count = (uint32)exports_count;
+        instance_type_size->func_count = (uint32)funcs_count;
+        instance_type_size->types_count = (uint32)types_count;
         instance_type_size->types_size = types_size;
-        instance_type_size->resource_count = resource_count;
+        instance_type_size->resource_count = (uint32)resource_count;
     }
-    size = (uint32)(sizeof(WASMComponentTypeInstance)
-                    + sizeof(WASMComponentInstTypeInstance) + types_size
-                    + (types_count * sizeof(WASMComponentTypeInstance))
-                    + (funcs_count * sizeof(WASMComponentFunctionInstance))
-                    + (exports_count * sizeof(WASMComponentExportInstance))
-                    + ((funcs_count + (resource_count * 3))
-                       * sizeof(WASMFunctionInstance))
-                    + ((funcs_count + (resource_count * 3))
-                       * sizeof(WASMFunctionImport)));
-    return size;
+    *size = total;
+    return true;
 }
 
 /// @brief Calculate total size that needs to be allocated for the instance ==
@@ -704,6 +821,7 @@ wasm_component_get_index_count(WASMComponent *component, char *error_buf,
                     (uint32)section->parsed.instance_section->count;
                 break;
             case WASM_COMP_SECTION_ALIASES:
+            {
                 uint32 aliases_count =
                     (uint32)section->parsed.alias_section->count;
                 for (idx = 0; idx < aliases_count; idx++) {
@@ -762,6 +880,7 @@ wasm_component_get_index_count(WASMComponent *component, char *error_buf,
                     }
                 }
                 break;
+            }
             case WASM_COMP_SECTION_TYPE:
                 index_count->types +=
                     (uint32)section->parsed.type_section->count;
@@ -769,6 +888,8 @@ wasm_component_get_index_count(WASMComponent *component, char *error_buf,
                      idx++) {
                     WASMComponentTypes *type =
                         &section->parsed.type_section->types[idx];
+                    uint64 type_size = 0;
+                    bool has_layout = true;
                     if (!type) {
                         set_error_buf_ex(error_buf, error_buf_size,
                                          "ERROR: Invalid type section");
@@ -776,28 +897,50 @@ wasm_component_get_index_count(WASMComponent *component, char *error_buf,
                     }
                     switch (type->tag) {
                         case WASM_COMP_DEF_TYPE:
-                            index_count->types_total_size +=
-                                wasm_get_def_val_type_size(
-                                    type->type.def_val_type);
+                            if (!wasm_get_def_val_type_size(
+                                    type->type.def_val_type, &type_size)) {
+                                has_layout = false;
+                            }
                             break;
                         case WASM_COMP_FUNC_TYPE:
-                            index_count->types_total_size +=
-                                wasm_get_func_type_size(type->type.func_type);
+                            if (!wasm_get_func_type_size(type->type.func_type,
+                                                         &type_size)) {
+                                has_layout = false;
+                            }
                             break;
                         case WASM_COMP_INSTANCE_TYPE:
-                            index_count->types_total_size +=
-                                wasm_get_inst_decl_size(
-                                    type->type.instance_type, NULL);
+                            if (!wasm_get_inst_decl_size(
+                                    type->type.instance_type, NULL,
+                                    &type_size)) {
+                                has_layout = false;
+                            }
                             break;
                         case WASM_COMP_RESOURCE_TYPE_SYNC:
-                            index_count->types_total_size +=
-                                sizeof(WASMComponentTypeInstance)
-                                + sizeof(WASMComponentResourceInstance)
-                                + 3 * sizeof(WASMFunctionInstance);
+                            if (!component_layout_add(
+                                    &type_size, 1,
+                                    sizeof(WASMComponentTypeInstance))
+                                || !component_layout_add(
+                                    &type_size, 1,
+                                    sizeof(WASMComponentResourceInstance))
+                                || !component_layout_add(
+                                    &type_size, 3,
+                                    sizeof(WASMFunctionInstance))) {
+                                has_layout = false;
+                            }
                             break;
                         default:
                             LOG_WARNING("Other types not supported for now\n");
-                            break;
+                            continue;
+                    }
+                    if (!has_layout
+                        || !component_layout_add(&index_count->types_total_size,
+                                                 1, type_size)) {
+                        set_error_buf_ex(
+                            error_buf, error_buf_size,
+                            "ERROR: Component type layout is too large or "
+                            "invalid\n");
+                        wasm_runtime_free(index_count);
+                        return NULL;
                     }
                 }
                 break;
@@ -880,6 +1023,7 @@ wasm_component_get_index_count(WASMComponent *component, char *error_buf,
                 // TODO: not in scope for now
                 break;
             case WASM_COMP_SECTION_CANONS:
+            {
                 WASMComponentCanon *canon = NULL;
                 for (idx = 0; idx < section->parsed.canon_section->count;
                      idx++) {
@@ -918,6 +1062,7 @@ wasm_component_get_index_count(WASMComponent *component, char *error_buf,
                     }
                 }
                 break;
+            }
             default:
                 set_error_buf_ex(
                     error_buf, error_buf_size,
@@ -929,10 +1074,37 @@ wasm_component_get_index_count(WASMComponent *component, char *error_buf,
     return index_count;
 }
 
+static bool
+component_instance_add_storage(uint64 *total_size, uint64 count,
+                               uint64 element_size, const char *description,
+                               char *error_buf, uint32 error_buf_size)
+{
+    if (!total_size || element_size == 0 || *total_size > UINT32_MAX
+        || count > ((uint64)UINT32_MAX - *total_size) / element_size) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Component instance allocation is too large at %s",
+                         description);
+        return false;
+    }
+
+    *total_size += count * element_size;
+    return true;
+}
+
 WASMComponentInstance *
 wasm_component_instance_allocate(WASMComponentIndexCount *index_count,
                                  char *error_buf, uint32 error_buf_size)
 {
+    uint64 total_size_64 = 0;
+    uint32 total_size;
+    WASMComponentInstance *comp_instance;
+
+    if (!index_count) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Component index counts are NULL");
+        return NULL;
+    }
+
     LOG_DEBUG("Allocate memory for component instance with:");
     LOG_DEBUG(" %d components", index_count->components);
     LOG_DEBUG(" %d instances", index_count->instances);
@@ -947,48 +1119,78 @@ wasm_component_instance_allocate(WASMComponentIndexCount *index_count,
     LOG_DEBUG(" %d types", index_count->types);
     LOG_DEBUG(" %d values", index_count->values);
     LOG_DEBUG(" %d exports", index_count->exports);
-    // Allocate memory for the Component instance + defined types
-    uint32 total_size =
-        (uint32)(sizeof(WASMComponentInstance)
-                 + (index_count->functions
-                    * sizeof(WASMComponentFunctionInstance *))
-                 + (index_count->values * sizeof(WASMComponentValue *))
-                 + (index_count->types * sizeof(WASMComponentTypeInstance *))
-                 + (index_count->instances * sizeof(WASMComponentInstance *))
-                 + (index_count->components * sizeof(WASMComponent *))
-                 + (index_count->core_functions
-                    * sizeof(WASMFunctionInstance *))
-                 + (index_count->core_tables * sizeof(WASMTableInstance *))
-                 + (index_count->core_memories * sizeof(WASMMemoryInstance *))
-                 + (index_count->core_globals * sizeof(WASMGlobalInstance *))
-                 + (index_count->core_types * sizeof(WASMType *))
-                 + (index_count->core_instances * sizeof(WASMModuleInstance *))
-                 + (index_count->core_modules * sizeof(WASMModule *))
-                 + (index_count->exports * sizeof(WASMComponentExportInstance))
-                 + index_count->types_total_size
-                 + (index_count->defined_core_functions
-                    * sizeof(WASMFunctionInstance))
-                 + (index_count->defined_functions
-                    * sizeof(WASMComponentFunctionInstance))
-                 + (index_count->defined_core_instances
-                    * sizeof(WASMModuleInstance *))
-                 + (index_count->defined_instances
-                    * sizeof(WASMComponentInstance *))
-                 + (index_count->canon_options_funcs
-                    * sizeof(WASMComponentCanonOptsInstance))
-                 + (index_count->canon_options
-                    * sizeof(WASMComponentCanonOptInstance)));
-    WASMComponentInstance *comp_instance = wasm_runtime_malloc(total_size);
+
+#define ADD_INSTANCE_STORAGE(count, type, description)                       \
+    do {                                                                     \
+        if (!component_instance_add_storage(&total_size_64, (uint64)(count), \
+                                            sizeof(type), description,       \
+                                            error_buf, error_buf_size)) {    \
+            return NULL;                                                     \
+        }                                                                    \
+    } while (0)
+
+    ADD_INSTANCE_STORAGE(1, WASMComponentInstance, "instance header");
+    ADD_INSTANCE_STORAGE(index_count->functions,
+                         WASMComponentFunctionInstance *, "functions");
+    ADD_INSTANCE_STORAGE(index_count->values, WASMComponentValue *, "values");
+    ADD_INSTANCE_STORAGE(index_count->types, WASMComponentTypeInstance *,
+                         "types");
+    ADD_INSTANCE_STORAGE(index_count->instances, WASMComponentInstance *,
+                         "component instances");
+    ADD_INSTANCE_STORAGE(index_count->components, WASMComponent *,
+                         "components");
+    ADD_INSTANCE_STORAGE(index_count->core_functions, WASMFunctionInstance *,
+                         "core functions");
+    ADD_INSTANCE_STORAGE(index_count->core_tables, WASMTableInstance *,
+                         "core tables");
+    ADD_INSTANCE_STORAGE(index_count->core_memories, WASMMemoryInstance *,
+                         "core memories");
+    ADD_INSTANCE_STORAGE(index_count->core_globals, WASMGlobalInstance *,
+                         "core globals");
+    ADD_INSTANCE_STORAGE(index_count->core_types, WASMType *, "core types");
+    ADD_INSTANCE_STORAGE(index_count->core_instances, WASMModuleInstance *,
+                         "core instances");
+    ADD_INSTANCE_STORAGE(index_count->core_modules, WASMModule *,
+                         "core modules");
+    ADD_INSTANCE_STORAGE(index_count->exports, WASMComponentExportInstance,
+                         "exports");
+    ADD_INSTANCE_STORAGE(index_count->types_total_size, uint8,
+                         "defined type data");
+    ADD_INSTANCE_STORAGE(index_count->defined_core_functions,
+                         WASMFunctionInstance, "defined core functions");
+    ADD_INSTANCE_STORAGE(index_count->defined_functions,
+                         WASMComponentFunctionInstance,
+                         "defined component functions");
+    ADD_INSTANCE_STORAGE(index_count->defined_core_instances,
+                         WASMModuleInstance *, "defined core instances");
+    ADD_INSTANCE_STORAGE(index_count->defined_instances,
+                         WASMComponentInstance *,
+                         "defined component instances");
+    ADD_INSTANCE_STORAGE(index_count->canon_options_funcs,
+                         WASMComponentCanonOptsInstance,
+                         "canonical option groups");
+    ADD_INSTANCE_STORAGE(index_count->canon_options,
+                         WASMComponentCanonOptInstance, "canonical options");
+
+#undef ADD_INSTANCE_STORAGE
+
+    total_size = (uint32)total_size_64;
+    comp_instance = wasm_runtime_malloc(total_size);
+    if (!comp_instance) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Failed to allocate component instance\n");
+        return NULL;
+    }
     memset(comp_instance, 0, total_size);
     // The types defined in this component will be stored in the memory region
     // right after the component instance, similar to Wasm Module implementation
 
-    comp_instance->defined_types_size = index_count->types_total_size;
+    comp_instance->defined_types_size = (uint32)index_count->types_total_size;
     comp_instance->defined_canon_opts_size =
-        (uint32)((index_count->canon_options_funcs
-                  * sizeof(WASMComponentCanonOptsInstance))
-                 + (index_count->canon_options
-                    * sizeof(WASMComponentCanonOptInstance)));
+        (uint32)((uint64)index_count->canon_options_funcs
+                     * sizeof(WASMComponentCanonOptsInstance)
+                 + (uint64)index_count->canon_options
+                       * sizeof(WASMComponentCanonOptInstance));
     comp_instance->functions =
         (WASMComponentFunctionInstance **)((uint8_t *)comp_instance
                                            + sizeof(WASMComponentInstance));
@@ -1156,9 +1358,10 @@ get_core_index_count(WASMInstExpr *instance_expression)
 }
 
 WASMComponentInstance *
-wasm_component_instantiate_internal(
+wasm_component_instantiate_internal_ex(
     WASMComponent *component,
-    WASMComponentInstArgInstances *instance_expression, char *error_buf,
+    WASMComponentInstArgInstances *instance_expression,
+    const struct InstantiationArgs2 *args, char *error_buf,
     uint32 error_buf_size)
 {
     LOG_DEBUG("Instantiate internal");
@@ -1185,23 +1388,47 @@ wasm_component_instantiate_internal(
     if (instance_expression) {
         comp_instance->parent = instance_expression->parent;
     }
+    if (args) {
+        comp_instance->instantiation_args = *args;
+    }
+    else {
+        wasm_runtime_instantiation_args_set_defaults(
+            &comp_instance->instantiation_args);
+        wasm_runtime_instantiation_args_set_default_stack_size(
+            &comp_instance->instantiation_args, COMPONENT_DEFAULT_STACK_SIZE);
+        wasm_runtime_instantiation_args_set_host_managed_heap_size(
+            &comp_instance->instantiation_args, COMPONENT_DEFAULT_HEAP_SIZE);
+    }
+    comp_instance->default_wasm_stack_size =
+        comp_instance->instantiation_args.v1.default_stack_size;
+    comp_instance->custom_data = comp_instance->instantiation_args.custom_data;
     comp_instance->component = component;
     uint32 section_idx = 0;
     WASMComponentSection *section = NULL;
 
 #if WASM_ENABLE_LIBC_WASI != 0
     if (!comp_instance->parent) {
+        const WASIArguments *wasi_args = &component->wasi_args;
+        if (component->wasi_args.set_by_user
+            && comp_instance->instantiation_args.wasi.set_by_user) {
+            set_error_buf_ex(error_buf, error_buf_size,
+                             "ERROR: WASI configuration was given via both "
+                             "the component and InstantiationArgs2\n");
+            wasm_component_deinstantiate(comp_instance);
+            comp_instance = NULL;
+            goto done;
+        }
+        if (comp_instance->instantiation_args.wasi.set_by_user
+            || !component->wasi_args.set_by_user) {
+            wasi_args = &comp_instance->instantiation_args.wasi;
+        }
         if (!wasm_component_runtime_init_wasi(
-                comp_instance, component->wasi_args.dir_list,
-                component->wasi_args.dir_count,
-                component->wasi_args.map_dir_list,
-                component->wasi_args.map_dir_count, component->wasi_args.env,
-                component->wasi_args.env_count, component->wasi_args.addr_pool,
-                component->wasi_args.addr_count,
-                component->wasi_args.ns_lookup_pool,
-                component->wasi_args.ns_lookup_count, component->wasi_args.argv,
-                component->wasi_args.argc, component->wasi_args.stdio[0],
-                component->wasi_args.stdio[1], component->wasi_args.stdio[2],
+                comp_instance, wasi_args->dir_list, wasi_args->dir_count,
+                wasi_args->map_dir_list, wasi_args->map_dir_count,
+                wasi_args->env, wasi_args->env_count, wasi_args->addr_pool,
+                wasi_args->addr_count, wasi_args->ns_lookup_pool,
+                wasi_args->ns_lookup_count, wasi_args->argv, wasi_args->argc,
+                wasi_args->stdio[0], wasi_args->stdio[1], wasi_args->stdio[2],
                 error_buf, error_buf_size)) {
             set_error_buf_ex(error_buf, error_buf_size,
                              "ERROR: Failed to initiate component wasi args\n");
@@ -1245,10 +1472,12 @@ wasm_component_instantiate_internal(
                 if (!wasm_resolve_core_instance(
                         section->parsed.core_instance_section, comp_instance,
                         error_buf, error_buf_size)) {
-                    set_error_buf_ex(error_buf, error_buf_size,
-                                     "ERROR: Core instance section %d "
-                                     "instantiation failed\n",
-                                     section->id);
+                    if (!error_buf || error_buf[0] == '\0') {
+                        set_error_buf_ex(error_buf, error_buf_size,
+                                         "ERROR: Core instance section %d "
+                                         "instantiation failed\n",
+                                         section->id);
+                    }
                     wasm_component_deinstantiate(comp_instance);
                     comp_instance = NULL;
                     goto done;
@@ -1337,8 +1566,12 @@ wasm_component_instantiate_internal(
                 }
                 break;
             case WASM_COMP_SECTION_START:
-                // TODO: Not in scope for now
-                break;
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "ERROR: Component start sections are not "
+                                 "supported\n");
+                wasm_component_deinstantiate(comp_instance);
+                comp_instance = NULL;
+                goto done;
             case WASM_COMP_SECTION_IMPORTS:
                 LOG_DEBUG("%d : --Import section", section_idx);
                 bool import_failed = false;
@@ -1346,17 +1579,17 @@ wasm_component_instantiate_internal(
                     import_failed = !wasm_resolve_imports(
                         section->parsed.import_section, comp_instance,
                         instance_expression, error_buf, error_buf_size);
-#if WASM_ENABLE_LIBC_WASI != 0
                 else if (!comp_instance->parent)
-                    import_failed = !wasm_resolve_imports_WASI(
+                    import_failed = !wasm_resolve_imports_host(
                         section->parsed.import_section, comp_instance,
                         error_buf, error_buf_size);
-#endif
                 if (import_failed) {
-                    set_error_buf_ex(
-                        error_buf, error_buf_size,
-                        "ERROR: Import section %d instantiation failed\n",
-                        section->id);
+                    if (!error_buf || error_buf[0] == '\0') {
+                        set_error_buf_ex(
+                            error_buf, error_buf_size,
+                            "ERROR: Import section %d instantiation failed\n",
+                            section->id);
+                    }
                     wasm_component_deinstantiate(comp_instance);
                     comp_instance = NULL;
                     goto done;
@@ -1377,8 +1610,12 @@ wasm_component_instantiate_internal(
                 }
                 break;
             case WASM_COMP_SECTION_VALUES:
-                // TODO, not in scope for now
-                break;
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "ERROR: Component value sections are not "
+                                 "supported\n");
+                wasm_component_deinstantiate(comp_instance);
+                comp_instance = NULL;
+                goto done;
             default:
                 set_error_buf_ex(
                     error_buf, error_buf_size,
@@ -1395,12 +1632,426 @@ done:
 }
 
 WASMComponentInstance *
+wasm_component_instantiate_internal(
+    WASMComponent *component,
+    WASMComponentInstArgInstances *instance_expression, char *error_buf,
+    uint32 error_buf_size)
+{
+    const struct InstantiationArgs2 *args =
+        instance_expression && instance_expression->parent
+            ? &instance_expression->parent->instantiation_args
+            : NULL;
+    return wasm_component_instantiate_internal_ex(
+        component, instance_expression, args, error_buf, error_buf_size);
+}
+
+WASMComponentInstance *
 wasm_component_instantiate(WASMComponent *component, char *error_buf,
                            uint32 error_buf_size)
 {
 
     return wasm_component_instantiate_internal(component, NULL, error_buf,
                                                error_buf_size);
+}
+
+WASMComponentInstance *
+wasm_component_instantiate_ex2(WASMComponent *component,
+                               const struct InstantiationArgs2 *args,
+                               char *error_buf, uint32 error_buf_size)
+{
+    if (!args) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: InstantiationArgs2 is NULL\n");
+        return NULL;
+    }
+    return wasm_component_instantiate_internal_ex(component, NULL, args,
+                                                  error_buf, error_buf_size);
+}
+
+static void
+component_set_custom_data(WASMComponentInstance *comp_instance,
+                          void *custom_data, uint32 depth)
+{
+    if (!comp_instance || depth > MAX_DEPTH_RECURSION) {
+        return;
+    }
+
+    comp_instance->custom_data = custom_data;
+    comp_instance->instantiation_args.custom_data = custom_data;
+
+    for (uint32 idx = 0; idx < comp_instance->types_count; idx++) {
+        WASMComponentTypeInstance *type = comp_instance->types[idx];
+        WASMComponentResourceInstance *resource = NULL;
+
+        if (type
+            && (type->type == COMPONENT_VAL_TYPE_RESOURCE_SYNC
+                || type->type == COMPONENT_VAL_TYPE_RESOURCE_ASYNC)
+            && (resource = type->type_specific.resource)
+            && resource->host_drop_attachment_is_custom_data) {
+            resource->host_drop_attachment = custom_data;
+        }
+    }
+
+    for (uint32 idx = 0; idx < comp_instance->defined_core_instances_count;
+         idx++) {
+        WASMModuleInstance *core_inst =
+            comp_instance->defined_core_instances[idx];
+
+        if (core_inst && core_inst->e) {
+            wasm_runtime_set_custom_data_internal(
+                (WASMModuleInstanceCommon *)core_inst, custom_data);
+        }
+    }
+
+    for (uint32 idx = 0; idx < comp_instance->defined_instances_count; idx++) {
+        component_set_custom_data(comp_instance->defined_instances[idx],
+                                  custom_data, depth + 1);
+    }
+}
+
+void
+wasm_component_set_custom_data(WASMComponentInstance *comp_instance,
+                               void *custom_data)
+{
+    component_set_custom_data(comp_instance, custom_data, 0);
+}
+
+void *
+wasm_component_get_custom_data(WASMComponentInstance *comp_instance)
+{
+    return comp_instance ? comp_instance->custom_data : NULL;
+}
+
+void *
+wasm_component_get_custom_data_from_exec_env(wasm_exec_env_t exec_env)
+{
+    WASMExecEnv *internal_exec_env = (WASMExecEnv *)exec_env;
+    WASMComponentInstance *comp_instance =
+        internal_exec_env ? internal_exec_env->component_inst : NULL;
+
+    while (comp_instance && comp_instance->parent) {
+        comp_instance = comp_instance->parent;
+    }
+    return wasm_component_get_custom_data(comp_instance);
+}
+
+typedef struct HostResourceMatch {
+    const char *interface_name;
+    const char *resource_name;
+    WASMComponentResourceInstance *resource;
+    bool ambiguous;
+} HostResourceMatch;
+
+static void
+match_host_resource(HostResourceMatch *match,
+                    WASMComponentResourceInstance *resource)
+{
+    if (!match || !resource || !resource->is_host || !resource->interface_name
+        || !resource->name
+        || strcmp(resource->interface_name, match->interface_name) != 0
+        || strcmp(resource->name, match->resource_name) != 0) {
+        return;
+    }
+
+    if (match->resource && match->resource != resource) {
+        match->ambiguous = true;
+    }
+    else {
+        match->resource = resource;
+    }
+}
+
+static void
+find_host_resource_in_type(HostResourceMatch *match,
+                           WASMComponentTypeInstance *type, uint32 depth)
+{
+    if (!match || !type || match->ambiguous || depth > MAX_DEPTH_RECURSION) {
+        return;
+    }
+
+    switch (type->type) {
+        case COMPONENT_VAL_TYPE_RESOURCE_SYNC:
+        case COMPONENT_VAL_TYPE_RESOURCE_ASYNC:
+            match_host_resource(match, type->type_specific.resource);
+            break;
+        case COMPONENT_VAL_TYPE_OWN:
+        case COMPONENT_VAL_TYPE_BORROW:
+            if (type->type_specific.resource_handle) {
+                match_host_resource(
+                    match, type->type_specific.resource_handle->resource);
+            }
+            break;
+        case COMPONENT_VAL_TYPE_RECORD:
+            if (type->type_specific.record) {
+                for (uint32 idx = 0; idx < type->type_specific.record->count;
+                     idx++) {
+                    find_host_resource_in_type(
+                        match, type->type_specific.record->fields[idx].type,
+                        depth + 1);
+                }
+            }
+            break;
+        case COMPONENT_VAL_TYPE_VARIANT:
+            if (type->type_specific.variant) {
+                for (uint32 idx = 0; idx < type->type_specific.variant->count;
+                     idx++) {
+                    find_host_resource_in_type(
+                        match,
+                        type->type_specific.variant->cases[idx].value_type,
+                        depth + 1);
+                }
+            }
+            break;
+        case COMPONENT_VAL_TYPE_LIST:
+            if (type->type_specific.list) {
+                find_host_resource_in_type(
+                    match, type->type_specific.list->element_type, depth + 1);
+            }
+            break;
+        case COMPONENT_VAL_TYPE_FIXED_SIZE_LIST:
+            if (type->type_specific.list_len) {
+                find_host_resource_in_type(
+                    match, type->type_specific.list_len->element_type,
+                    depth + 1);
+            }
+            break;
+        case COMPONENT_VAL_TYPE_TUPLE:
+            if (type->type_specific.tuple) {
+                for (uint32 idx = 0; idx < type->type_specific.tuple->count;
+                     idx++) {
+                    find_host_resource_in_type(
+                        match, type->type_specific.tuple->element_types[idx],
+                        depth + 1);
+                }
+            }
+            break;
+        case COMPONENT_VAL_TYPE_OPTION:
+            if (type->type_specific.option) {
+                find_host_resource_in_type(
+                    match, type->type_specific.option->element_type, depth + 1);
+            }
+            break;
+        case COMPONENT_VAL_TYPE_RESULT:
+            if (type->type_specific.result) {
+                find_host_resource_in_type(
+                    match, type->type_specific.result->result_type, depth + 1);
+                find_host_resource_in_type(
+                    match, type->type_specific.result->error_type, depth + 1);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+static WASMComponentResourceInstance *
+find_host_resource_in_func(WASMComponentFuncTypeInstance *func_type,
+                           const char *interface_name,
+                           const char *resource_name, bool search_results)
+{
+    HostResourceMatch match = {
+        .interface_name = interface_name,
+        .resource_name = resource_name,
+    };
+
+    if (!func_type || !interface_name || !resource_name) {
+        return NULL;
+    }
+
+    if (search_results) {
+        if (func_type->results) {
+            find_host_resource_in_type(&match, func_type->results->result, 0);
+        }
+    }
+    else if (func_type->params) {
+        for (uint32 idx = 0; idx < func_type->params->count; idx++) {
+            find_host_resource_in_type(&match,
+                                       func_type->params->params[idx].type, 0);
+        }
+    }
+
+    return match.ambiguous ? NULL : match.resource;
+}
+
+bool
+wasm_component_host_resource_new(wasm_exec_env_t exec_env,
+                                 const char *interface_name,
+                                 const char *resource_name,
+                                 uint32_t representation, uint32_t *out_handle)
+{
+    WASMExecEnv *internal_exec_env = (WASMExecEnv *)exec_env;
+    WASMComponentFuncTypeInstance *func_type = NULL;
+    WASMComponentInstance *component_inst = NULL;
+    WASMComponentResourceInstance *resource = NULL;
+
+    if (!out_handle) {
+        return false;
+    }
+    *out_handle = 0;
+    if (!internal_exec_env || !interface_name || !resource_name
+        || representation == 0
+        || !(component_inst = internal_exec_env->component_inst)
+        || !(func_type = wasm_get_component_func_type(internal_exec_env))) {
+        return false;
+    }
+
+    resource = find_host_resource_in_func(func_type, interface_name,
+                                          resource_name, true);
+    if (!resource
+        || !canon_resource_new(resource, component_inst, representation,
+                               out_handle)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool
+wasm_component_host_resource_rep(wasm_exec_env_t exec_env,
+                                 const char *interface_name,
+                                 const char *resource_name, uint32_t handle,
+                                 uint32_t *out_representation)
+{
+    WASMExecEnv *internal_exec_env = (WASMExecEnv *)exec_env;
+    WASMComponentFuncTypeInstance *func_type = NULL;
+    WASMComponentInstance *component_inst = NULL;
+    WASMComponentResourceInstance *resource = NULL;
+
+    if (!out_representation) {
+        return false;
+    }
+    *out_representation = 0;
+    if (!internal_exec_env || !interface_name || !resource_name
+        || !(component_inst = internal_exec_env->component_inst)
+        || !(func_type = wasm_get_component_func_type(internal_exec_env))) {
+        return false;
+    }
+
+    resource = find_host_resource_in_func(func_type, interface_name,
+                                          resource_name, false);
+    return resource
+           && canon_resource_rep(resource, component_inst, handle,
+                                 out_representation);
+}
+
+bool
+wasm_component_host_resource_take(wasm_exec_env_t exec_env,
+                                  const char *interface_name,
+                                  const char *resource_name, uint32_t handle,
+                                  uint32_t *out_representation)
+{
+    WASMExecEnv *internal_exec_env = (WASMExecEnv *)exec_env;
+    WASMComponentFuncTypeInstance *func_type = NULL;
+    WASMComponentInstance *component_inst = NULL;
+    WASMComponentResourceInstance *resource = NULL;
+    WASMResourceHandle *resource_handle = NULL;
+
+    if (!out_representation) {
+        return false;
+    }
+    *out_representation = 0;
+    if (!internal_exec_env || !interface_name || !resource_name
+        || !(component_inst = internal_exec_env->component_inst)
+        || !(func_type = wasm_get_component_func_type(internal_exec_env))) {
+        return false;
+    }
+
+    resource = find_host_resource_in_func(func_type, interface_name,
+                                          resource_name, false);
+    resource_handle =
+        resource ? wasm_component_table_get(component_inst->table, handle,
+                                            WASM_TABLE_ELEM_RESOURCE_HANDLE)
+                 : NULL;
+    if (!resource_handle || resource_handle->rt != resource
+        || !resource_handle->own || resource_handle->num_lends != 0) {
+        return false;
+    }
+
+    *out_representation = resource_handle->rep;
+    if (!wasm_component_table_remove(component_inst->table, handle)) {
+        *out_representation = 0;
+        return false;
+    }
+    return true;
+}
+
+static uint32
+set_host_resource_drop_callback(
+    WASMComponentInstance *comp_instance, const char *interface_name,
+    const char *resource_name,
+    wasm_component_host_resource_drop_callback_t callback, void *attachment,
+    uint32 depth)
+{
+    uint32 match_count = 0;
+
+    if (!comp_instance || depth > MAX_DEPTH_RECURSION) {
+        return 0;
+    }
+
+    for (uint32 idx = 0; idx < comp_instance->types_count; idx++) {
+        WASMComponentTypeInstance *type = comp_instance->types[idx];
+        WASMComponentResourceInstance *resource = NULL;
+
+        if (!type
+            || (type->type != COMPONENT_VAL_TYPE_RESOURCE_SYNC
+                && type->type != COMPONENT_VAL_TYPE_RESOURCE_ASYNC)
+            || !(resource = type->type_specific.resource) || !resource->is_host
+            || !resource->interface_name || !resource->name
+            || strcmp(resource->interface_name, interface_name) != 0
+            || strcmp(resource->name, resource_name) != 0) {
+            continue;
+        }
+
+        resource->host_drop_callback = callback;
+        resource->host_drop_attachment = attachment;
+        resource->host_drop_attachment_is_custom_data = false;
+        match_count++;
+    }
+
+    for (uint32 idx = 0; idx < comp_instance->defined_instances_count; idx++) {
+        match_count += set_host_resource_drop_callback(
+            comp_instance->defined_instances[idx], interface_name,
+            resource_name, callback, attachment, depth + 1);
+    }
+
+    return match_count;
+}
+
+bool
+wasm_component_set_host_resource_drop_callback(
+    WASMComponentInstance *comp_instance, const char *interface_name,
+    const char *resource_name,
+    wasm_component_host_resource_drop_callback_t callback, void *attachment)
+{
+    if (!comp_instance || !interface_name || !resource_name || !callback) {
+        return false;
+    }
+
+    return set_host_resource_drop_callback(comp_instance, interface_name,
+                                           resource_name, callback, attachment,
+                                           0)
+           > 0;
+}
+
+void
+wasm_component_terminate(WASMComponentInstance *comp_instance)
+{
+    if (!comp_instance) {
+        return;
+    }
+
+    for (uint32 idx = 0; idx < comp_instance->defined_core_instances_count;
+         idx++) {
+        WASMModuleInstance *core_inst =
+            comp_instance->defined_core_instances[idx];
+        if (core_inst && core_inst->e) {
+            wasm_runtime_terminate((wasm_module_inst_t)core_inst);
+        }
+    }
+
+    for (uint32 idx = 0; idx < comp_instance->defined_instances_count; idx++) {
+        wasm_component_terminate(comp_instance->defined_instances[idx]);
+    }
 }
 
 #if WASM_ENABLE_LIBC_WASI != 0
@@ -1454,7 +2105,23 @@ wasm_component_deinstantiate(WASMComponentInstance *comp_instance)
     }
     uint32 idx = 0;
 
-    // Free core instances
+    /* Drop owned resources while all destructor implementations are still
+     * live. This must precede both nested-component and core deinstantiation.
+     */
+    if (comp_instance->table) {
+        wasm_component_table_destroy(comp_instance->table);
+        comp_instance->table = NULL;
+    }
+
+    // Free nested component instances
+    for (idx = 0; idx < comp_instance->defined_instances_count; idx++) {
+        if (comp_instance->defined_instances[idx]) {
+            wasm_component_deinstantiate(comp_instance->defined_instances[idx]);
+            comp_instance->defined_instances[idx] = NULL;
+        }
+    }
+
+    // Free core instances after every component resource has been dropped
     for (idx = 0; idx < comp_instance->defined_core_instances_count; idx++) {
         if (!comp_instance->defined_core_instances[idx]->e) {
             wasm_runtime_free(
@@ -1466,14 +2133,6 @@ wasm_component_deinstantiate(WASMComponentInstance *comp_instance)
             wasm_deinstantiate(comp_instance->defined_core_instances[idx],
                                false);
         comp_instance->defined_core_instances[idx] = NULL;
-    }
-
-    // Free nested component instances
-    for (idx = 0; idx < comp_instance->defined_instances_count; idx++) {
-        if (comp_instance->defined_instances[idx]) {
-            wasm_component_deinstantiate(comp_instance->defined_instances[idx]);
-            comp_instance->defined_instances[idx] = NULL;
-        }
     }
 
     // Free runtime canonical options for component functions (canon.lift)
@@ -1502,12 +2161,6 @@ wasm_component_deinstantiate(WASMComponentInstance *comp_instance)
         wasm_component_runtime_destroy_wasi(comp_instance);
     }
 #endif
-    // Destroy the component instance table
-    if (comp_instance->table) {
-        wasm_component_table_destroy(comp_instance->table);
-        comp_instance->table = NULL;
-    }
-
     wasm_runtime_free(comp_instance);
     comp_instance = NULL;
 }
@@ -1572,6 +2225,79 @@ wasm_component_lookup_function(const WASMComponentInstance *component_inst,
     }
 
     return NULL; // Function not found
+}
+
+static const char *
+component_export_name(const WASMComponentExportInstance *export_inst)
+{
+    WASMComponentExportName *export_name;
+
+    if (!export_inst || !(export_name = export_inst->export_name)) {
+        return NULL;
+    }
+
+    if (export_name->tag == WASM_COMP_IMPORTNAME_SIMPLE) {
+        return export_name->exported.simple.name
+                   ? export_name->exported.simple.name->name
+                   : NULL;
+    }
+    if (export_name->tag == WASM_COMP_IMPORTNAME_VERSIONED) {
+        return export_name->exported.versioned.name
+                   ? export_name->exported.versioned.name->name
+                   : NULL;
+    }
+    return NULL;
+}
+
+WASMComponentFunctionInstance *
+wasm_component_lookup_function_qualified(
+    const WASMComponentInstance *component_inst, const char *interface_name,
+    const char *function_name)
+{
+    uint32 interface_index, function_index;
+
+    if (!component_inst || !component_inst->exports || !interface_name
+        || !function_name) {
+        return NULL;
+    }
+
+    for (interface_index = 0; interface_index < component_inst->exports_count;
+         interface_index++) {
+        WASMComponentExportInstance *interface_export =
+            &component_inst->exports[interface_index];
+        WASMComponentInstance *interface_inst;
+        const char *exported_interface_name;
+
+        if (interface_export->type != WASM_COMP_EXTERN_INSTANCE
+            || !(interface_inst = interface_export->exp.instance)
+            || !(exported_interface_name =
+                     component_export_name(interface_export))
+            || strcmp(exported_interface_name, interface_name) != 0) {
+            continue;
+        }
+
+        for (function_index = 0; function_index < interface_inst->exports_count;
+             function_index++) {
+            WASMComponentExportInstance *function_export =
+                &interface_inst->exports[function_index];
+            const char *exported_function_name;
+
+            if (function_export->type != WASM_COMP_EXTERN_FUNC
+                || !(exported_function_name =
+                         component_export_name(function_export))) {
+                continue;
+            }
+            if (strcmp(exported_function_name, function_name) == 0) {
+                return function_export->exp.function;
+            }
+        }
+
+        /* Component export names are unique, so an exact interface match
+         * cannot be followed by a second candidate. */
+        return NULL;
+    }
+
+    return NULL;
 }
 
 WASMMemoryInstance *
@@ -1922,8 +2648,14 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     WASMModuleInstance *module =
         (WASMModuleInstance *)wasm_runtime_get_module_inst(exec_env);
 
+    WASMComponentInstance *saved_component_inst = exec_env->component_inst;
+    WASMFunctionInstance *saved_core_func = exec_env->core_func;
+    WASMMemoryInstance *saved_memory = exec_env->memory;
+    LiftLowerContext *saved_cx = exec_env->cx;
+    void *saved_attachment = exec_env->attachment;
+
     WASMComponentInstance *root_comp = module->comp_instance;
-    while (root_comp->parent)
+    while (root_comp && root_comp->parent)
         root_comp = root_comp->parent;
 
     exec_env->component_inst = root_comp;
@@ -1945,17 +2677,19 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
 
 #if WASM_ENABLE_SIMD != 0 && WASM_ENABLE_FAST_INTERP != 0
     /* SIMD assembly: each xmm slot = 16 bytes = 2 uint64 slots */
-    argc1 =
-        1 + MAX_REG_FLOATS * 2 + (uint32)func_type->param_count + ext_ret_count;
+    argc1 = 1 + COMPONENT_MAX_REG_FLOATS * 2 + (uint32)func_type->param_count
+            + ext_ret_count;
 #else
     /* Non-SIMD assembly: each xmm slot = 8 bytes = 1 uint64 slot */
-    argc1 = 1 + MAX_REG_FLOATS + (uint32)func_type->param_count + ext_ret_count;
+    argc1 = 1 + COMPONENT_MAX_REG_FLOATS + (uint32)func_type->param_count
+            + ext_ret_count;
 #endif
 
     if (argc1 > sizeof(argv_buf) / sizeof(uint64)) {
         size = (uint64)(sizeof(uint64) * (uint64)argc1);
         argv1 = wasm_runtime_malloc((uint32)size);
         if (!argv1) {
+            exec_env->component_inst = saved_component_inst;
             return false;
         }
     }
@@ -1965,6 +2699,9 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     Subtask *subtask = subtask_create();
     if (!subtask) {
         wasm_set_exception(module, "failed to create subtask");
+        if (argv1 != argv_buf)
+            wasm_runtime_free(argv1);
+        exec_env->component_inst = saved_component_inst;
         return false;
     }
 
@@ -1980,18 +2717,16 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     exec_env->core_func = cur_func;
 
 #if WASM_ENABLE_SIMD != 0 && WASM_ENABLE_FAST_INTERP != 0
-    /* fp as v128*: each step = 16 bytes; ints at byte offset MAX_REG_FLOATS*16
-     */
+    /* fp as v128*: each step = 16 bytes; integer registers follow. */
     fps = (V128 *)argv1;
-    ints = (uint64 *)(fps + MAX_REG_FLOATS);
+    ints = (uint64 *)(fps + COMPONENT_MAX_REG_FLOATS);
 #else
-    /* fp as v128*: each step = 16 bytes; ints at byte offset MAX_REG_FLOATS*8
-     */
+    /* fp slots are 8 bytes; integer registers follow. */
     fps = argv1;
-    ints = fps + MAX_REG_FLOATS;
+    ints = fps + COMPONENT_MAX_REG_FLOATS;
 #endif
 
-    stacks = ints + MAX_REG_INTS;
+    stacks = ints + COMPONENT_MAX_REG_INTS;
 
     ints[n_ints++] = (uint64)(uintptr_t)exec_env;
 
@@ -2040,21 +2775,21 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
                         arg_i64 = (uint64)memory->memory_data + app_offset;
                     }
                 }
-                if (n_ints < MAX_REG_INTS)
+                if (n_ints < COMPONENT_MAX_REG_INTS)
                     ints[n_ints++] = arg_i64;
                 else
                     stacks[n_stacks++] = arg_i64;
                 break;
             }
             case VALUE_TYPE_I64:
-                if (n_ints < MAX_REG_INTS)
+                if (n_ints < COMPONENT_MAX_REG_INTS)
                     ints[n_ints++] = *(uint64 *)argv_src;
                 else
                     stacks[n_stacks++] = *(uint64 *)argv_src;
                 argv_src += 2;
                 break;
             case VALUE_TYPE_F32:
-                if (n_fps < MAX_REG_FLOATS) {
+                if (n_fps < COMPONENT_MAX_REG_FLOATS) {
                     *(float32 *)&fps[n_fps++] = *(float32 *)argv_src++;
                 }
                 else {
@@ -2062,7 +2797,7 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
                 }
                 break;
             case VALUE_TYPE_F64:
-                if (n_fps < MAX_REG_FLOATS) {
+                if (n_fps < COMPONENT_MAX_REG_FLOATS) {
                     *(float64 *)&fps[n_fps++] = *(float64 *)argv_src;
                 }
                 else {
@@ -2077,7 +2812,7 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     }
     /* Save extra result values' address to argv1 */
     for (i = 0; i < ext_ret_count; i++) {
-        if (n_ints < MAX_REG_INTS)
+        if (n_ints < COMPONENT_MAX_REG_INTS)
             ints[n_ints++] = *(uint64 *)argv_src;
         else
             stacks[n_stacks++] = *(uint64 *)argv_src;
@@ -2122,12 +2857,24 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
                 PUT_I64_TO_ADDR(argv_ret,
                                 invokeNative_Int64(func_ptr, argv1, n_stacks));
                 break;
+            case VALUE_TYPE_F32:
+            {
+                float32 value = invokeNative_Float32(func_ptr, argv1, n_stacks);
+                memcpy(argv_ret, &value, sizeof(value));
+                break;
+            }
+            case VALUE_TYPE_F64:
+            {
+                float64 value = invokeNative_Float64(func_ptr, argv1, n_stacks);
+                memcpy(argv_ret, &value, sizeof(value));
+                break;
+            }
             default:
                 bh_assert(0);
                 break;
         }
     }
-    exec_env->attachment = NULL;
+    exec_env->attachment = saved_attachment;
 
     subtask->state = SUBTASK_STATE_RETURNED;
 
@@ -2136,6 +2883,11 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     ret = !wasm_copy_exception(module, NULL);
 
 fail:
+    exec_env->attachment = saved_attachment;
+    exec_env->cx = saved_cx;
+    exec_env->memory = saved_memory;
+    exec_env->core_func = saved_core_func;
+    exec_env->component_inst = saved_component_inst;
     if (argv1 != argv_buf)
         wasm_runtime_free(argv1);
     subtask_destroy(subtask);

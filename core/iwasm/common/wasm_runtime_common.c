@@ -2329,7 +2329,7 @@ wasm_runtime_get_export_global_inst(WASMModuleInstanceCommon *const module_inst,
                     &e->globals[wasm_export->index];
                 global_inst->kind = val_type_to_val_kind(global->type);
                 global_inst->is_mutable = global->is_mutable;
-#if WASM_ENABLE_MULTI_MODULE == 0
+#if WASM_ENABLE_MULTI_MODULE == 0 && WASM_ENABLE_COMPONENT_MODEL == 0
                 global_inst->global_data =
                     wasm_module_inst->global_data + global->data_offset;
 #else
@@ -2440,6 +2440,22 @@ wasm_table_get_func_inst(struct WASMModuleInstanceCommon *const module_inst,
     if (module_inst->module_type == Wasm_Module_Bytecode) {
         const WASMModuleInstance *wasm_module_inst =
             (const WASMModuleInstance *)module_inst;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        uint32 table_idx;
+
+        for (table_idx = 0; table_idx < wasm_module_inst->table_count;
+             table_idx++) {
+            const WASMTableInstance *internal_table =
+                wasm_module_inst->tables[table_idx];
+
+            if (internal_table && internal_table->elems == table_inst->elems) {
+                if (internal_table->component_func_refs) {
+                    return internal_table->component_func_refs[idx];
+                }
+                break;
+            }
+        }
+#endif
         table_elem_type_t tbl_elem_val =
             ((table_elem_type_t *)table_inst->elems)[idx];
         if (tbl_elem_val == NULL_REF) {

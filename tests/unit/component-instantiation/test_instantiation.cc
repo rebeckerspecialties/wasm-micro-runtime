@@ -174,55 +174,79 @@ class ComponentInstantiationTest : public testing::Test
       }
     }
 
-    virtual void test_instance_type(WASMComponentTypeInstance *type_instance, WASMComponentInstType *instance_type_definition, WASMComponentTypeInstance **types) {
-      WASMComponentInstanceDeclTypeSize instance_decl_size;
-      memset(&instance_decl_size, 0, sizeof(WASMComponentInstanceDeclTypeSize));
-      uint32 size = 0, decl_idx, type_idx = 0, func_idx = 0, export_idx = 0;;
-      WASMComponentInstTypeInstance *instance_type_instance = type_instance->type_specific.instance;
-      WASMComponentInstDecl instance_decl;
-      size += wasm_get_inst_decl_size(instance_type_definition, &instance_decl_size);
-      ASSERT_TRUE(type_instance);
-      ASSERT_EQ(type_instance->type, COMPONENT_VAL_TYPE_INSTANCE);
-      ASSERT_TRUE(type_instance->type_specific.instance->types);
-      ASSERT_TRUE(type_instance->type_specific.instance->funcs);
-      ASSERT_TRUE(type_instance->type_specific.instance->exports);
-      ASSERT_EQ(type_instance->type_specific.instance->types_count, instance_decl_size.types_count);
-      ASSERT_EQ(type_instance->type_specific.instance->func_count, instance_decl_size.func_count);
-      ASSERT_EQ(type_instance->type_specific.instance->exports_count, instance_decl_size.exports_count);
+    virtual void test_instance_type(
+        WASMComponentTypeInstance *type_instance,
+        WASMComponentInstType *instance_type_definition,
+        WASMComponentTypeInstance **types)
+    {
+        WASMComponentInstanceDeclTypeSize instance_decl_size;
+        memset(&instance_decl_size, 0,
+               sizeof(WASMComponentInstanceDeclTypeSize));
+        uint64 size = 0;
+        uint32 decl_idx, type_idx = 0, func_idx = 0, export_idx = 0;
+        WASMComponentInstTypeInstance *instance_type_instance =
+            type_instance->type_specific.instance;
+        WASMComponentInstDecl instance_decl;
+        ASSERT_TRUE(wasm_get_inst_decl_size(instance_type_definition,
+                                            &instance_decl_size, &size));
+        ASSERT_TRUE(type_instance);
+        ASSERT_EQ(type_instance->type, COMPONENT_VAL_TYPE_INSTANCE);
+        ASSERT_TRUE(type_instance->type_specific.instance->types);
+        ASSERT_TRUE(type_instance->type_specific.instance->funcs);
+        ASSERT_TRUE(type_instance->type_specific.instance->exports);
+        ASSERT_EQ(type_instance->type_specific.instance->types_count,
+                  instance_decl_size.types_count);
+        ASSERT_EQ(type_instance->type_specific.instance->func_count,
+                  instance_decl_size.func_count);
+        ASSERT_EQ(type_instance->type_specific.instance->exports_count,
+                  instance_decl_size.exports_count);
 
-      for (decl_idx = 0; decl_idx < instance_type_definition->count; decl_idx++) {
-        instance_decl = instance_type_definition->instance_decls[decl_idx];
-        switch (instance_decl.tag)
-        {
-          case WASM_COMP_COMPONENT_DECL_INSTANCE_TYPE:
-            type_idx++;
-            break;
-          case WASM_COMP_COMPONENT_DECL_INSTANCE_ALIAS:
-            type_idx++;
-            break;
-          case WASM_COMP_COMPONENT_DECL_INSTANCE_EXPORTDECL:
-            switch(instance_decl.decl.export_decl->extern_desc->type) {
-              case WASM_COMP_EXTERN_TYPE:
-                type_idx++;
-                ASSERT_EQ(instance_type_instance->exports[export_idx].export_name, instance_decl.decl.export_decl->export_name);
-                ASSERT_EQ(instance_type_instance->exports[export_idx].type, instance_decl.decl.export_decl->extern_desc->type);
-                export_idx++;
-                break;
-              case WASM_COMP_EXTERN_FUNC:
-                func_idx++;
-                ASSERT_EQ(instance_type_instance->exports[export_idx].export_name, instance_decl.decl.export_decl->export_name);
-                ASSERT_EQ(instance_type_instance->exports[export_idx].type, instance_decl.decl.export_decl->extern_desc->type);
-                export_idx++;
-                break;
-              default:
-                break;
+        for (decl_idx = 0; decl_idx < instance_type_definition->count;
+             decl_idx++) {
+            instance_decl = instance_type_definition->instance_decls[decl_idx];
+            switch (instance_decl.tag) {
+                case WASM_COMP_COMPONENT_DECL_INSTANCE_TYPE:
+                    type_idx++;
+                    break;
+                case WASM_COMP_COMPONENT_DECL_INSTANCE_ALIAS:
+                    type_idx++;
+                    break;
+                case WASM_COMP_COMPONENT_DECL_INSTANCE_EXPORTDECL:
+                    switch (instance_decl.decl.export_decl->extern_desc->type) {
+                        case WASM_COMP_EXTERN_TYPE:
+                            type_idx++;
+                            ASSERT_EQ(
+                                instance_type_instance->exports[export_idx]
+                                    .export_name,
+                                instance_decl.decl.export_decl->export_name);
+                            ASSERT_EQ(
+                                instance_type_instance->exports[export_idx]
+                                    .type,
+                                instance_decl.decl.export_decl->extern_desc
+                                    ->type);
+                            export_idx++;
+                            break;
+                        case WASM_COMP_EXTERN_FUNC:
+                            func_idx++;
+                            ASSERT_EQ(
+                                instance_type_instance->exports[export_idx]
+                                    .export_name,
+                                instance_decl.decl.export_decl->export_name);
+                            ASSERT_EQ(
+                                instance_type_instance->exports[export_idx]
+                                    .type,
+                                instance_decl.decl.export_decl->extern_desc
+                                    ->type);
+                            export_idx++;
+                            break;
+                        default:
+                            break;
+                    }
+                default:
+                    break;
             }
-          default:
-            break;
         }
-      }
     }
-
 };
 
 TEST_F(ComponentInstantiationTest, TestGetIndexCount)

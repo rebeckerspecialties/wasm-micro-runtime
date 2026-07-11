@@ -13,7 +13,6 @@
 #include "../common/wasm_runtime_common.h"
 #include "../common/wasm_memory.h"
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-#include "../common/component-model/wasm_component_export.h"
 #include "../common/component-model/wasm_component.h"
 #include "../common/component-model/wasm_component_runtime.h"
 #endif
@@ -59,6 +58,206 @@ set_error_buf_v(char *error_buf, uint32 error_buf_size, const char *format, ...)
                  "WASM module instantiate failed: %s", buf);
     }
 }
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+static bool
+validate_canon_import_type(const WASMFunctionInstance *source,
+                           const WASMFuncType *target_type)
+{
+    uint16 result_count;
+
+    switch (source->canon_type) {
+        case WASM_COMP_CANON_RESOURCE_DROP:
+            result_count = 0;
+            break;
+        case WASM_COMP_CANON_RESOURCE_NEW:
+        case WASM_COMP_CANON_RESOURCE_REP:
+            result_count = 1;
+            break;
+        default:
+            return false;
+    }
+
+    return target_type->param_count == 1
+           && target_type->result_count == result_count
+           && target_type->types[0] == VALUE_TYPE_I32
+           && (!result_count
+               || target_type->types[target_type->param_count]
+                      == VALUE_TYPE_I32);
+}
+
+static bool
+validate_prelinked_imports(const WASMModule *module,
+                           const WASMCoreImports *imports, char *error_buf,
+                           uint32 error_buf_size)
+{
+    uint32 i;
+
+    if (!imports)
+        return true;
+
+    if (imports->func_count != module->import_function_count
+        || imports->tables_count != module->import_table_count
+        || imports->mem_count != module->import_memory_count
+        || imports->globals_count != module->import_global_count) {
+        set_error_buf(error_buf, error_buf_size,
+                      "component import count mismatch");
+        return false;
+    }
+
+    if ((imports->func_count && !imports->func_instance)
+        || (imports->tables_count && !imports->table_instance)
+        || (imports->mem_count && !imports->mem_instance)
+        || (imports->globals_count && !imports->global_instance)) {
+        set_error_buf(error_buf, error_buf_size,
+                      "component import binding array is null");
+        return false;
+    }
+
+    for (i = 0; i < imports->func_count; i++) {
+        WASMFunctionInstance *source = imports->func_instance[i];
+        WASMFuncType *target_type =
+            module->import_functions[i].u.function.func_type;
+        WASMFuncType *source_type;
+
+        if (!source) {
+            set_error_buf_v(error_buf, error_buf_size,
+                            "component function import %u is null", i);
+            return false;
+        }
+        if (source->is_canon_func) {
+            if (!validate_canon_import_type(source, target_type)) {
+                set_error_buf_v(error_buf, error_buf_size,
+                                "incompatible canonical component function "
+                                "import %u (kind=%u, target params=%u, "
+                                "results=%u)",
+                                i, source->canon_type, target_type->param_count,
+                                target_type->result_count);
+                return false;
+            }
+            continue;
+        }
+
+        /* Synthetic host functions carry their native binding and component
+           metadata, but their template core func type is not authoritative.
+           functions_instantiate deliberately retains the consuming core
+           import's type and copies only this binding metadata.  Validate the
+           native signature against that target type instead. */
+        if (source->is_import_func && source->u.func_import
+            && source->u.func_import->func_ptr_linked
+            && !source->import_func_inst) {
+            if (source->u.func_import->signature
+                && !wasm_native_validate_symbol_signature(
+                    target_type, source->u.func_import->signature)) {
+                set_error_buf_v(error_buf, error_buf_size,
+                                "native signature mismatch for component "
+                                "function import %u",
+                                i);
+                return false;
+            }
+            continue;
+        }
+
+        source_type =
+            source->is_import_func
+                ? (source->u.func_import ? source->u.func_import->func_type
+                                         : NULL)
+                : (source->u.func ? source->u.func->func_type : NULL);
+        if (!source_type
+            || !wasm_type_equal((WASMType *)target_type,
+                                (WASMType *)source_type, module->types,
+                                module->type_count)) {
+            set_error_buf_v(error_buf, error_buf_size,
+                            "component func import %u type mismatch "
+                            "s=%u/%u t=%u/%u imp=%u canon=%u kind=%u",
+                            i, source_type ? source_type->param_count : 0,
+                            source_type ? source_type->result_count : 0,
+                            target_type->param_count, target_type->result_count,
+                            source->is_import_func, source->is_canon_func,
+                            source->canon_type);
+            return false;
+        }
+        if (source->is_import_func && source->u.func_import->signature
+            && !wasm_native_validate_symbol_signature(
+                target_type, source->u.func_import->signature)) {
+            set_error_buf_v(error_buf, error_buf_size,
+                            "native signature mismatch for component "
+                            "function import %u",
+                            i);
+            return false;
+        }
+    }
+
+    for (i = 0; i < imports->tables_count; i++) {
+        WASMTableInstance *source = imports->table_instance[i];
+        WASMTableType *target = &module->import_tables[i].u.table.table_type;
+        bool target_has_max = !!(target->flags & MAX_TABLE_SIZE_FLAG);
+
+        if (!source || !source->module_instance
+            || source->elem_type != target->elem_type
+            || source->cur_size < target->init_size
+            || source->is_table64 != !!(target->flags & TABLE64_FLAG)
+            || (target_has_max
+                && (!source->has_max || source->max_size > target->max_size))) {
+            set_error_buf_v(error_buf, error_buf_size,
+                            "component table import %u mismatch "
+                            "cur=%u/%u max=%u/%u has-max=%u/%u",
+                            i, source ? source->cur_size : 0, target->init_size,
+                            source ? source->max_size : 0, target->max_size,
+                            source ? source->has_max : 0, target_has_max);
+            return false;
+        }
+    }
+
+    for (i = 0; i < imports->mem_count; i++) {
+        WASMMemoryInstance *source = imports->mem_instance[i];
+        WASMMemoryType *target = &module->import_memories[i].u.memory.mem_type;
+        bool target_has_max = !!(target->flags & MAX_PAGE_COUNT_FLAG);
+        uint32 target_page_size = target->num_bytes_per_page
+                                      ? target->num_bytes_per_page
+                                      : DEFAULT_NUM_BYTES_PER_PAGE;
+
+        if (!source || source->num_bytes_per_page != target_page_size
+            || source->cur_page_count < target->init_page_count
+            || source->is_memory64 != !!(target->flags & MEMORY64_FLAG)
+            || source->is_shared_memory
+                   != !!(target->flags & SHARED_MEMORY_FLAG)
+            || (target_has_max
+                && (!source->has_max
+                    || source->max_page_count > target->max_page_count))) {
+            set_error_buf_v(
+                error_buf, error_buf_size,
+                "component memory import %u mismatch "
+                "page=%u/%u cur=%u min=%u max=%u/%u "
+                "has-max=%u/%u mem64=%u/%u shared=%u/%u",
+                i, source ? source->num_bytes_per_page : 0, target_page_size,
+                source ? source->cur_page_count : 0, target->init_page_count,
+                source ? source->max_page_count : 0, target->max_page_count,
+                source ? source->has_max : 0, target_has_max,
+                source ? source->is_memory64 : 0,
+                !!(target->flags & MEMORY64_FLAG),
+                source ? source->is_shared_memory : 0,
+                !!(target->flags & SHARED_MEMORY_FLAG));
+            return false;
+        }
+    }
+
+    for (i = 0; i < imports->globals_count; i++) {
+        WASMGlobalInstance *source = imports->global_instance[i];
+        WASMGlobalType *target = &module->import_globals[i].u.global.type;
+
+        if (!source || source->type != target->val_type
+            || source->is_mutable != target->is_mutable
+            || !source->module_instance) {
+            set_error_buf_v(error_buf, error_buf_size,
+                            "incompatible component global import %u", i);
+            return false;
+        }
+    }
+
+    return true;
+}
+#endif
 
 WASMModule *
 wasm_load(uint8 *buf, uint32 size,
@@ -179,11 +378,6 @@ wasm_resolve_import_func(const WASMModule *module, WASMFunctionImport *function)
         return true;
     }
 
-#if WASM_ENABLE_COMPONENT_MODEL != 0
-    if (is_component_runtime()) {
-        return true;
-    }
-#endif
 #if WASM_ENABLE_MULTI_MODULE != 0
 
     if (!wasm_runtime_is_built_in_module(function->module_name)) {
@@ -252,6 +446,13 @@ memories_deinstantiate(WASMModuleInstance *module_inst,
     if (memories) {
         for (i = 0; i < count; i++) {
             if (memories[i]) {
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                /* Component core imports are borrowed from an earlier core
+                   instance.  Do not inspect, decrement, or free them: their
+                   owner may already have been torn down. */
+                if (i < module_inst->prelinked_import_memory_count)
+                    continue;
+#endif
 #if WASM_ENABLE_MULTI_MODULE != 0
                 WASMModule *module = module_inst->module;
                 if (i < module->import_memory_count
@@ -314,6 +515,11 @@ memory_instantiate(WASMModuleInstance *module_inst, WASMModuleInstance *parent,
     (void)memory_idx;
     (void)flags;
 #endif /* end of WASM_ENABLE_SHARED_MEMORY */
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    memory->has_max = !!(flags & MAX_PAGE_COUNT_FLAG);
+    memory->module_instance = module_inst;
+#endif
 
 #if WASM_ENABLE_MEMORY64 != 0
     if (flags & MEMORY64_FLAG) {
@@ -512,8 +718,11 @@ fail1:
 static WASMMemoryInstance **
 memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
                      WASMModuleInstance *parent, uint32 heap_size,
-                     uint32 max_memory_pages, char *error_buf,
-                     uint32 error_buf_size)
+                     uint32 max_memory_pages,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                     const WASMCoreImports *prelinked_imports,
+#endif
+                     char *error_buf, uint32 error_buf_size)
 {
     WASMImport *import;
     uint32 mem_index = 0, i,
@@ -526,6 +735,7 @@ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
     if (!(memories = runtime_malloc(total_size, error_buf, error_buf_size))) {
         return NULL;
     }
+    memset(memories, 0, (uint32)total_size);
 
     memory = module_inst->global_table_data.memory_instances;
 
@@ -540,6 +750,13 @@ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
             import->u.memory.mem_type.max_page_count);
         uint32 flags = import->u.memory.mem_type.flags;
         uint32 actual_heap_size = heap_size;
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (prelinked_imports) {
+            memories[mem_index++] = prelinked_imports->mem_instance[i];
+            continue;
+        }
+#endif
 
 #if WASM_ENABLE_MULTI_MODULE != 0
         if (import->u.memory.import_module != NULL) {
@@ -598,10 +815,75 @@ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
 /**
  * Destroy table instances.
  */
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+static bool
+component_table_enable_func_refs(WASMTableInstance *table, char *error_buf,
+                                 uint32 error_buf_size)
+{
+    WASMModuleInstance *owner;
+    uint32 capacity, i;
+    uint64 total_size;
+
+    if (table->component_func_refs || table->elem_type != VALUE_TYPE_FUNCREF)
+        return true;
+
+    capacity = table->max_size;
+    if (!capacity)
+        return true;
+
+    total_size = sizeof(WASMFunctionInstance *) * (uint64)capacity;
+    if (!(table->component_func_refs =
+              runtime_malloc(total_size, error_buf, error_buf_size)))
+        return false;
+    memset(table->component_func_refs, 0, (uint32)total_size);
+
+    /* A table starts carrying cross-instance provenance only when another
+       component core instance borrows it.  Seed existing owner-relative
+       elements before the borrower can overwrite individual entries. */
+    owner = table->module_instance;
+    for (i = 0; i < table->cur_size; i++) {
+        uint32 func_idx;
+#if WASM_ENABLE_GC == 0
+        func_idx = (uint32)table->elems[i];
+#else
+        func_idx = table->elems[i] == NULL_REF
+                       ? UINT32_MAX
+                       : wasm_func_obj_get_func_idx_bound(
+                           (WASMFuncObjectRef)table->elems[i]);
+#endif
+        if (func_idx == UINT32_MAX)
+            continue;
+        if (!owner || !owner->e || func_idx >= owner->e->function_count) {
+            wasm_runtime_free(table->component_func_refs);
+            table->component_func_refs = NULL;
+            set_error_buf(error_buf, error_buf_size,
+                          "unknown function in imported table");
+            return false;
+        }
+        table->component_func_refs[i] = &owner->e->functions[func_idx];
+    }
+    return true;
+}
+#endif
+
 static void
 tables_deinstantiate(WASMModuleInstance *module_inst)
 {
     if (module_inst->tables) {
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        uint32 i;
+
+        /* Borrowed table pointers may already dangle during component
+           definition-order teardown.  Skip them before dereferencing. */
+        for (i = module_inst->prelinked_import_table_count;
+             i < module_inst->table_count; i++) {
+            WASMTableInstance *table = module_inst->tables[i];
+            if (table && table->component_func_refs) {
+                wasm_runtime_free(table->component_func_refs);
+                table->component_func_refs = NULL;
+            }
+        }
+#endif
         wasm_runtime_free(module_inst->tables);
     }
 #if WASM_ENABLE_MULTI_MODULE != 0
@@ -616,8 +898,11 @@ tables_deinstantiate(WASMModuleInstance *module_inst)
  */
 static WASMTableInstance **
 tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
-                   WASMTableInstance *first_table, char *error_buf,
-                   uint32 error_buf_size)
+                   WASMTableInstance *first_table,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                   const WASMCoreImports *prelinked_imports,
+#endif
+                   char *error_buf, uint32 error_buf_size)
 {
     WASMImport *import;
     uint32 table_index = 0, i;
@@ -633,6 +918,7 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
     if (!(tables = runtime_malloc(total_size, error_buf, error_buf_size))) {
         return NULL;
     }
+    memset(tables, 0, (uint32)total_size);
 
 #if WASM_ENABLE_MULTI_MODULE != 0
     if (module->import_table_count > 0
@@ -646,6 +932,17 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
     import = module->import_tables;
     for (i = 0; i < module->import_table_count; i++, import++) {
         uint32 max_size_fixed = 0;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (prelinked_imports) {
+            WASMTableInstance *imported_table =
+                prelinked_imports->table_instance[i];
+            if (!component_table_enable_func_refs(imported_table, error_buf,
+                                                  error_buf_size))
+                goto fail;
+            tables[table_index++] = imported_table;
+            continue;
+        }
+#endif
 #if WASM_ENABLE_MULTI_MODULE != 0
         WASMTableInstance *table_inst_linked = NULL;
         WASMModuleInstance *module_inst_linked = NULL;
@@ -690,6 +987,12 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
 #endif
 
         table->is_table64 = import->u.table.table_type.flags & TABLE64_FLAG;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        table->has_max =
+            !!(import->u.table.table_type.flags & MAX_TABLE_SIZE_FLAG);
+        table->module_instance = module_inst;
+        table->component_func_refs = NULL;
+#endif
 
 #if WASM_ENABLE_MULTI_MODULE != 0
         *table_linked = table_inst_linked;
@@ -700,6 +1003,9 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
 #endif
             table->cur_size = table_inst_linked->cur_size;
             table->max_size = table_inst_linked->max_size;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+            table->has_max = table_inst_linked->has_max;
+#endif
         }
         else
 #endif
@@ -712,7 +1018,6 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
             table->cur_size = import->u.table.table_type.init_size;
             table->max_size = max_size_fixed;
         }
-
         table = (WASMTableInstance *)((uint8 *)table + (uint32)total_size);
 #if WASM_ENABLE_MULTI_MODULE != 0
         table_linked++;
@@ -750,6 +1055,12 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
            uninitialized elements */
 #endif
         table->is_table64 = module->tables[i].table_type.flags & TABLE64_FLAG;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        table->has_max =
+            !!(module->tables[i].table_type.flags & MAX_TABLE_SIZE_FLAG);
+        table->module_instance = module_inst;
+        table->component_func_refs = NULL;
+#endif
         table->elem_type = module->tables[i].table_type.elem_type;
 #if WASM_ENABLE_GC != 0
         table->elem_ref_type.elem_ref_type =
@@ -757,18 +1068,29 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
 #endif
         table->cur_size = module->tables[i].table_type.init_size;
         table->max_size = max_size_fixed;
-
         table = (WASMTableInstance *)((uint8 *)table + (uint32)total_size);
     }
 
     bh_assert(table_index == table_count);
     (void)module_inst;
     return tables;
-#if WASM_ENABLE_MULTI_MODULE != 0
 fail:
+#if WASM_ENABLE_MULTI_MODULE != 0
+    if (module_inst->e->table_insts_linked) {
+        wasm_runtime_free(module_inst->e->table_insts_linked);
+        module_inst->e->table_insts_linked = NULL;
+    }
+#endif
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    for (i = module_inst->prelinked_import_table_count; i < table_index; i++) {
+        if (tables[i] && tables[i]->component_func_refs) {
+            wasm_runtime_free(tables[i]->component_func_refs);
+            tables[i]->component_func_refs = NULL;
+        }
+    }
+#endif
     wasm_runtime_free(tables);
     return NULL;
-#endif
 }
 
 /**
@@ -787,6 +1109,9 @@ functions_deinstantiate(WASMFunctionInstance *functions)
  */
 static WASMFunctionInstance *
 functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                      const WASMCoreImports *prelinked_imports,
+#endif
                       char *error_buf, uint32 error_buf_size)
 {
     WASMImport *import;
@@ -794,11 +1119,23 @@ functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
         function_count = module->import_function_count + module->function_count;
     uint64 total_size = sizeof(WASMFunctionInstance) * (uint64)function_count;
     WASMFunctionInstance *functions, *function;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    WASMFunctionImport *instance_imports;
+
+    /* Component bindings are instance-local.  Keep a private import
+       descriptor beside the function array so concurrent component
+       instances never mutate the shared parsed module. */
+    total_size +=
+        sizeof(WASMFunctionImport) * (uint64)module->import_function_count;
+#endif
 
     if (!(functions = runtime_malloc(total_size, error_buf, error_buf_size))) {
         return NULL;
     }
     memset(functions, 0, (uint32)total_size);
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    instance_imports = (WASMFunctionImport *)(functions + function_count);
+#endif
 
     total_size = sizeof(void *) * (uint64)module->import_function_count;
     if (total_size > 0
@@ -826,7 +1163,43 @@ functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
             }
         }
 #endif /* WASM_ENABLE_MULTI_MODULE */
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        instance_imports[i] = import->u.function;
+        function->u.func_import = &instance_imports[i];
+
+        if (prelinked_imports) {
+            WASMFunctionInstance *source = prelinked_imports->func_instance[i];
+
+            if (source->is_import_func) {
+                WASMFunctionImport *source_import = source->u.func_import;
+                function->u.func_import->func_ptr_linked =
+                    source_import->func_ptr_linked;
+                function->u.func_import->signature = source_import->signature;
+                function->u.func_import->attachment = source_import->attachment;
+                function->u.func_import->call_conv_raw =
+                    source_import->call_conv_raw;
+                function->u.func_import->call_conv_wasm_c_api =
+                    source_import->call_conv_wasm_c_api;
+                function->import_module_inst = source->import_module_inst;
+                function->import_func_inst = source->import_func_inst;
+            }
+            else {
+                function->import_module_inst = source->module_instance;
+                function->import_func_inst = source;
+            }
+
+#if WASM_ENABLE_FAST_INTERP != 0
+            function->const_cell_num = source->const_cell_num;
+#endif
+            function->is_canon_func = source->is_canon_func;
+            function->canon_type = source->canon_type;
+            function->resource = source->resource;
+            function->canon_options = source->canon_options;
+            function->component_function = source->component_function;
+        }
+#else
         function->u.func_import = &import->u.function;
+#endif
         function->param_cell_num = import->u.function.func_type->param_cell_num;
         function->ret_cell_num = import->u.function.func_type->ret_cell_num;
         function->param_count =
@@ -839,6 +1212,11 @@ functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
         /* Copy the function pointer to current instance */
         module_inst->import_func_ptrs[i] =
             function->u.func_import->func_ptr_linked;
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        function->module_instance = module_inst;
+        function->func_idx = i;
+#endif
 
         function++;
     }
@@ -862,6 +1240,11 @@ functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
 
 #if WASM_ENABLE_FAST_INTERP != 0
         function->const_cell_num = function->u.func->const_cell_num;
+#endif
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        function->module_instance = module_inst;
+        function->func_idx = module->import_function_count + i;
 #endif
 
         function++;
@@ -1257,6 +1640,9 @@ fail:
  */
 static WASMGlobalInstance *
 globals_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                    const WASMCoreImports *prelinked_imports,
+#endif
                     char *error_buf, uint32 error_buf_size)
 {
     WASMImport *import;
@@ -1268,6 +1654,7 @@ globals_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
     if (!(globals = runtime_malloc(total_size, error_buf, error_buf_size))) {
         return NULL;
     }
+    memset(globals, 0, (uint32)total_size);
 
     /* instantiate globals from import section */
     global = globals;
@@ -1279,32 +1666,56 @@ globals_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
 #if WASM_ENABLE_GC != 0
         global->ref_type = global_import->ref_type;
 #endif
-#if WASM_ENABLE_MULTI_MODULE != 0
-        if (global_import->import_module) {
-            if (!(global->import_module_inst = get_sub_module_inst(
-                      module_inst, global_import->import_module))) {
-                set_error_buf(error_buf, error_buf_size, "unknown global");
-                goto fail;
-            }
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        global->module_instance = module_inst;
+        if (prelinked_imports) {
+            WASMGlobalInstance *source = prelinked_imports->global_instance[i];
+            WASMModuleInstance *source_module = source->module_instance;
+            uint32 value_size = wasm_value_type_size(source->type);
 
-            if (!(global->import_global_inst = wasm_lookup_global(
-                      global->import_module_inst, global_import->field_name))) {
-                set_error_buf(error_buf, error_buf_size, "unknown global");
-                goto fail;
+            /* Flatten import chains so the hot interpreter path only needs
+               one indirection and always reaches the owning global data. */
+            while (source->import_global_inst) {
+                source_module = source->import_module_inst;
+                source = source->import_global_inst;
             }
-
-            /* The linked global instance has been initialized, we
-               just need to copy the value. */
-            global->initial_value =
-                global_import->import_global_linked->init_expr.u.unary.v;
+            global->import_module_inst = source_module;
+            global->import_global_inst = source;
+            bh_memcpy_s(&global->initial_value, sizeof(WASMValue),
+                        source_module->global_data + source->data_offset,
+                        value_size);
         }
         else
 #endif
         {
-            /* native globals share their initial_values in one module */
-            bh_memcpy_s(&(global->initial_value), sizeof(WASMValue),
-                        &(global_import->global_data_linked),
-                        sizeof(WASMValue));
+#if WASM_ENABLE_MULTI_MODULE != 0
+            if (global_import->import_module) {
+                if (!(global->import_module_inst = get_sub_module_inst(
+                          module_inst, global_import->import_module))) {
+                    set_error_buf(error_buf, error_buf_size, "unknown global");
+                    goto fail;
+                }
+
+                if (!(global->import_global_inst =
+                          wasm_lookup_global(global->import_module_inst,
+                                             global_import->field_name))) {
+                    set_error_buf(error_buf, error_buf_size, "unknown global");
+                    goto fail;
+                }
+
+                /* The linked global instance has been initialized, we
+                   just need to copy the value. */
+                global->initial_value =
+                    global_import->import_global_linked->init_expr.u.unary.v;
+            }
+            else
+#endif
+            {
+                /* native globals share their initial_values in one module */
+                bh_memcpy_s(&(global->initial_value), sizeof(WASMValue),
+                            &(global_import->global_data_linked),
+                            sizeof(WASMValue));
+            }
         }
 #if WASM_ENABLE_FAST_JIT != 0
         bh_assert(global_data_offset == global_import->data_offset);
@@ -1322,6 +1733,9 @@ globals_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
 
         global->type = module->globals[i].type.val_type;
         global->is_mutable = module->globals[i].type.is_mutable;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        global->module_instance = module_inst;
+#endif
 #if WASM_ENABLE_FAST_JIT != 0
         bh_assert(global_data_offset == module->globals[i].data_offset);
 #endif
@@ -1590,7 +2004,7 @@ export_tables_deinstantiate(WASMExportTabInstance *tables)
         wasm_runtime_free(tables);
 }
 
-#if WASM_ENABLE_MULTI_MEMORY != 0
+#if WASM_ENABLE_MULTI_MEMORY != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
 static void
 export_memories_deinstantiate(WASMExportMemInstance *memories)
 {
@@ -1625,9 +2039,9 @@ export_memories_instantiate(const WASMModule *module,
     bh_assert((uint32)(export_memory - export_memories) == export_mem_count);
     return export_memories;
 }
-#endif /* end of if WASM_ENABLE_MULTI_MEMORY != 0 */
+#endif /* WASM_ENABLE_MULTI_MEMORY || WASM_ENABLE_COMPONENT_MODEL */
 
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
 static void
 export_globals_deinstantiate(WASMExportGlobInstance *globals)
 {
@@ -1663,7 +2077,7 @@ export_globals_instantiate(const WASMModule *module,
     return export_globals;
 }
 
-#endif /* end of if WASM_ENABLE_MULTI_MODULE != 0 */
+#endif /* WASM_ENABLE_MULTI_MODULE || WASM_ENABLE_COMPONENT_MODEL */
 
 static WASMFunctionInstance *
 lookup_post_instantiate_func(WASMModuleInstance *module_inst,
@@ -1686,7 +2100,9 @@ lookup_post_instantiate_func(WASMModuleInstance *module_inst,
 
 static bool
 execute_post_instantiate_functions(WASMModuleInstance *module_inst,
-                                   bool is_sub_inst, WASMExecEnv *exec_env_main)
+                                   bool is_sub_inst,
+                                   bool is_component_core_inst,
+                                   WASMExecEnv *exec_env_main)
 {
     WASMFunctionInstance *start_func = module_inst->e->start_function;
     WASMFunctionInstance *initialize_func = NULL;
@@ -1708,7 +2124,7 @@ execute_post_instantiate_functions(WASMModuleInstance *module_inst,
      * the environment at most once, and that none of their other exports
      * are accessed before that call.
      */
-    if (!is_sub_inst && module->import_wasi_api) {
+    if (!is_sub_inst && !is_component_core_inst && module->import_wasi_api) {
         initialize_func =
             lookup_post_instantiate_func(module_inst, "_initialize");
     }
@@ -1716,7 +2132,7 @@ execute_post_instantiate_functions(WASMModuleInstance *module_inst,
 
     /* Execute possible "__post_instantiate" function if wasm app is
        compiled by emsdk's early version */
-    if (!is_sub_inst) {
+    if (!is_sub_inst && !is_component_core_inst) {
         post_inst_func =
             lookup_post_instantiate_func(module_inst, "__post_instantiate");
     }
@@ -1724,7 +2140,7 @@ execute_post_instantiate_functions(WASMModuleInstance *module_inst,
 #if WASM_ENABLE_BULK_MEMORY != 0
     /* Only execute the memory init function for main instance since
        the data segments will be dropped once initialized */
-    if (!is_sub_inst
+    if (!is_sub_inst && !is_component_core_inst
 #if WASM_ENABLE_LIBC_WASI != 0
         && !module->import_wasi_api
 #endif
@@ -2471,11 +2887,15 @@ wasm_set_running_mode(WASMModuleInstance *module_inst, RunningMode running_mode)
 /**
  * Instantiate module
  */
-WASMModuleInstance *
-wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
-                 WASMExecEnv *exec_env_main,
-                 const struct InstantiationArgs2 *args, char *error_buf,
-                 uint32 error_buf_size)
+static WASMModuleInstance *
+wasm_instantiate_internal(WASMModule *module, WASMModuleInstance *parent,
+                          WASMExecEnv *exec_env_main,
+                          const struct InstantiationArgs2 *args,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                          WASMComponentInstance *component_inst,
+                          const WASMCoreImports *prelinked_imports,
+#endif
+                          char *error_buf, uint32 error_buf_size)
 {
     WASMModuleInstance *module_inst;
     WASMGlobalInstance *globals = NULL, *global;
@@ -2498,6 +2918,12 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
 
     if (!module)
         return NULL;
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    if (!validate_prelinked_imports(module, prelinked_imports, error_buf,
+                                    error_buf_size))
+        return NULL;
+#endif
 
     /* Check the heap size */
     heap_size = align_uint(heap_size, 8);
@@ -2566,6 +2992,21 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
         (WASMModuleInstanceExtra *)((uint8 *)module_inst + extra_info_offset);
     wasm_runtime_set_custom_data_internal(
         (WASMModuleInstanceCommon *)module_inst, args->custom_data);
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    module_inst->comp_instance = component_inst;
+    module_inst->core_instance_idx =
+        component_inst ? component_inst->core_module_instances_count : 0;
+    module_inst->prelinked_import_memory_count =
+        prelinked_imports ? module->import_memory_count : 0;
+    module_inst->prelinked_import_table_count =
+        prelinked_imports ? module->import_table_count : 0;
+#if WASM_ENABLE_LIBC_WASI != 0
+    if (component_inst) {
+        wasm_runtime_set_wasi_ctx((WASMModuleInstanceCommon *)module_inst,
+                                  component_inst->wasi_ctx);
+    }
+#endif
+#endif
 #if WASM_ENABLE_THREAD_MGR != 0
     if (os_mutex_init(&module_inst->e->common.exception_lock) != 0) {
         wasm_runtime_free(module_inst);
@@ -2650,8 +3091,11 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
     /* Instantiate global firstly to get the mutable data size */
     global_count = module->import_global_count + module->global_count;
     if (global_count
-        && !(globals = globals_instantiate(module, module_inst, error_buf,
-                                           error_buf_size))) {
+        && !(globals = globals_instantiate(module, module_inst,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                                           prelinked_imports,
+#endif
+                                           error_buf, error_buf_size))) {
         goto fail;
     }
     module_inst->e->global_count = global_count;
@@ -2673,7 +3117,7 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
 
     /* export */
     module_inst->export_func_count = get_export_count(module, EXPORT_KIND_FUNC);
-#if WASM_ENABLE_MULTI_MEMORY != 0
+#if WASM_ENABLE_MULTI_MEMORY != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
     module_inst->export_memory_count =
         get_export_count(module, EXPORT_KIND_MEMORY);
 #endif
@@ -2692,18 +3136,28 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
     if ((module_inst->memory_count > 0
          && !(module_inst->memories = memories_instantiate(
                   module, module_inst, parent, heap_size, max_memory_pages,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                  prelinked_imports,
+#endif
                   error_buf, error_buf_size)))
         || (module_inst->table_count > 0
             && !(module_inst->tables =
                      tables_instantiate(module, module_inst, first_table,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                                        prelinked_imports,
+#endif
                                         error_buf, error_buf_size)))
         || (module_inst->export_table_count > 0
             && !(module_inst->export_tables = export_tables_instantiate(
                      module, module_inst, module_inst->export_table_count,
                      error_buf, error_buf_size)))
         || (module_inst->e->function_count > 0
-            && !(module_inst->e->functions = functions_instantiate(
-                     module, module_inst, error_buf, error_buf_size)))
+            && !(module_inst->e->functions =
+                     functions_instantiate(module, module_inst,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                                           prelinked_imports,
+#endif
+                                           error_buf, error_buf_size)))
         || (module_inst->export_func_count > 0
             && !(module_inst->export_functions = export_functions_instantiate(
                      module, module_inst, module_inst->export_func_count,
@@ -2717,13 +3171,13 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
                      module, module_inst, module_inst->e->export_tag_count,
                      error_buf, error_buf_size)))
 #endif
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
         || (module_inst->export_global_count > 0
             && !(module_inst->export_globals = export_globals_instantiate(
                      module, module_inst, module_inst->export_global_count,
                      error_buf, error_buf_size)))
 #endif
-#if WASM_ENABLE_MULTI_MEMORY != 0
+#if WASM_ENABLE_MULTI_MEMORY != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
         || (module_inst->export_memory_count > 0
             && !(module_inst->export_memories = export_memories_instantiate(
                      module, module_inst, module_inst->export_memory_count,
@@ -3009,6 +3463,17 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
                   (void *)table->init_expr.u.unary.v.gc_obj);
         for (j = 0; j < table_inst->cur_size; j++) {
             *(table_data + j) = table->init_expr.u.unary.v.gc_obj;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+            if (table_inst->component_func_refs) {
+                uint32 func_idx = table->init_expr.u.unary.v.ref_index;
+                table_inst->component_func_refs[j] =
+                    table->init_expr.init_expr_type
+                                == INIT_EXPR_TYPE_FUNCREF_CONST
+                            && func_idx != UINT32_MAX
+                        ? &module_inst->e->functions[func_idx]
+                        : NULL;
+            }
+#endif
         }
     }
 #endif /* end of WASM_ENABLE_GC != 0 */
@@ -3020,6 +3485,9 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
         /* has check it in loader */
         WASMTableInstance *table = module_inst->tables[table_seg->table_index];
         table_elem_type_t *table_data;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        WASMFunctionInstance **component_func_refs;
+#endif
         WASMValue offset_value;
         uint32 j;
 #if WASM_ENABLE_REF_TYPES != 0 || WASM_ENABLE_GC != 0
@@ -3064,6 +3532,9 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
 #endif /* end of WASM_ENABLE_REF_TYPES != 0 || WASM_ENABLE_GC != 0 */
 
         table_data = table->elems;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        component_func_refs = table->component_func_refs;
+#endif
 #if WASM_ENABLE_MULTI_MODULE != 0
         if (table_seg->table_index < module->import_table_count
             && module_inst->e->table_insts_linked[table_seg->table_index]) {
@@ -3313,6 +3784,26 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
             }
 
             *(table_data + offset_value.i32 + j) = (table_elem_type_t)ref;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+            if (component_func_refs) {
+                uint32 table_offset = (uint32)offset_value.i32 + j;
+
+                if (flag == INIT_EXPR_TYPE_FUNCREF_CONST
+                    && init_expr->u.unary.v.ref_index != UINT32_MAX) {
+                    uint32 func_idx = init_expr->u.unary.v.ref_index;
+                    if (func_idx >= module_inst->e->function_count) {
+                        set_error_buf(error_buf, error_buf_size,
+                                      "unknown function in table segment");
+                        goto fail;
+                    }
+                    component_func_refs[table_offset] =
+                        &module_inst->e->functions[func_idx];
+                }
+                else {
+                    component_func_refs[table_offset] = NULL;
+                }
+            }
+#endif
         }
     }
 
@@ -3388,13 +3879,19 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
     }
 
     if (module->start_function != (uint32)-1) {
-        /* TODO: fix start function can be import function issue */
-        if (module->start_function >= module->import_function_count)
-            module_inst->e->start_function =
-                &module_inst->e->functions[module->start_function];
+        /* The start index may name an imported function.  Component imports
+           are already bound at this point, so both imported and defined
+           starts are safe to execute. */
+        module_inst->e->start_function =
+            &module_inst->e->functions[module->start_function];
     }
 
     if (!execute_post_instantiate_functions(module_inst, is_sub_inst,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                                            component_inst != NULL,
+#else
+                                            false,
+#endif
                                             exec_env_main)) {
         set_error_buf(error_buf, error_buf_size, module_inst->cur_exception);
         goto fail;
@@ -3412,6 +3909,37 @@ fail:
     wasm_deinstantiate(module_inst, false);
     return NULL;
 }
+
+WASMModuleInstance *
+wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
+                 WASMExecEnv *exec_env_main,
+                 const struct InstantiationArgs2 *args, char *error_buf,
+                 uint32 error_buf_size)
+{
+    return wasm_instantiate_internal(module, parent, exec_env_main, args,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                                     NULL, NULL,
+#endif
+                                     error_buf, error_buf_size);
+}
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+WASMModuleInstance *
+wasm_instantiate_with_imports(WASMModule *module,
+                              WASMComponentInstance *component_inst,
+                              const WASMCoreImports *imports,
+                              const struct InstantiationArgs2 *args,
+                              char *error_buf, uint32 error_buf_size)
+{
+    if (module && module->import_count && !imports) {
+        set_error_buf(error_buf, error_buf_size,
+                      "component core imports were not supplied");
+        return NULL;
+    }
+    return wasm_instantiate_internal(module, NULL, NULL, args, component_inst,
+                                     imports, error_buf, error_buf_size);
+}
+#endif
 
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
 static void
@@ -3523,11 +4051,11 @@ wasm_deinstantiate(WASMModuleInstance *module_inst, bool is_sub_inst)
     export_tags_deinstantiate(module_inst->e->export_tags);
 #endif
 
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
     export_globals_deinstantiate(module_inst->export_globals);
 #endif
 
-#if WASM_ENABLE_MULTI_MEMORY != 0
+#if WASM_ENABLE_MULTI_MEMORY != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
     export_memories_deinstantiate(module_inst->export_memories);
 #endif
 
@@ -4070,6 +4598,22 @@ wasm_enlarge_table(WASMModuleInstance *module_inst, uint32 table_idx,
     new_table_data_start = table_inst->elems + table_inst->cur_size;
     for (i = 0; i < inc_size; ++i) {
         new_table_data_start[i] = init_val;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (table_inst->component_func_refs) {
+            uint32 func_idx;
+#if WASM_ENABLE_GC == 0
+            func_idx = (uint32)init_val;
+#else
+            func_idx = init_val == NULL_REF ? UINT32_MAX
+                                            : wasm_func_obj_get_func_idx_bound(
+                                                (WASMFuncObjectRef)init_val);
+#endif
+            if (!wasm_component_set_table_func_ref(module_inst, table_inst,
+                                                   table_inst->cur_size + i,
+                                                   func_idx))
+                return false;
+        }
+#endif
     }
 
     table_inst->cur_size = total_size;
@@ -4086,6 +4630,10 @@ call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 tbl_elem_idx,
     table_elem_type_t tbl_elem_val = NULL_REF;
     uint32 func_idx = 0;
     WASMFunctionInstance *func_inst = NULL;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    WASMFunctionInstance table_func_proxy;
+    WASMFunctionImport table_func_proxy_import;
+#endif
 
     module_inst = (WASMModuleInstance *)exec_env->module_inst;
     bh_assert(module_inst);
@@ -4101,28 +4649,51 @@ call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 tbl_elem_idx,
         goto got_exception;
     }
 
-    tbl_elem_val = ((table_elem_type_t *)table_inst->elems)[tbl_elem_idx];
-    if (tbl_elem_val == NULL_REF) {
-        wasm_set_exception(module_inst, "uninitialized element");
-        goto got_exception;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    if (table_inst->component_func_refs) {
+        WASMFunctionInstance *source =
+            table_inst->component_func_refs[tbl_elem_idx];
+        if (!source) {
+            wasm_set_exception(module_inst, "uninitialized element");
+            goto got_exception;
+        }
+        if (source->module_instance == module_inst) {
+            func_inst = source;
+        }
+        else if (!wasm_component_build_table_func_proxy(
+                     module_inst, source, &table_func_proxy,
+                     &table_func_proxy_import)) {
+            wasm_set_exception(module_inst, "unknown function");
+            goto got_exception;
+        }
+        else {
+            func_inst = &table_func_proxy;
+        }
     }
-
-#if WASM_ENABLE_GC == 0
-    func_idx = (uint32)tbl_elem_val;
-#else
-    func_idx =
-        wasm_func_obj_get_func_idx_bound((WASMFuncObjectRef)tbl_elem_val);
+    else
 #endif
-
-    /**
-     * we insist to call functions owned by the module itself
-     **/
-    if (func_idx >= module_inst->e->function_count) {
-        wasm_set_exception(module_inst, "unknown function");
-        goto got_exception;
+    {
+        tbl_elem_val = ((table_elem_type_t *)table_inst->elems)[tbl_elem_idx];
+#if WASM_ENABLE_GC == 0
+        func_idx = (uint32)tbl_elem_val;
+        if (func_idx == (uint32)-1) {
+            wasm_set_exception(module_inst, "uninitialized element");
+            goto got_exception;
+        }
+#else
+        if (tbl_elem_val == NULL_REF) {
+            wasm_set_exception(module_inst, "uninitialized element");
+            goto got_exception;
+        }
+        func_idx =
+            wasm_func_obj_get_func_idx_bound((WASMFuncObjectRef)tbl_elem_val);
+#endif
+        if (func_idx >= module_inst->e->function_count) {
+            wasm_set_exception(module_inst, "unknown function");
+            goto got_exception;
+        }
+        func_inst = module_inst->e->functions + func_idx;
     }
-
-    func_inst = module_inst->e->functions + func_idx;
 
     if (check_type_idx) {
         WASMType *cur_type = module_inst->module->types[type_idx];
@@ -4133,7 +4704,9 @@ call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 tbl_elem_idx,
         else
             cur_func_type = (WASMType *)func_inst->u.func->func_type;
 
-        if (cur_type != cur_func_type) {
+        if (!wasm_type_equal(cur_type, cur_func_type,
+                             module_inst->module->types,
+                             module_inst->module->type_count)) {
             wasm_set_exception(module_inst, "indirect call type mismatch");
             goto got_exception;
         }
@@ -4378,7 +4951,29 @@ wasm_interp_copy_callstack(WASMExecEnv *exec_env, WASMCApiFrame *buffer,
     while (cur_frame && (uint8_t *)cur_frame >= bottom
            && (uint8_t *)cur_frame + sizeof(WASMInterpFrame) <= top_boundary
            && count < (skip_n + length)) {
+        uintptr_t functions_begin, functions_end, function_addr;
+        uint64 functions_size;
+
         if (!cur_frame->function) {
+            cur_frame = cur_frame->prev_frame;
+            continue;
+        }
+
+        /* Component cross-core calls may leave a stack-local proxy in a
+         * frame. Pointer subtraction against the root instance's function
+         * array would be undefined and could produce an attacker-controlled
+         * index. This allocation-free API cannot safely chase the proxy, so
+         * omit frames which are not provably owned by the current instance. */
+        functions_begin = (uintptr_t)module_inst->e->functions;
+        functions_size = sizeof(WASMFunctionInstance)
+                         * (uint64)module_inst->e->function_count;
+        function_addr = (uintptr_t)cur_frame->function;
+        if (functions_size > UINTPTR_MAX - functions_begin
+            || (functions_end = functions_begin + (uintptr_t)functions_size)
+                   < functions_begin
+            || function_addr < functions_begin || function_addr >= functions_end
+            || (function_addr - functions_begin) % sizeof(WASMFunctionInstance)
+                   != 0) {
             cur_frame = cur_frame->prev_frame;
             continue;
         }
@@ -4391,8 +4986,8 @@ wasm_interp_copy_callstack(WASMExecEnv *exec_env, WASMCApiFrame *buffer,
         record_frame.module_offset = 0;
         // It's safe to dereference module_inst->e because "e" is asigned only
         // once in wasm_instantiate
-        record_frame.func_index =
-            (uint32)(cur_frame->function - module_inst->e->functions);
+        record_frame.func_index = (uint32)((function_addr - functions_begin)
+                                           / sizeof(WASMFunctionInstance));
         buffer[count - skip_n] = record_frame;
         cur_frame = cur_frame->prev_frame;
         ++count;
@@ -4402,12 +4997,61 @@ wasm_interp_copy_callstack(WASMExecEnv *exec_env, WASMCApiFrame *buffer,
 #endif // WASM_ENABLE_COPY_CALL_STACK
 
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+static bool
+resolve_component_call_stack_function(WASMModuleInstance *fallback_module,
+                                      WASMFunctionInstance **function,
+                                      WASMModuleInstance **function_module,
+                                      uint32 *function_index)
+{
+    WASMFunctionInstance *candidate = *function;
+    uint32 depth = 0;
+
+    while (candidate && depth++ < 1024) {
+        WASMModuleInstance *candidate_module = candidate->module_instance
+                                                   ? candidate->module_instance
+                                                   : fallback_module;
+        uintptr_t functions_begin, functions_end, candidate_addr;
+        uint64 functions_size;
+
+        if (candidate_module && candidate_module->e
+            && candidate_module->e->functions) {
+            functions_begin = (uintptr_t)candidate_module->e->functions;
+            functions_size = sizeof(WASMFunctionInstance)
+                             * (uint64)candidate_module->e->function_count;
+            functions_end = functions_begin + (uintptr_t)functions_size;
+            candidate_addr = (uintptr_t)candidate;
+            if (functions_end >= functions_begin
+                && candidate_addr >= functions_begin
+                && candidate_addr < functions_end
+                && (candidate_addr - functions_begin)
+                           % sizeof(WASMFunctionInstance)
+                       == 0) {
+                *function = candidate;
+                *function_module = candidate_module;
+                *function_index = (uint32)((candidate_addr - functions_begin)
+                                           / sizeof(WASMFunctionInstance));
+                return true;
+            }
+        }
+
+        /* Cross-core table calls use a stack-local import proxy.  Resolve it
+           to the stable function instance before recording a call frame. */
+        if (!candidate->is_import_func || !candidate->import_func_inst) {
+            break;
+        }
+        candidate = candidate->import_func_inst;
+    }
+
+    return false;
+}
+#endif
+
 bool
 wasm_interp_create_call_stack(struct WASMExecEnv *exec_env)
 {
     WASMModuleInstance *module_inst =
         (WASMModuleInstance *)wasm_exec_env_get_module_inst(exec_env);
-    WASMModule *module = module_inst->module;
     WASMInterpFrame *first_frame,
         *cur_frame = wasm_exec_env_get_cur_frame(exec_env);
     uint32 n = 0;
@@ -4433,6 +5077,8 @@ wasm_interp_create_call_stack(struct WASMExecEnv *exec_env)
     while (cur_frame) {
         WASMCApiFrame frame = { 0 };
         WASMFunctionInstance *func_inst = cur_frame->function;
+        WASMModuleInstance *frame_module_inst = module_inst;
+        WASMModule *frame_module;
         const char *func_name = NULL;
         const uint8 *func_code_base = NULL;
         uint32 max_local_cell_num, max_stack_cell_num;
@@ -4443,10 +5089,22 @@ wasm_interp_create_call_stack(struct WASMExecEnv *exec_env)
             continue;
         }
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (!resolve_component_call_stack_function(module_inst, &func_inst,
+                                                   &frame_module_inst,
+                                                   &frame.func_index)) {
+            cur_frame = cur_frame->prev_frame;
+            continue;
+        }
+#else
+        frame.func_index =
+            (uint32)(func_inst - frame_module_inst->e->functions);
+#endif
+        frame_module = frame_module_inst->module;
+
         /* place holder, will overwrite it in wasm_c_api */
-        frame.instance = module_inst;
+        frame.instance = frame_module_inst;
         frame.module_offset = 0;
-        frame.func_index = (uint32)(func_inst - module_inst->e->functions);
 
         func_code_base = wasm_get_func_code(func_inst);
         if (!cur_frame->ip || !func_code_base) {
@@ -4454,31 +5112,35 @@ wasm_interp_create_call_stack(struct WASMExecEnv *exec_env)
         }
         else {
 #if WASM_ENABLE_FAST_INTERP == 0
-            frame.func_offset = (uint32)(cur_frame->ip - module->load_addr);
+            frame.func_offset =
+                (uint32)(cur_frame->ip - frame_module->load_addr);
 #else
             frame.func_offset = (uint32)(cur_frame->ip - func_code_base);
 #endif
         }
 
-        func_name = get_func_name_from_index(module_inst, frame.func_index);
+        func_name =
+            get_func_name_from_index(frame_module_inst, frame.func_index);
         frame.func_name_wp = func_name;
 
-        if (frame.func_index >= module->import_function_count) {
+        if (frame.func_index >= frame_module->import_function_count) {
             uint32 wasm_func_idx =
-                frame.func_index - module->import_function_count;
+                frame.func_index - frame_module->import_function_count;
             max_local_cell_num =
-                module->functions[wasm_func_idx]->param_cell_num
-                + module->functions[wasm_func_idx]->local_cell_num;
+                frame_module->functions[wasm_func_idx]->param_cell_num
+                + frame_module->functions[wasm_func_idx]->local_cell_num;
             max_stack_cell_num =
-                module->functions[wasm_func_idx]->max_stack_cell_num;
+                frame_module->functions[wasm_func_idx]->max_stack_cell_num;
             all_cell_num = max_local_cell_num + max_stack_cell_num;
 #if WASM_ENABLE_FAST_INTERP != 0
-            all_cell_num += module->functions[wasm_func_idx]->const_cell_num;
+            all_cell_num +=
+                frame_module->functions[wasm_func_idx]->const_cell_num;
 #endif
         }
         else {
             WASMFuncType *func_type =
-                module->import_functions[frame.func_index].u.function.func_type;
+                frame_module->import_functions[frame.func_index]
+                    .u.function.func_type;
             max_local_cell_num =
                 func_type->param_cell_num > 2 ? func_type->param_cell_num : 2;
             max_stack_cell_num = 0;

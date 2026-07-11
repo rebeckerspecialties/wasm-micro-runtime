@@ -15,6 +15,7 @@ on:
       - "!core/deps/**"
       - "product-mini/platforms/darwin/**"
       - "tests/apple-app-store-interpreter/**"
+      - "tests/unit/component-execution/wasm-apps/add.wasm"
   push:
     branches:
       - main
@@ -26,6 +27,7 @@ on:
       - "!core/deps/**"
       - "product-mini/platforms/darwin/**"
       - "tests/apple-app-store-interpreter/**"
+      - "tests/unit/component-execution/wasm-apps/add.wasm"
   workflow_dispatch:
 
 concurrency:
@@ -37,7 +39,7 @@ permissions:
 
 jobs:
   build_static_interpreter:
-    name: ${{ matrix.platform }} static interpreter
+    name: ${{ matrix.platform }} static wasm32-wasip2 fast interpreter
     runs-on: macos-15
     strategy:
       fail-fast: false
@@ -68,63 +70,129 @@ jobs:
       - name: checkout
         uses: actions/checkout@v7.0.0
 
+      - name: Install component parser build dependency
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew list bison >/dev/null 2>&1 || brew install bison
+
       - name: Build static interpreter archive
         run: |
           cmake \
+            -C tests/apple-app-store-interpreter/apple_wasip2_fast_interp.cmake \
             -S product-mini/platforms/darwin \
             -B "build/apple-${{ matrix.sdk }}" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS="-Werror" \
+            -DBISON_EXECUTABLE="$(brew --prefix bison)/bin/bison" \
             -DCMAKE_SYSTEM_NAME="${{ matrix.system_name }}" \
             -DCMAKE_OSX_SYSROOT="${{ matrix.sdk }}" \
             -DCMAKE_OSX_ARCHITECTURES="${{ matrix.architecture }}" \
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
-            -DWAMR_BUILD_TARGET=AARCH64 \
-            -DWAMR_BUILD_INTERP=1 \
-            -DWAMR_BUILD_FAST_INTERP=1 \
-            -DWAMR_BUILD_AOT=0 \
-            -DWAMR_BUILD_JIT=0 \
-            -DWAMR_BUILD_FAST_JIT=0 \
-            -DWAMR_BUILD_WAMR_COMPILER=0 \
-            -DWAMR_BUILD_COMPONENT_MODEL=0 \
-            -DWAMR_BUILD_LIBC_WASI=0 \
-            -DWAMR_BUILD_LIBC_BUILTIN=0 \
-            -DWAMR_BUILD_MULTI_MODULE=1 \
-            -DWAMR_BUILD_THREAD_MGR=1 \
-            -DWAMR_BUILD_SHARED_MEMORY=0 \
-            -DWAMR_BUILD_LIB_PTHREAD=0 \
-            -DWAMR_BUILD_LIB_WASI_THREADS=0 \
-            -DWAMR_BUILD_SIMD=1 \
-            -DWAMR_BUILD_RELAXED_SIMD=1 \
-            -DWAMR_BUILD_EXCE_HANDLING=1 \
-            -DWAMR_BUILD_REF_TYPES=1 \
-            -DWAMR_BUILD_CUSTOM_NAME_SECTION=1 \
-            -DWAMR_BUILD_DUMP_CALL_STACK=1 \
-            -DWAMR_DISABLE_HW_BOUND_CHECK=1 \
-            -DWAMR_DISABLE_WAKEUP_BLOCKING_OP=1
+            -DWAMR_BUILD_TARGET=AARCH64
           cmake --build "build/apple-${{ matrix.sdk }}" \
             --target vmlib --config Release --parallel 4
 
       - name: Verify archive shape
         run: |
           library="build/apple-${{ matrix.sdk }}/libiwasm.a"
-          lipo -info "$library" | grep -F \
-            "architecture: ${{ matrix.architecture }}"
-          if ar -t "$library" | grep -Eiq '(^|/)(aot|jit|compilation)'; then
-            echo "Unexpected AOT/JIT/compiler object in $library" >&2
-            ar -t "$library" | grep -Ei '(^|/)(aot|jit|compilation)' >&2
-            exit 1
-          fi
+          tests/apple-app-store-interpreter/verify_archive.sh \
+            "build/apple-${{ matrix.sdk }}" \
+            "$library" \
+            "${{ matrix.architecture }}"
 
       - name: Run hardened-runtime embedding smoke
         if: matrix.platform == 'macOS'
         run: |
-          cc -std=c11 -Wall -Wextra -Werror \
+          common_flags=(
+            -std=c11 -O3 -DNDEBUG -Wall -Wextra -Werror
+            -flto=full -arch "${{ matrix.architecture }}"
+            -I core/iwasm/include
+          )
+          link_flags=(
+            "build/apple-${{ matrix.sdk }}/libiwasm.a"
+            -flto=full "-Wl,-dead_strip" -lpthread -lm
+          )
+          xcrun --sdk macosx clang "${common_flags[@]}" \
             -I core/iwasm/include \
             tests/apple-app-store-interpreter/smoke.c \
-            "build/apple-${{ matrix.sdk }}/libiwasm.a" \
-            -lpthread -lm \
+            "${link_flags[@]}" \
             -o "build/apple-${{ matrix.sdk }}/embed-smoke"
+          xcrun --sdk macosx clang "${common_flags[@]}" \
+            -DWASM_ENABLE_COMPONENT_MODEL=1 \
+            -DWASM_ENABLE_INTERP=1 \
+            -DWASM_ENABLE_FAST_INTERP=1 \
+            -DWASM_ENABLE_THREAD_MGR=1 \
+            -I core/iwasm/common \
+            -I core/iwasm/common/component-model \
+            -I core/iwasm/interpreter \
+            -I core/shared/mem-alloc \
+            -I core/shared/utils \
+            -I core/shared/platform/include \
+            -I core/shared/platform/darwin \
+            tests/apple-app-store-interpreter/component_smoke.c \
+            "${link_flags[@]}" \
+            -o "build/apple-${{ matrix.sdk }}/component-smoke"
+          xcrun --sdk macosx clang "${common_flags[@]}" \
+            -DWASM_ENABLE_COMPONENT_MODEL=1 \
+            -DWASM_ENABLE_INTERP=1 \
+            -DWASM_ENABLE_FAST_INTERP=1 \
+            -DWASM_ENABLE_THREAD_MGR=1 \
+            -I core/iwasm/common \
+            -I core/iwasm/common/component-model \
+            -I core/iwasm/interpreter \
+            -I core/shared/mem-alloc \
+            -I core/shared/utils \
+            -I core/shared/platform/include \
+            -I core/shared/platform/darwin \
+            tests/apple-app-store-interpreter/component_termination_smoke.c \
+            "${link_flags[@]}" \
+            -o "build/apple-${{ matrix.sdk }}/component-termination-smoke"
+          xcrun --sdk macosx clang "${common_flags[@]}" \
+            -DWASM_ENABLE_COMPONENT_MODEL=1 \
+            -DWASM_ENABLE_INTERP=1 \
+            -DWASM_ENABLE_FAST_INTERP=1 \
+            -DWASM_ENABLE_THREAD_MGR=1 \
+            -I core/iwasm/common \
+            -I core/iwasm/common/component-model \
+            -I core/iwasm/interpreter \
+            -I core/shared/mem-alloc \
+            -I core/shared/utils \
+            -I core/shared/platform/include \
+            -I core/shared/platform/darwin \
+            tests/apple-app-store-interpreter/component_host_import_smoke.c \
+            "${link_flags[@]}" \
+            -o "build/apple-${{ matrix.sdk }}/component-host-import-smoke"
+          xcrun --sdk macosx clang "${common_flags[@]}" \
+            -DWASM_ENABLE_COMPONENT_MODEL=1 \
+            -DWASM_ENABLE_INTERP=1 \
+            -DWASM_ENABLE_FAST_INTERP=1 \
+            -DWASM_ENABLE_THREAD_MGR=1 \
+            -I core/iwasm/common \
+            -I core/iwasm/common/component-model \
+            -I core/iwasm/interpreter \
+            -I core/shared/mem-alloc \
+            -I core/shared/utils \
+            -I core/shared/platform/include \
+            -I core/shared/platform/darwin \
+            tests/apple-app-store-interpreter/component_wasip2_command_smoke.c \
+            "${link_flags[@]}" \
+            -o "build/apple-${{ matrix.sdk }}/component-wasip2-command-smoke"
+          tests/apple-app-store-interpreter/verify_link.sh \
+            "build/apple-${{ matrix.sdk }}/component-smoke"
           codesign --force --sign - --options runtime \
             "build/apple-${{ matrix.sdk }}/embed-smoke"
+          codesign --force --sign - --options runtime \
+            "build/apple-${{ matrix.sdk }}/component-smoke"
+          codesign --force --sign - --options runtime \
+            "build/apple-${{ matrix.sdk }}/component-termination-smoke"
+          codesign --force --sign - --options runtime \
+            "build/apple-${{ matrix.sdk }}/component-host-import-smoke"
+          codesign --force --sign - --options runtime \
+            "build/apple-${{ matrix.sdk }}/component-wasip2-command-smoke"
           "build/apple-${{ matrix.sdk }}/embed-smoke"
+          "build/apple-${{ matrix.sdk }}/component-smoke" \
+            tests/unit/component-execution/wasm-apps/add.wasm
+          "build/apple-${{ matrix.sdk }}/component-termination-smoke"
+          "build/apple-${{ matrix.sdk }}/component-host-import-smoke" \
+            tests/apple-app-store-interpreter/static_host_component.wasm
+          "build/apple-${{ matrix.sdk }}/component-wasip2-command-smoke" \
+            tests/apple-app-store-interpreter/wasip2_command.wasm

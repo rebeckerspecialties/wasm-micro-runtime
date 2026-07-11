@@ -29,8 +29,21 @@ typedef struct WASMResourceHandle {
 WASMResourceHandle *
 wasm_create_resource_handle(WASMComponentResourceInstance *rt, uint32_t rep,
                             bool own);
+
+/** Release only the handle wrapper without dropping its representation. */
 void
 wasm_destroy_resource_handle(WASMResourceHandle *handle);
+
+/**
+ * Drop a handle from a component resource table. Owned handles destroy their
+ * underlying representation before the handle wrapper is released. Borrowed
+ * handles only release the wrapper; their task bookkeeping remains the
+ * caller's responsibility.
+ *
+ * The handle wrapper is released even when representation teardown fails.
+ */
+bool
+wasm_drop_resource_handle(WASMResourceHandle *handle);
 
 static inline uint32_t
 wasm_resource_handle_get_rep_i32(const WASMResourceHandle *handle)

@@ -126,8 +126,14 @@ struct WASMModuleInstanceCommon;
 typedef struct WASMModuleInstanceCommon *wasm_module_inst_t;
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
+struct WASMComponent;
+typedef struct WASMComponent WASMComponent;
 struct WASMComponentInstance;
 typedef struct WASMComponentInstance WASMComponentInstance;
+struct WASMComponentPreparedCall;
+typedef struct WASMComponentPreparedCall WASMComponentPreparedCall;
+typedef bool (*wasm_component_host_resource_drop_callback_t)(
+    void *attachment, uint32_t representation);
 #endif
 
 /* Function instance */
@@ -1376,8 +1382,275 @@ WASM_RUNTIME_API_EXTERN const char *
 wasm_runtime_get_exception(wasm_module_inst_t module_inst);
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
+/**
+ * Load and validate a WebAssembly component from a byte buffer.
+ *
+ * The buffer must be writable and remain alive and unchanged until
+ * wasm_component_unload() returns.  A component and all of its instances are
+ * confined to the thread which owns them unless an API explicitly documents
+ * cross-thread use.
+ *
+ * @param buf writable component binary data
+ * @param size size of buf in bytes
+ * @param load_args optional loader settings; is_component is forced to true
+ * @param error_buf optional buffer which receives a load error
+ * @param error_buf_size size of error_buf in bytes
+ *
+ * @return a validated component on success, NULL on failure
+ */
+WASM_RUNTIME_API_EXTERN WASMComponent *
+wasm_component_load(uint8_t *buf, uint32_t size, const LoadArgs *load_args,
+                    char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Unload a component.
+ *
+ * All prepared calls must be destroyed and all component instances must be
+ * deinstantiated before this function is called.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_unload(WASMComponent *component);
+
+/**
+ * Register the owner-drop callback for an imported resource before component
+ * instantiation.
+ *
+ * Names are exact WIT interface/resource names; interface_name includes its
+ * version. The registration belongs to component and remains valid until
+ * wasm_component_unload(). During instantiation it is copied into each
+ * matching imported resource type before any core start/constructor can run.
+ * The callback's context argument is the per-instance custom_data supplied in
+ * InstantiationArgs2.
+ *
+ * Call this on the component's owner thread after load and before creating any
+ * instances.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_register_host_resource_drop_callback(
+    WASMComponent *component, const char *interface_name,
+    const char *resource_name,
+    wasm_component_host_resource_drop_callback_t callback);
+
 WASM_RUNTIME_API_EXTERN const char *
 wasm_component_runtime_get_exception(WASMComponentInstance *comp_inst);
+
+/**
+ * Prepare a synchronous component export for allocation-free flat calls.
+ *
+ * This resolves the export and creates its core execution environment.  The
+ * returned handle uses the canonical ABI's flattened core signature: only
+ * WASM_I32, WASM_I64, WASM_F32, and WASM_F64 values are accepted.  It does
+ * not parse WAVE text or perform WIT lifting/lowering.
+ *
+ * This compatibility entrypoint resolves a leaf function name using WAMR's
+ * legacy first-match lookup.  Generated bindings should use
+ * wasm_component_prepare_export_call_qualified() so duplicate function names
+ * in different interfaces cannot be confused.
+ *
+ * The handle is thread-affine and non-reentrant.  Prepare it on the thread
+ * which will call it, and keep both the component instance and that thread
+ * alive until wasm_component_destroy_prepared_call() returns.
+ *
+ * @param comp_inst the component instance containing the export
+ * @param export_name the exported component function name
+ * @param error_buf optional buffer which receives a preparation error
+ * @param error_buf_size size of error_buf in bytes
+ *
+ * @return a prepared call on success, NULL on failure
+ */
+WASM_RUNTIME_API_EXTERN WASMComponentPreparedCall *
+wasm_component_prepare_export_call(WASMComponentInstance *comp_inst,
+                                   const char *export_name, char *error_buf,
+                                   uint32_t error_buf_size);
+
+/**
+ * Prepare a synchronous component export by its interface and function name.
+ *
+ * interface_name is matched exactly against the component's exported
+ * interface instance name.  For a versioned interface it must contain the
+ * full version suffix, for example "test:project/my-interface@0.1.0".  The
+ * lookup never falls back to an unqualified or first-matching function.
+ *
+ * The returned handle has the same lifetime, thread-affinity, signature, and
+ * allocation behavior as wasm_component_prepare_export_call().
+ *
+ * @param comp_inst the component instance containing the interface export
+ * @param interface_name the complete exported interface instance name
+ * @param export_name the function name within that interface
+ * @param error_buf optional buffer which receives a preparation error
+ * @param error_buf_size size of error_buf in bytes
+ *
+ * @return a prepared call on success, NULL on failure
+ */
+WASM_RUNTIME_API_EXTERN WASMComponentPreparedCall *
+wasm_component_prepare_export_call_qualified(WASMComponentInstance *comp_inst,
+                                             const char *interface_name,
+                                             const char *export_name,
+                                             char *error_buf,
+                                             uint32_t error_buf_size);
+
+/**
+ * Call a prepared component export with canonical flattened values.
+ *
+ * The argument/result counts and kinds must exactly match the prepared core
+ * signature.  After preparation the adapter performs no heap allocation; it
+ * uses scratch storage owned by the prepared handle.  Allocations explicitly
+ * performed by guest code or host imports are outside this guarantee.
+ *
+ * If the export has a canonical post-return function, a successful call
+ * retains guest-backed result storage.  The caller must finish lifting or
+ * copying those results and then call
+ * wasm_component_prepared_call_post_return() before another call or destroy.
+ *
+ * @return true on success, false on failure; component exception is set
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_call_prepared(WASMComponentPreparedCall *prepared_call,
+                             uint32_t num_results, wasm_val_t results[],
+                             uint32_t num_args, const wasm_val_t args[]);
+
+/**
+ * Complete the last prepared call's canonical post-return step.
+ *
+ * This is a no-op when the export has no post-return function.  It performs
+ * no adapter heap allocation.  Call it only from the prepared handle's owning
+ * thread.  Guest post-return code may itself allocate.
+ *
+ * @return true on success, false on failure; component exception is set
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_prepared_call_post_return(
+    WASMComponentPreparedCall *prepared_call);
+
+/**
+ * Destroy a prepared component call.
+ *
+ * This does not implicitly execute a pending post-return.  The caller must
+ * complete post-return before destroying the handle.  Destroy must run on the
+ * handle's owning thread and before its component instance is deinstantiated.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_destroy_prepared_call(WASMComponentPreparedCall *prepared_call);
+
+WASM_RUNTIME_API_EXTERN WASMComponentInstance *
+wasm_component_instantiate_ex2(WASMComponent *component,
+                               const struct InstantiationArgs2 *args,
+                               char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Deinstantiate a component on its owning thread.
+ *
+ * Destroy all prepared calls and join any thread executing this instance
+ * before deinstantiating it.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_deinstantiate(WASMComponentInstance *comp_inst);
+
+/**
+ * Request asynchronous termination of a component instance.
+ *
+ * This is the component API which may be called by a control thread while the
+ * instance's owning thread is executing Wasm.  It recursively terminates the
+ * instance's defined core and nested component instances.  The owner must
+ * return from execution and be joined before prepared calls, the instance, or
+ * its component buffer are destroyed.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_terminate(WASMComponentInstance *comp_inst);
+
+/**
+ * Replace the component instance's custom data on its owning thread.
+ *
+ * The update is propagated to nested/core instances and to host-resource drop
+ * callbacks which inherited their attachment from InstantiationArgs2.
+ * Attachments explicitly installed with
+ * wasm_component_set_host_resource_drop_callback() remain unchanged.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_set_custom_data(WASMComponentInstance *comp_inst,
+                               void *custom_data);
+
+WASM_RUNTIME_API_EXTERN void *
+wasm_component_get_custom_data(WASMComponentInstance *comp_inst);
+
+WASM_RUNTIME_API_EXTERN void *
+wasm_component_get_custom_data_from_exec_env(wasm_exec_env_t exec_env);
+
+/**
+ * Create a canonical own-resource handle from a host representation.
+ *
+ * Call this only from an exact raw native component import callback. The
+ * interface name must include its complete version. The resource is resolved
+ * nominally from the current callback's component signature, so an unrelated
+ * resource with the same leaf name cannot be selected accidentally.
+ *
+ * Generated static bindings should call this once for each host-owned
+ * resource returned through the canonical flat ABI, then write out_handle to
+ * the corresponding result cell. The nonzero representation remains owned by
+ * the component until it is transferred out or its registered owner-drop
+ * callback runs.
+ *
+ * @return true on success; false for invalid context, names, representation,
+ *         ambiguous nominal types, or allocation failure
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_host_resource_new(wasm_exec_env_t exec_env,
+                                 const char *interface_name,
+                                 const char *resource_name,
+                                 uint32_t representation, uint32_t *out_handle);
+
+/**
+ * Resolve a borrowed canonical resource handle to its host representation.
+ *
+ * Call this from an exact raw native component import callback for a borrow
+ * parameter. The function signature and fully versioned names are checked
+ * nominally. This does not transfer or destroy the handle.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_host_resource_rep(wasm_exec_env_t exec_env,
+                                 const char *interface_name,
+                                 const char *resource_name, uint32_t handle,
+                                 uint32_t *out_representation);
+
+/**
+ * Consume an owned canonical resource parameter and return its representation.
+ *
+ * This is the ownership-transferring counterpart to
+ * wasm_component_host_resource_rep(). It fails while the handle has active
+ * borrows and never invokes the registered owner-drop callback.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_host_resource_take(wasm_exec_env_t exec_env,
+                                  const char *interface_name,
+                                  const char *resource_name, uint32_t handle,
+                                  uint32_t *out_representation);
+
+/**
+ * Install the owner-drop callback for an imported component resource type.
+ *
+ * interface_name and resource_name are exact WIT names, including the
+ * interface version. This per-instance API overrides or installs a callback
+ * after instantiation; use
+ * wasm_component_register_host_resource_drop_callback() when core
+ * starts/constructors may create or drop the resource during instantiation.
+ * The callback is invoked on the owner thread for each owned representation,
+ * including during component teardown. A false result traps the drop, but the
+ * handle is still consumed exactly once.
+ *
+ * Resources whose complete interface was resolved through WAMR's built-in
+ * WASI Preview 2 implementation retain their existing resource-table fallback
+ * when no callback is installed. An exact statically registered wasi: import,
+ * like every other imported owned resource, requires a callback; omitting one
+ * is reported as a drop failure instead of deleting an unrelated built-in
+ * table entry with the same representation.
+ *
+ * @return true when at least one exact resource type was configured
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_set_host_resource_drop_callback(
+    WASMComponentInstance *comp_inst, const char *interface_name,
+    const char *resource_name,
+    wasm_component_host_resource_drop_callback_t callback, void *attachment);
 #endif
 
 /**

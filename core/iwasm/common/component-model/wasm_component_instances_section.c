@@ -32,8 +32,9 @@ wasm_component_parse_instances_section(const uint8_t **payload,
         return false;
     }
 
-    const uint8_t *p = *payload;
-    const uint8_t *end = *payload + payload_len;
+    const uint8_t *start = *payload;
+    const uint8_t *p = start;
+    const uint8_t *end = start + payload_len;
 
     uint64_t instance_count = 0;
     if (!read_leb((uint8_t **)&p, end, 32, false, &instance_count, error_buf,
@@ -45,18 +46,14 @@ wasm_component_parse_instances_section(const uint8_t **payload,
     out->count = (uint32_t)instance_count;
 
     if (instance_count > 0) {
-        out->instances =
-            wasm_runtime_malloc(sizeof(WASMComponentInst) * instance_count);
+        out->instances = wasm_component_checked_calloc(
+            (uint32_t)instance_count, sizeof(WASMComponentInst), p, end, 1,
+            "component instance", error_buf, error_buf_size);
         if (!out->instances) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for instances");
             if (consumed_len)
                 *consumed_len = (uint32_t)(p - *payload);
             return false;
         }
-
-        // Initialize all instances to zero to avoid garbage data
-        memset(out->instances, 0, sizeof(WASMComponentInst) * instance_count);
 
         for (uint32_t i = 0; i < instance_count; ++i) {
             // Check bounds before reading tag
@@ -96,20 +93,15 @@ wasm_component_parse_instances_section(const uint8_t **payload,
 
                     if (arg_len > 0) {
                         out->instances[i].expression.with_args.args =
-                            wasm_runtime_malloc(sizeof(WASMComponentInstArg)
-                                                * arg_len);
+                            wasm_component_checked_calloc(
+                                (uint32_t)arg_len, sizeof(WASMComponentInstArg),
+                                p, end, 1, "component instantiate argument",
+                                error_buf, error_buf_size);
                         if (!out->instances[i].expression.with_args.args) {
-                            set_error_buf_ex(error_buf, error_buf_size,
-                                             "Failed to allocate memory for "
-                                             "component instantiate args");
                             if (consumed_len)
                                 *consumed_len = (uint32_t)(p - *payload);
                             return false;
                         }
-
-                        // Initialize args to zero
-                        memset(out->instances[i].expression.with_args.args, 0,
-                               sizeof(WASMComponentInstArg) * arg_len);
 
                         for (uint32_t j = 0; j < arg_len; ++j) {
                             // Parse core:name (LEB128 length + UTF-8 bytes)
@@ -138,8 +130,6 @@ wasm_component_parse_instances_section(const uint8_t **payload,
                                 set_error_buf_ex(error_buf, error_buf_size,
                                                  "Failed to allocate memory "
                                                  "for component arg sort idx");
-                                free_core_name(core_name);
-                                wasm_runtime_free(core_name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
@@ -161,8 +151,6 @@ wasm_component_parse_instances_section(const uint8_t **payload,
                                 set_error_buf_ex(
                                     error_buf, error_buf_size,
                                     "Failed to parse component arg sort idx");
-                                free_core_name(core_name);
-                                wasm_runtime_free(core_name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
@@ -191,25 +179,17 @@ wasm_component_parse_instances_section(const uint8_t **payload,
 
                     if (inline_expr_len > 0) {
                         out->instances[i].expression.without_args.inline_expr =
-                            wasm_runtime_malloc(
-                                sizeof(WASMComponentInlineExport)
-                                * inline_expr_len);
+                            wasm_component_checked_calloc(
+                                (uint32_t)inline_expr_len,
+                                sizeof(WASMComponentInlineExport), p, end, 1,
+                                "component inline export", error_buf,
+                                error_buf_size);
                         if (!out->instances[i]
                                  .expression.without_args.inline_expr) {
-                            set_error_buf_ex(error_buf, error_buf_size,
-                                             "Failed to allocate memory for "
-                                             "component inline exports");
                             if (consumed_len)
                                 *consumed_len = (uint32_t)(p - *payload);
                             return false;
                         }
-
-                        // Initialize inline exports to zero
-                        memset(out->instances[i]
-                                   .expression.without_args.inline_expr,
-                               0,
-                               sizeof(WASMComponentInlineExport)
-                                   * inline_expr_len);
 
                         for (uint32_t j = 0; j < inline_expr_len; j++) {
                             // inlineexport ::= n:<exportname> si:<sortidx>
@@ -251,6 +231,9 @@ wasm_component_parse_instances_section(const uint8_t **payload,
                             }
                             // Zero-initialize sort_idx
                             memset(sort_idx, 0, sizeof(WASMComponentSortIdx));
+                            out->instances[i]
+                                .expression.without_args.inline_expr[j]
+                                .sort_idx = sort_idx;
 
                             bool status =
                                 parse_sort_idx(&p, end, sort_idx, error_buf,
@@ -259,17 +242,10 @@ wasm_component_parse_instances_section(const uint8_t **payload,
                                 set_error_buf_ex(
                                     error_buf, error_buf_size,
                                     "Failed to parse component sort idx");
-                                wasm_runtime_free(sort_idx);
-                                free_core_name(name);
-                                wasm_runtime_free(name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
                             }
-
-                            out->instances[i]
-                                .expression.without_args.inline_expr[j]
-                                .sort_idx = sort_idx;
                         }
                     }
                     else {
@@ -291,7 +267,8 @@ wasm_component_parse_instances_section(const uint8_t **payload,
         }
     }
     if (consumed_len)
-        *consumed_len = payload_len;
+        *consumed_len = (uint32_t)(p - start);
+    *payload = p;
     return true;
 }
 
@@ -410,14 +387,13 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
             bool inst_ok = true;
 
             if (instance_expression.arg_len) {
-                instance_expression.args =
-                    (WASMComponentInstArgInstance *)wasm_runtime_malloc(
-                        instance_expression.arg_len
-                        * sizeof(WASMComponentInstArgInstance));
+                instance_expression.args = (WASMComponentInstArgInstance *)
+                    wasm_component_checked_calloc(
+                        instance_expression.arg_len,
+                        sizeof(WASMComponentInstArgInstance), NULL, NULL, 0,
+                        "resolved component instantiate argument", error_buf,
+                        error_buf_size);
                 if (!instance_expression.args) {
-                    set_error_buf_ex(
-                        error_buf, error_buf_size,
-                        "ERROR: Failed to allocate instance expression args");
                     goto fail_inst;
                 }
             }

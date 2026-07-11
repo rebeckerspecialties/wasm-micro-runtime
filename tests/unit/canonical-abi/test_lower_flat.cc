@@ -252,11 +252,13 @@ TEST_F(ComponentInstantiationLowerFlatTest, TestLowerFlatValuesRecord) {
     cx.borrow_scope.task = nullptr;
 
     ComponentWITRecordField *fields = (ComponentWITRecordField *)wasm_runtime_malloc(2 * sizeof(ComponentWITRecordField));
-    fields[0].value = wit_u8_ctor(10);
-    fields[0].key = strdup("a");
-    fields[1].value = wit_u32_ctor(200);
-    fields[1].key = strdup("b");
-    
+    char key_a[] = "a";
+    char key_b[] = "b";
+    init_record_field(&fields[0], key_a, sizeof(key_a) - 1, wit_u8_ctor(10));
+    init_record_field(&fields[1], key_b, sizeof(key_b) - 1, wit_u32_ctor(200));
+    ASSERT_NE(fields[0].key, nullptr);
+    ASSERT_NE(fields[1].key, nullptr);
+
     wit_value_t rec_val = wit_record_ctor(fields, 2);
     wit_value_t *elems = (wit_value_t *)wasm_runtime_malloc(sizeof(wit_value_t));
     elems[0] = rec_val;
