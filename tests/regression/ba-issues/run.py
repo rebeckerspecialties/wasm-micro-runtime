@@ -20,7 +20,10 @@ TEST_WASM_COMMAND = (
     "./build/build-{runtime}/iwasm {running_options} {running_mode} {file} {argument}"
 )
 
-COMPILE_AOT_COMMAND = "./build/build-wamrc/{compiler} {options} -o {out_file} {in_file}"
+COMPILE_AOT_COMMAND = (
+    "./build/build-wamrc/{compiler} {target_options} {options} "
+    "-o {out_file} {in_file}"
+)
 TEST_AOT_COMMAND = "./build/build-{runtime}/iwasm {running_options} {file} {argument}"
 
 LOG_FILE = "issues_tests.log"
@@ -148,7 +151,11 @@ def run_issue_test_wamrc(issue_id, compile_options):
     out_file_path = os.path.join(issue_path, out_file)
 
     cmd = COMPILE_AOT_COMMAND.format(
-        compiler=compiler, options=options, out_file=out_file_path, in_file=in_file_path
+        compiler=compiler,
+        target_options=os.environ.get("WAMRC_TARGET_OPTIONS", ""),
+        options=options,
+        out_file=out_file_path,
+        in_file=in_file_path,
     )
 
     return run_and_compare_results(issue_id, cmd, description, ret_code, stdout_content)

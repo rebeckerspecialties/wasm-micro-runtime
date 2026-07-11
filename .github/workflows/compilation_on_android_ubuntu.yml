@@ -405,6 +405,10 @@ jobs:
         working-directory: tests/regression/ba-issues
 
       - name: Run regression tests
+        env:
+          # Avoid host-CPU AOT output changing as hosted runners move between
+          # x86 generations; this matches the x86-64 spec-suite baseline.
+          WAMRC_TARGET_OPTIONS: "--target=x86_64 --cpu=skylake"
         run: |
           python run.py
         working-directory: tests/regression/ba-issues
