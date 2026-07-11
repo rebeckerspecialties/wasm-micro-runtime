@@ -63,6 +63,44 @@ TEST_F(BinaryParserTest, TestAllComponentsLoadAndUnload)
     }
 }
 
+TEST_F(BinaryParserTest, TestEmbeddedCoreModulesDoNotAccumulateAcrossLoads)
+{
+    mem_alloc_info_t first_unload = {};
+
+    /* The pool allocator can coalesce pre-existing free blocks during the
+     * first load/unload cycle, so use that cycle as the stable baseline.  A
+     * core module left in the global multi-module registry consumes more pool
+     * space on every later component load. */
+    for (uint32_t i = 0; i < 8; i++) {
+        helper->reset_component();
+        if (helper->component_raw) {
+            BH_FREE(helper->component_raw);
+            helper->component_raw = NULL;
+        }
+
+        ASSERT_TRUE(helper->read_wasm_file("add.wasm"));
+        ASSERT_TRUE(helper->load_component());
+        ASSERT_TRUE(helper->is_loaded());
+
+        helper->reset_component();
+        if (helper->component_raw) {
+            BH_FREE(helper->component_raw);
+            helper->component_raw = NULL;
+        }
+
+        mem_alloc_info_t after_unload = {};
+        ASSERT_TRUE(wasm_runtime_get_mem_alloc_info(&after_unload));
+        if (i == 0) {
+            first_unload = after_unload;
+        }
+        else {
+            EXPECT_GE(after_unload.total_free_size,
+                      first_unload.total_free_size)
+                << "embedded core module retained after iteration " << i;
+        }
+    }
+}
+
 TEST_F(BinaryParserTest, TestLoadCorruptComponent)
 {
     // Corrupt header and expect load failure

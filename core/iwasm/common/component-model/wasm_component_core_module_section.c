@@ -40,6 +40,18 @@ wasm_component_parse_core_module_section(const uint8_t **payload,
         return false;
     }
 
+#if WASM_ENABLE_MULTI_MODULE != 0
+    /* Embedded component modules are owned by the component tree, not by the
+     * process-wide core-module registry. wasm_runtime_load_ex() registers all
+     * core modules for legacy multi-module resolution, so transfer ownership
+     * back immediately and let component teardown unload this module. */
+    if (!wasm_runtime_unregister_module(mod)) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "failed to take ownership of embedded core module");
+        return false;
+    }
+#endif
+
     // Print some basic info about the embedded module
     LOG_DEBUG("      Types: %u function types\n",
               wasm_runtime_get_import_count(mod));
