@@ -54,16 +54,28 @@ TEST_F(WasiP2WrapperTest, VersionCompatibilityUsesRuntimePatchAsUpperBound)
     }
 
     ASSERT_NE(io_poll_module, nullptr);
-    ScopedWasiP2ModuleVersion version(io_poll_module, "0.2.3");
+    ScopedWasiP2ModuleVersion version(io_poll_module, "0.2.6");
 
     EXPECT_TRUE(wasm_check_wasi_p2_version("wasi:io/poll"));
     EXPECT_TRUE(wasm_check_wasi_p2_version("wasi:io/poll@0.2.0"));
     EXPECT_TRUE(wasm_check_wasi_p2_version("wasi:io/poll@0.2.3"));
-    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@0.2.4"));
-    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@0.1.3"));
-    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@1.2.3"));
+    EXPECT_TRUE(wasm_check_wasi_p2_version("wasi:io/poll@0.2.6"));
+    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@0.2.7"));
+    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@0.1.6"));
+    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@1.2.6"));
     EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@0.2"));
     EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@0.2.x"));
+}
+
+TEST_F(WasiP2WrapperTest, BuiltInModulesDeclareImplementedPackageVersion)
+{
+    wasi_p2_module_t *modules = NULL;
+    uint32_t module_count = get_libc_wasi_p2_export_apis(&modules);
+
+    ASSERT_GT(module_count, 0u);
+    for (uint32_t i = 0; i < module_count; i++) {
+        EXPECT_STREQ(modules[i].version, "0.2.6") << modules[i].module_name;
+    }
 }
 
 // Test to verify that all exported WASI P2 symbols can be resolved.
@@ -98,7 +110,7 @@ TEST_F(WasiP2WrapperTest, LookupAllWasiP2Symbols)
 
     // Test that a symbol in a non-existent module is not resolved.
     void *func_ptr = wasm_native_resolve_symbol(
-        "wasi:non-existent/interface@0.2.3", "non-existent", nullptr, nullptr,
+        "wasi:non-existent/interface@0.2.6", "non-existent", nullptr, nullptr,
         nullptr, nullptr);
     EXPECT_EQ(func_ptr, nullptr);
 }
@@ -106,21 +118,23 @@ TEST_F(WasiP2WrapperTest, LookupAllWasiP2Symbols)
 TEST_F(WasiP2WrapperTest, BuiltinResourceRegistryIsExactAndVersioned)
 {
     EXPECT_TRUE(wasm_native_has_builtin_wasi_p2_resource(
-        "wasi:sockets/network@0.2.3", "network"));
+        "wasi:sockets/network@0.2.6", "network"));
     EXPECT_TRUE(wasm_native_has_builtin_wasi_p2_resource(
-        "wasi:filesystem/types@0.2.3", "descriptor"));
+        "wasi:filesystem/types@0.2.6", "descriptor"));
 
     EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
-        "wasi:sockets/network@0.2.3", "unknown"));
+        "wasi:sockets/network@0.2.6", "unknown"));
     EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
-        "wasi:unknown/network@0.2.3", "network"));
+        "wasi:unknown/network@0.2.6", "network"));
     EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
         "wasi:sockets/network", "network"));
+    EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
+        "wasi:sockets/network@0.2.7", "network"));
     EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
         "wasi:sockets/network@0.3.0", "network"));
     EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(nullptr, "network"));
     EXPECT_FALSE(wasm_native_has_builtin_wasi_p2_resource(
-        "wasi:sockets/network@0.2.3", nullptr));
+        "wasi:sockets/network@0.2.6", nullptr));
 }
 
 // Test to ensure that WASI P2 symbols are not resolved in the WASI P1 namespace.
@@ -150,7 +164,7 @@ TEST_F(WasiP2WrapperTest, LookupWasiP2SymbolsInWasiP1NamespaceShouldFail)
 // Test the registration and unregistration of all WASI P2 modules.
 TEST_F(WasiP2WrapperTest, RegisterUnregisterAllModules)
 {
-    const char *module_name = "wasi:clocks/wall-clock@0.2.3";
+    const char *module_name = "wasi:clocks/wall-clock@0.2.6";
     const char *symbol_name = "now";
 
     // Unregister all modules.
@@ -173,9 +187,9 @@ TEST_F(WasiP2WrapperTest, RegisterUnregisterAllModules)
 // Test the registration and unregistration of a single WASI P2 module.
 TEST_F(WasiP2WrapperTest, RegisterUnregisterSingleModule)
 {
-    const char *module_to_test = "wasi:clocks/monotonic-clock@0.2.3";
+    const char *module_to_test = "wasi:clocks/monotonic-clock@0.2.6";
     const char *symbol_to_test = "now";
-    const char *another_module = "wasi:clocks/wall-clock@0.2.3";
+    const char *another_module = "wasi:clocks/wall-clock@0.2.6";
     const char *another_symbol = "now";
 
     // Ensure they are registered first
@@ -206,7 +220,7 @@ TEST_F(WasiP2WrapperTest, RegisterUnregisterSingleModule)
 // Test the registration and unregistration of a single function within a WASI P2 module.
 TEST_F(WasiP2WrapperTest, RegisterUnregisterSingleFunction)
 {
-    const char *module_name = "wasi:random/random@0.2.3";
+    const char *module_name = "wasi:random/random@0.2.6";
     const char *func_to_test = "get-random-bytes";
     const char *another_func = "get-random-u64";
 
