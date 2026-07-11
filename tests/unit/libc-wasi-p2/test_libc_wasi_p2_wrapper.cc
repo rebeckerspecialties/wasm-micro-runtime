@@ -23,6 +23,49 @@ protected:
     std::unique_ptr<WAMRRuntimeRAII<>> runtime_;
 };
 
+class ScopedWasiP2ModuleVersion
+{
+  public:
+    ScopedWasiP2ModuleVersion(wasi_p2_module_t *module, const char *version)
+      : module_(module)
+      , original_version_(module->version)
+    {
+        module_->version = version;
+    }
+
+    ~ScopedWasiP2ModuleVersion() { module_->version = original_version_; }
+
+  private:
+    wasi_p2_module_t *module_;
+    const char *original_version_;
+};
+
+TEST_F(WasiP2WrapperTest, VersionCompatibilityUsesRuntimePatchAsUpperBound)
+{
+    wasi_p2_module_t *modules = NULL;
+    uint32_t module_count = get_libc_wasi_p2_export_apis(&modules);
+    wasi_p2_module_t *io_poll_module = NULL;
+
+    for (uint32_t i = 0; i < module_count; i++) {
+        if (strcmp(modules[i].module_name, "wasi:io/poll") == 0) {
+            io_poll_module = &modules[i];
+            break;
+        }
+    }
+
+    ASSERT_NE(io_poll_module, nullptr);
+    ScopedWasiP2ModuleVersion version(io_poll_module, "0.2.3");
+
+    EXPECT_TRUE(wasm_check_wasi_p2_version("wasi:io/poll"));
+    EXPECT_TRUE(wasm_check_wasi_p2_version("wasi:io/poll@0.2.0"));
+    EXPECT_TRUE(wasm_check_wasi_p2_version("wasi:io/poll@0.2.3"));
+    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@0.2.4"));
+    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@0.1.3"));
+    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@1.2.3"));
+    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@0.2"));
+    EXPECT_FALSE(wasm_check_wasi_p2_version("wasi:io/poll@0.2.x"));
+}
+
 // Test to verify that all exported WASI P2 symbols can be resolved.
 TEST_F(WasiP2WrapperTest, LookupAllWasiP2Symbols)
 {

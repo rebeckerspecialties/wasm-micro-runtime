@@ -510,8 +510,9 @@ wasi_p2_version_is_compatible(const char *required_interface,
         return false;
     }
 
-    // Hard fail: major or minor mismatch = incompatible API
-    if (req_maj != run_maj || req_min != run_min || req_pat < run_pat) {
+    // Hard fail if the runtime does not implement the requested major/minor
+    // line or a sufficiently recent patch release.
+    if (req_maj != run_maj || req_min != run_min || run_pat < req_pat) {
         LOG_ERROR("Incompatible WASI version for %s: "
                   "required %d.%d.%d, runtime implements %d.%d.%d",
                   required_interface, req_maj, req_min, req_pat, run_maj,
