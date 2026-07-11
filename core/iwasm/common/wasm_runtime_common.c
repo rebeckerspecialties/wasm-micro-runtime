@@ -3706,7 +3706,7 @@ wasm_runtime_set_wasi_args_ex(WASMModuleCommon *module, const char *dir_list[],
     wasi_args->stdio[2] = (os_raw_file_handle)stderrfd;
     wasi_args->set_by_user = true;
 
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_LIBC_WASI != 0 && WASM_ENABLE_MULTI_MODULE != 0
 #if WASM_ENABLE_INTERP != 0
     if (module->module_type == Wasm_Module_Bytecode) {
         wasm_propagate_wasi_args((WASMModule *)module);
