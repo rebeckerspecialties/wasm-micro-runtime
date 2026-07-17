@@ -1,0 +1,92 @@
+# Throwaway diagnostic (do not merge): reproduce the ba-issues SIMD-AOT SIGILL
+# on the ubuntu-22.04 runner and capture the exact faulting instruction + CPU
+# feature flags, to decide runner-CPU-mismatch vs wamrc codegen regression.
+name: diag simd aot
+
+on:
+  push:
+    branches:
+      - ci/diag-simd-aot
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build_llvm:
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/build_llvm_libraries.yml
+    with:
+      os: "ubuntu-22.04"
+      arch: "X86"
+
+  diag:
+    needs: [build_llvm]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: runner CPU + microarchitecture
+        run: |
+          echo "=== lscpu ==="; lscpu | grep -iE 'model name|vendor|flags' || lscpu
+          echo "=== SIMD-relevant flags present on this runner ==="
+          grep -oE '\b(sse[0-9_]*|ssse3|avx|avx2|avx512[a-z]*|fma|f16c|xop|bmi[0-9]?)\b' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+
+      - name: restore prebuilt LLVM
+        id: llvm
+        uses: actions/cache@v6
+        with:
+          path: |
+            ./core/deps/llvm/build/bin
+            ./core/deps/llvm/build/include
+            ./core/deps/llvm/build/lib
+            ./core/deps/llvm/build/libexec
+            ./core/deps/llvm/build/share
+          key: ${{ needs.build_llvm.outputs.cache_key }}
+
+      - name: quit if llvm cache miss
+        if: steps.llvm.outputs.cache-hit != 'true'
+        run: echo "::error::no prebuilt llvm" && exit 1
+
+      - name: build wamrc
+        run: |
+          cmake -S wamr-compiler -B wamr-compiler/build
+          cmake --build wamr-compiler/build --parallel
+          ./wamr-compiler/build/wamrc --version
+
+      - name: build iwasm-default (matches ba-issues build_wamr.sh)
+        run: |
+          cmake -S product-mini/platforms/linux -B iwasm-build \
+            -DWAMR_BUILD_REF_TYPES=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_FAST_INTERP=1
+          cmake --build iwasm-build --parallel
+
+      - name: compile the repro (issue-2833) to AOT
+        run: |
+          W=tests/regression/ba-issues/issues/issue-2833/filea12287_4.wasm
+          ./wamr-compiler/build/wamrc -o /tmp/out.aot "$W"
+          ls -l /tmp/out.aot
+          ./wamr-compiler/build/wamrc --format=object -o /tmp/out.o "$W" || echo "(--format=object unsupported)"
+
+      - name: disassemble emitted SIMD instructions
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq binutils gdb
+          if [ -f /tmp/out.o ]; then
+            echo "=== high-SIMD instructions in emitted object ==="
+            objdump -d /tmp/out.o | grep -iE 'zmm|ymm[0-9]|avx|vpdp|vfmadd|vpternlog|vpshufb|vpblend' | head -40 || echo "(none matched)"
+          fi
+
+      - name: run under gdb, catch SIGILL, print faulting instruction
+        run: |
+          set +e
+          gdb -q -batch \
+            -ex 'handle SIGILL stop print' \
+            -ex 'run' \
+            -ex 'printf "\n=== FAULTING INSTRUCTION ===\n"' \
+            -ex 'x/2i $pc' \
+            -ex 'printf "\n=== BACKTRACE ===\n"' \
+            -ex 'bt' \
+            --args ./iwasm-build/iwasm --heap-size=0 -f main /tmp/out.aot
+          echo "gdb done (exit $?)"
