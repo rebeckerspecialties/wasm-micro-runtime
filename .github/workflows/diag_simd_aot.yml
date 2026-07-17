@@ -78,15 +78,23 @@ jobs:
             objdump -d /tmp/out.o | grep -iE 'zmm|ymm[0-9]|avx|vpdp|vfmadd|vpternlog|vpshufb|vpblend' | head -40 || echo "(none matched)"
           fi
 
-      - name: run under gdb, catch SIGILL, print faulting instruction
+      - name: VERIFY the fix — AOT must run without SIGILL
         run: |
           set +e
-          gdb -q -batch \
-            -ex 'handle SIGILL stop print' \
-            -ex 'run' \
-            -ex 'printf "\n=== FAULTING INSTRUCTION ===\n"' \
-            -ex 'x/2i $pc' \
-            -ex 'printf "\n=== BACKTRACE ===\n"' \
-            -ex 'bt' \
-            --args ./iwasm-build/iwasm --heap-size=0 -f main /tmp/out.aot
-          echo "gdb done (exit $?)"
+          echo "=== AVX-512 instructions still in emitted object? (should be none) ==="
+          objdump -d /tmp/out.o 2>/dev/null \
+            | grep -iE 'zmm|vpternlog|vextracti64x4|vmovdqa64|%k[0-7]\b' | head \
+            || echo "  none — no AVX-512 emitted"
+          echo "=== run the AOT directly ==="
+          out=$(./iwasm-build/iwasm --heap-size=0 -f main /tmp/out.aot 2>&1)
+          rc=$?
+          echo "exit code: $rc"
+          echo "stdout: $out"
+          if [ $rc -eq 0 ] && echo "$out" | grep -q ':v128'; then
+            echo "::notice::PASS — AOT ran to completion with v128 output, no SIGILL"
+          else
+            echo "::error::FAIL — AOT rc=$rc (still crashing or wrong output)"
+            gdb -q -batch -ex 'handle SIGILL stop print' -ex run -ex 'x/2i $pc' \
+              --args ./iwasm-build/iwasm --heap-size=0 -f main /tmp/out.aot
+            exit 1
+          fi
