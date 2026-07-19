@@ -5,7 +5,8 @@
 
 /* splice(2) / SPLICE_F_NONBLOCK used below are GNU extensions; request them
    before any system header is pulled in. Defining it in the TU keeps the file
-   building where the compile flags don't set it (e.g. CodeQL's autobuild). */
+   building where the compile flags don't set it (e.g. CodeQL's autobuild).
+   See also the sibling wasi_p2_* TUs that use accept4/pipe2/MSG_NOSIGNAL. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
