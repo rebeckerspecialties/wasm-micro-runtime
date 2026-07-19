@@ -3,6 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  */
 
+/* splice(2) below is a GNU extension; request it before any system header
+   (see wasi_p2_io.c). */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "libc_wasi_p2_wrapper.h"
 #include "wasm_native.h"
 #include "wasi_p2_cli_wrapper.h"
