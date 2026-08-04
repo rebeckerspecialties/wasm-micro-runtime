@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  */
 
+/* accept4/pipe2/SOCK_NONBLOCK/SOCK_CLOEXEC/MSG_NOSIGNAL below are GNU
+   extensions; request them before any system header (see wasi_p2_io.c). */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif

@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  */
 
+/* splice(2) / SPLICE_F_NONBLOCK used below are GNU extensions; request them
+   before any system header is pulled in. Defining it in the TU keeps the file
+   building where the compile flags don't set it (e.g. CodeQL's autobuild). */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
