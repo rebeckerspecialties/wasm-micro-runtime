@@ -12,6 +12,43 @@
 #include <stdlib.h>
 #include <netdb.h>
 
+bool
+lower_owned_host_resource(wasm_exec_env_t exec_env,
+                          WASMComponentResourceHandleInstance *resource_type,
+                          HostResourceTable *table, uint32_t rep,
+                          uint32_t *out_index)
+{
+    wit_value_t value;
+    uint32_t lowered_index = 0;
+    bool lowered;
+
+    if (!exec_env || !exec_env->cx || !resource_type || !table || rep == 0
+        || !out_index) {
+        if (table && rep != 0) {
+            host_resource_table_delete(table, rep);
+        }
+        return false;
+    }
+
+    value = wit_resource_ctor(rep);
+    if (!value) {
+        host_resource_table_delete(table, rep);
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "failed to allocate owned resource value");
+        return false;
+    }
+
+    lowered = lower_own(exec_env->cx, resource_type, value, &lowered_index);
+    free_wit_value(value);
+    if (!lowered) {
+        host_resource_table_delete(table, rep);
+        return false;
+    }
+
+    *out_index = lowered_index;
+    return true;
+}
+
 wasi_network_error_code_t
 errno_to_wasi_network(int err)
 {

@@ -309,11 +309,12 @@ wasi_cli_get_stdin_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
 
     return (int32_t)index_rep;
 }
@@ -360,11 +361,12 @@ wasi_cli_get_stdout_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
 
     return (int32_t)index_rep;
 }
@@ -410,11 +412,12 @@ wasi_cli_get_stderr_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
 
     return (int32_t)index_rep;
 }

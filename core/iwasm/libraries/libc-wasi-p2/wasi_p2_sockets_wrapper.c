@@ -304,12 +304,12 @@ wasi_sockets_instance_network_instance_network_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(out);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &out);
-
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, out, &out)) {
+        return 0;
+    }
     return out;
 }
 
@@ -573,12 +573,12 @@ wasi_sockets_ip_name_lookup_resolve_address_stream_subscribe_wrapper(
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
 
     return index_rep;
 }
@@ -2556,12 +2556,12 @@ wasi_sockets_tcp_tcp_socket_subscribe_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
     return index_rep;
 }
 
@@ -3557,12 +3557,12 @@ wasi_sockets_udp_udp_socket_subscribe_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
     return index_rep;
 }
 
@@ -3718,12 +3718,12 @@ wasi_sockets_udp_incoming_datagram_stream_subscribe_wrapper(
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
     return index_rep;
 }
 
@@ -4057,12 +4057,12 @@ wasi_sockets_udp_outgoing_datagram_stream_subscribe_wrapper(
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
 
     return index_rep;
 }
