@@ -643,4 +643,45 @@ TEST_F(PrelinkedCoreImportsTest, EnforcesTableAndMemoryMaximumSubtyping)
     }
 }
 
+TEST_F(PrelinkedCoreImportsTest,
+       StackTopEqualToDataEndHasNoOverlappingAuxiliaryStack)
+{
+    std::vector<uint8_t> module_bytes =
+        read_fixture("stack_top_equals_data_end.wasm");
+    char error_buf[128] = {};
+    LoadArgs load_args = {};
+    struct InstantiationArgs2 args;
+
+    ASSERT_FALSE(module_bytes.empty());
+    load_args.no_resolve = true;
+    load_args.is_component = false;
+
+    auto *module = reinterpret_cast<WASMModule *>(wasm_runtime_load_ex(
+        module_bytes.data(), static_cast<uint32_t>(module_bytes.size()),
+        &load_args, error_buf, sizeof(error_buf)));
+    ASSERT_NE(module, nullptr) << error_buf;
+    EXPECT_EQ(module->aux_stack_bottom, module->aux_data_end);
+    EXPECT_EQ(module->aux_stack_size, 0u);
+
+    wasm_runtime_instantiation_args_set_defaults(&args);
+    wasm_runtime_instantiation_args_set_default_stack_size(&args, 64 * 1024);
+    wasm_runtime_instantiation_args_set_host_managed_heap_size(&args, 0);
+    WASMModuleInstance *instance = wasm_instantiate(
+        module, nullptr, nullptr, &args, error_buf, sizeof(error_buf));
+    ASSERT_NE(instance, nullptr) << error_buf;
+
+    WASMExecEnv *exec_env = wasm_runtime_get_exec_env_singleton(
+        reinterpret_cast<WASMModuleInstanceCommon *>(instance));
+    ASSERT_NE(exec_env, nullptr);
+    wasm_function_inst_t answer = wasm_runtime_lookup_function(
+        reinterpret_cast<wasm_module_inst_t>(instance), "answer");
+    uint32_t result = 0;
+    ASSERT_NE(answer, nullptr);
+    ASSERT_TRUE(wasm_runtime_call_wasm(exec_env, answer, 0, &result));
+    EXPECT_EQ(result, 42u);
+
+    wasm_deinstantiate(instance, false);
+    wasm_runtime_unload(reinterpret_cast<wasm_module_t>(module));
+}
+
 } // namespace

@@ -6570,7 +6570,9 @@ load_from_sections(WASMModule *module, WASMSection *sections,
                         module->aux_stack_size =
                             aux_stack_top > aux_data_end
                                 ? (uint32)(aux_stack_top - aux_data_end)
-                                : (uint32)aux_stack_top;
+                            : aux_stack_top < aux_data_end
+                                ? (uint32)aux_stack_top
+                                : 0;
                         LOG_VERBOSE(
                             "Found aux stack top global, value: %" PRIu64 ", "
                             "global index: %d, stack size: %d",
