@@ -54,12 +54,12 @@ bh_static_assert(offsetof(AOTModuleInstance, c_api_func_imports)
 bh_static_assert(offsetof(AOTModuleInstance, global_table_data)
                  == 13 * sizeof(uint64) + 128 + 14 * sizeof(uint64)
                         + 3 * sizeof(uint64));
-bh_static_assert(sizeof(AOTMemoryInstance) == 128);
+bh_static_assert(sizeof(AOTMemoryInstance) == 160);
 bh_static_assert(offsetof(AOTTableInstance, elems) == 40);
 #else
 bh_static_assert(offsetof(AOTModuleInstance, global_table_data)
                  == 13 * sizeof(uint64) + 128 + 14 * sizeof(uint64));
-bh_static_assert(sizeof(AOTMemoryInstance) == 120);
+bh_static_assert(sizeof(AOTMemoryInstance) == 152);
 bh_static_assert(offsetof(AOTTableInstance, elems) == 24);
 #endif
 
@@ -979,14 +979,15 @@ static AOTMemoryInstance *
 memory_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
                    AOTModule *module, AOTMemoryInstance *memory_inst,
                    AOTMemory *memory, uint32 memory_idx, uint32 heap_size,
-                   uint32 max_memory_pages, char *error_buf,
+                   const struct InstantiationArgs2 *args, char *error_buf,
                    uint32 error_buf_size)
 {
     void *heap_handle;
     uint32 num_bytes_per_page = memory->num_bytes_per_page;
     uint32 init_page_count = memory->init_page_count;
-    uint32 max_page_count = wasm_runtime_get_max_mem(
-        max_memory_pages, memory->init_page_count, memory->max_page_count);
+    uint32 max_page_count = wasm_runtime_get_max_mem(args->v1.max_memory_pages,
+                                                     memory->init_page_count,
+                                                     memory->max_page_count);
     uint32 default_max_pages;
     uint32 inc_page_count, global_idx;
     uint32 bytes_of_last_page, bytes_to_page_end;
@@ -1009,6 +1010,16 @@ memory_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
         return shared_memory_instance;
     }
 #endif
+
+    if (args->v1.max_memory_pages != 0
+        && init_page_count > args->v1.max_memory_pages) {
+        set_error_buf_v(error_buf, error_buf_size,
+                        "initial memory pages %u exceed configured limit %u",
+                        init_page_count, args->v1.max_memory_pages);
+        return NULL;
+    }
+
+    wasm_memory_set_page_quota(memory_inst, args);
 
 #if WASM_ENABLE_MEMORY64 != 0
     if (is_memory64) {
@@ -1122,11 +1133,30 @@ memory_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
     bh_assert(max_memory_data_size <= GET_MAX_LINEAR_MEMORY_SIZE(is_memory64));
     (void)max_memory_data_size;
 
+    if (args->v1.max_memory_pages != 0
+        && init_page_count > args->v1.max_memory_pages) {
+        set_error_buf_v(error_buf, error_buf_size,
+                        "effective initial memory pages %u exceed configured "
+                        "limit %u",
+                        init_page_count, args->v1.max_memory_pages);
+        return NULL;
+    }
+    if (args->v1.max_memory_pages != 0
+        && max_page_count > args->v1.max_memory_pages)
+        max_page_count = args->v1.max_memory_pages;
+    if (!wasm_memory_reserve_page_quota(memory_inst, init_page_count)) {
+        set_error_buf_v(error_buf, error_buf_size,
+                        "aggregate memory page quota denied %u initial pages",
+                        init_page_count);
+        return NULL;
+    }
+
     /* TODO: memory64 uses is_memory64 flag */
     if (wasm_allocate_linear_memory(&p, is_shared_memory, is_memory64,
                                     num_bytes_per_page, init_page_count,
                                     max_page_count, &memory_data_size)
         != BHT_OK) {
+        wasm_memory_release_page_quota(memory_inst, init_page_count);
         set_error_buf(error_buf, error_buf_size,
                       "allocate linear memory failed");
         return NULL;
@@ -1227,7 +1257,7 @@ aot_get_memory_with_idx(AOTModuleInstance *module_inst, uint32 mem_idx)
 static bool
 memories_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
                      AOTModule *module, uint32 heap_size,
-                     uint32 max_memory_pages, char *error_buf,
+                     const struct InstantiationArgs2 *args, char *error_buf,
                      uint32 error_buf_size)
 {
     uint32 global_index, global_data_offset, length;
@@ -1247,9 +1277,9 @@ memories_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
 
     memories = module_inst->global_table_data.memory_instances;
     for (i = 0; i < memory_count; i++, memories++) {
-        memory_inst = memory_instantiate(
-            module_inst, parent, module, memories, &module->memories[i], i,
-            heap_size, max_memory_pages, error_buf, error_buf_size);
+        memory_inst = memory_instantiate(module_inst, parent, module, memories,
+                                         &module->memories[i], i, heap_size,
+                                         args, error_buf, error_buf_size);
         if (!memory_inst) {
             return false;
         }
@@ -1926,7 +1956,6 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
 #endif
     uint32 stack_size = args->v1.default_stack_size;
     uint32 heap_size = args->v1.host_managed_heap_size;
-    uint32 max_memory_pages = args->v1.max_memory_pages;
 
     /* Align and validate heap size */
     heap_size = align_uint(heap_size, 8);
@@ -2080,8 +2109,8 @@ aot_instantiate(AOTModule *module, AOTModuleInstance *parent,
         goto fail;
 
     /* Initialize memory space */
-    if (!memories_instantiate(module_inst, parent, module, heap_size,
-                              max_memory_pages, error_buf, error_buf_size))
+    if (!memories_instantiate(module_inst, parent, module, heap_size, args,
+                              error_buf, error_buf_size))
         goto fail;
 
     /* Initialize function pointers */
@@ -5560,7 +5589,8 @@ aot_const_str_set_insert(const uint8 *str, int32 len, AOTModule *module,
 #if WASM_ENABLE_DYNAMIC_AOT_DEBUG != 0
 AOTModule *g_dynamic_aot_module = NULL;
 
-void __attribute__((noinline)) __enable_dynamic_aot_debug(void)
+void __attribute__((noinline))
+__enable_dynamic_aot_debug(void)
 {
     /* empty implementation. */
 }

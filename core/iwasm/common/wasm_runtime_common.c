@@ -1850,6 +1850,24 @@ wasm_runtime_instantiation_args_set_max_memory_pages(
 }
 
 void
+wasm_runtime_instantiation_args_set_memory_page_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_memory_page_quota_reserve_callback_t reserve_callback,
+    wasm_memory_page_quota_release_callback_t release_callback)
+{
+    if (reserve_callback == NULL || release_callback == NULL) {
+        p->memory_page_quota_attachment = NULL;
+        p->memory_page_quota_reserve = NULL;
+        p->memory_page_quota_release = NULL;
+        return;
+    }
+
+    p->memory_page_quota_attachment = attachment;
+    p->memory_page_quota_reserve = reserve_callback;
+    p->memory_page_quota_release = release_callback;
+}
+
+void
 wasm_runtime_instantiation_args_set_custom_data(struct InstantiationArgs2 *p,
                                                 void *custom_data)
 {
