@@ -159,12 +159,12 @@ wasi_monotonic_clock_subscribe_instant_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(out);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &out);
-
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, out, &out)) {
+        return 0;
+    }
 
     return (int32_t)out;
 }
@@ -219,12 +219,12 @@ wasi_monotonic_clock_subscribe_duration_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
-    wit_value_t out_val = wit_resource_ctor(out);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &out);
-
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, out, &out)) {
+        return 0;
+    }
 
     return (int32_t)out;
 }

@@ -6,7 +6,16 @@
 #include "gtest/gtest.h"
 #include "wasm_native.h"
 #include "libc_wasi_p2_wrapper.h"
+#include "wasi_p2_common.h"
 #include "test_helper.h"
+
+static uint32_t failed_lower_resource_drop_count;
+
+static void
+count_failed_lower_resource_drop(void *)
+{
+    failed_lower_resource_drop_count++;
+}
 
 class WasiP2WrapperTest : public testing::Test {
 protected:
@@ -76,6 +85,30 @@ TEST_F(WasiP2WrapperTest, BuiltInModulesDeclareImplementedPackageVersion)
     for (uint32_t i = 0; i < module_count; i++) {
         EXPECT_STREQ(modules[i].version, "0.2.6") << modules[i].module_name;
     }
+}
+
+TEST_F(WasiP2WrapperTest, OfflineCommonsFailedOwnedLoweringReclaimsHostResource)
+{
+    ASSERT_TRUE(instantiate_host_resource_table());
+    HostResourceTable *table = get_global_host_resource_table();
+    ASSERT_NE(table, nullptr);
+
+    HostResource *resource = host_resource_create(WASI_P2_POLLABLE, 1);
+    ASSERT_NE(resource, nullptr);
+    failed_lower_resource_drop_count = 0;
+    host_resource_set_dtor(resource, count_failed_lower_resource_drop);
+
+    uint32_t rep = host_resource_table_add(table, resource);
+    ASSERT_NE(rep, 0u);
+    uint32_t lowered_index = UINT32_MAX;
+
+    EXPECT_FALSE(lower_owned_host_resource(nullptr, nullptr, table, rep,
+                                           &lowered_index));
+    EXPECT_EQ(host_resource_table_get(table, rep), nullptr);
+    EXPECT_EQ(failed_lower_resource_drop_count, 1u);
+    EXPECT_EQ(lowered_index, UINT32_MAX);
+
+    destroy_host_resource_table();
 }
 
 // Test to verify that all exported WASI P2 symbols can be resolved.

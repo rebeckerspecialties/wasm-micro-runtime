@@ -217,6 +217,28 @@ TEST_F(HostResourceTableTest, Table_Delete)
     EXPECT_EQ(result, 0); // Not found
 }
 
+TEST_F(HostResourceTableTest, OfflineCommonsDroppedHandlesRemainStale)
+{
+    void *first_data = createTestData(7);
+    HostResource *first = createTestResource(WASI_P2_NETWORK, first_data);
+    ASSERT_NE(first, nullptr);
+
+    const uint32_t stale_id = host_resource_table_add(table_, first);
+    ASSERT_NE(stale_id, 0u);
+    ASSERT_EQ(host_resource_table_delete(table_, stale_id), 1u);
+    ASSERT_EQ(host_resource_table_get(table_, stale_id), nullptr);
+
+    void *replacement_data = createTestData(8);
+    HostResource *replacement =
+        createTestResource(WASI_P2_NETWORK, replacement_data);
+    ASSERT_NE(replacement, nullptr);
+    const uint32_t replacement_id =
+        host_resource_table_add(table_, replacement);
+    ASSERT_NE(replacement_id, 0u);
+    ASSERT_NE(replacement_id, stale_id);
+    ASSERT_EQ(host_resource_table_get(table_, stale_id), nullptr);
+}
+
 // Test get_next_id function
 TEST_F(HostResourceTableTest, Table_GetNextId)
 {

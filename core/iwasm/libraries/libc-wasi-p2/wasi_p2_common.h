@@ -60,6 +60,17 @@ wasm_get_string_encoding(WASMExecEnv *exec_env);
 bool
 close_host_resource_fd(HostResource *hr);
 
+/**
+ * Lower a newly-created global host resource into the current component
+ * instance's owned-resource table. If allocation or lowering fails, the
+ * global resource is removed so a failed canonical-ABI return cannot leak it.
+ */
+bool
+lower_owned_host_resource(wasm_exec_env_t exec_env,
+                          WASMComponentResourceHandleInstance *resource_type,
+                          HostResourceTable *table, uint32_t rep,
+                          uint32_t *out_index);
+
 #ifdef __cplusplus
 }
 #endif
