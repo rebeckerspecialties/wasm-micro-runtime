@@ -549,7 +549,8 @@ memory_instantiate(WASMModuleInstance *module_inst, WASMModuleInstance *parent,
                    WASMMemoryInstance *memory, uint32 memory_idx,
                    uint32 num_bytes_per_page, uint32 init_page_count,
                    uint32 max_page_count, uint32 heap_size, uint32 flags,
-                   char *error_buf, uint32 error_buf_size)
+                   const struct InstantiationArgs2 *args, char *error_buf,
+                   uint32 error_buf_size)
 {
     WASMModule *module = module_inst->module;
     uint32 inc_page_count, global_idx, default_max_page;
@@ -575,6 +576,16 @@ memory_instantiate(WASMModuleInstance *module_inst, WASMModuleInstance *parent,
     (void)memory_idx;
     (void)flags;
 #endif /* end of WASM_ENABLE_SHARED_MEMORY */
+
+    if (args->v1.max_memory_pages != 0
+        && init_page_count > args->v1.max_memory_pages) {
+        set_error_buf_v(error_buf, error_buf_size,
+                        "initial memory pages %u exceed configured limit %u",
+                        init_page_count, args->v1.max_memory_pages);
+        return NULL;
+    }
+
+    wasm_memory_set_page_quota(memory, args);
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
     memory->has_max = !!(flags & MAX_PAGE_COUNT_FLAG);
@@ -710,11 +721,30 @@ memory_instantiate(WASMModuleInstance *module_inst, WASMModuleInstance *parent,
 
     bh_assert(memory != NULL);
 
+    if (args->v1.max_memory_pages != 0
+        && init_page_count > args->v1.max_memory_pages) {
+        set_error_buf_v(error_buf, error_buf_size,
+                        "effective initial memory pages %u exceed configured "
+                        "limit %u",
+                        init_page_count, args->v1.max_memory_pages);
+        return NULL;
+    }
+    if (args->v1.max_memory_pages != 0
+        && max_page_count > args->v1.max_memory_pages)
+        max_page_count = args->v1.max_memory_pages;
+    if (!wasm_memory_reserve_page_quota(memory, init_page_count)) {
+        set_error_buf_v(error_buf, error_buf_size,
+                        "aggregate memory page quota denied %u initial pages",
+                        init_page_count);
+        return NULL;
+    }
+
     if (wasm_allocate_linear_memory(&memory->memory_data, is_shared_memory,
                                     memory->is_memory64, num_bytes_per_page,
                                     init_page_count, max_page_count,
                                     &memory_data_size)
         != BHT_OK) {
+        wasm_memory_release_page_quota(memory, init_page_count);
         set_error_buf(error_buf, error_buf_size,
                       "allocate linear memory failed");
         return NULL;
@@ -778,7 +808,7 @@ fail1:
 static WASMMemoryInstance **
 memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
                      WASMModuleInstance *parent, uint32 heap_size,
-                     uint32 max_memory_pages,
+                     const struct InstantiationArgs2 *args,
 #if WASM_ENABLE_COMPONENT_MODEL != 0
                      const WASMCoreImports *prelinked_imports,
 #endif
@@ -805,9 +835,10 @@ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
         uint32 num_bytes_per_page =
             import->u.memory.mem_type.num_bytes_per_page;
         uint32 init_page_count = import->u.memory.mem_type.init_page_count;
-        uint32 max_page_count = wasm_runtime_get_max_mem(
-            max_memory_pages, import->u.memory.mem_type.init_page_count,
-            import->u.memory.mem_type.max_page_count);
+        uint32 max_page_count =
+            wasm_runtime_get_max_mem(args->v1.max_memory_pages,
+                                     import->u.memory.mem_type.init_page_count,
+                                     import->u.memory.mem_type.max_page_count);
         uint32 flags = import->u.memory.mem_type.flags;
         uint32 actual_heap_size = heap_size;
 
@@ -842,7 +873,8 @@ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
             if (!(memories[mem_index] = memory_instantiate(
                       module_inst, parent, memory, mem_index,
                       num_bytes_per_page, init_page_count, max_page_count,
-                      actual_heap_size, flags, error_buf, error_buf_size))) {
+                      actual_heap_size, flags, args, error_buf,
+                      error_buf_size))) {
                 memories_deinstantiate(module_inst, memories, memory_count);
                 return NULL;
             }
@@ -853,13 +885,13 @@ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
     /* instantiate memories from memory section */
     for (i = 0; i < module->memory_count; i++, memory++) {
         uint32 max_page_count = wasm_runtime_get_max_mem(
-            max_memory_pages, module->memories[i].init_page_count,
+            args->v1.max_memory_pages, module->memories[i].init_page_count,
             module->memories[i].max_page_count);
         if (!(memories[mem_index] = memory_instantiate(
                   module_inst, parent, memory, mem_index,
                   module->memories[i].num_bytes_per_page,
                   module->memories[i].init_page_count, max_page_count,
-                  heap_size, module->memories[i].flags, error_buf,
+                  heap_size, module->memories[i].flags, args, error_buf,
                   error_buf_size))) {
             memories_deinstantiate(module_inst, memories, memory_count);
             return NULL;
@@ -909,7 +941,7 @@ component_table_enable_func_refs(WASMTableInstance *table, char *error_buf,
         func_idx = table->elems[i] == NULL_REF
                        ? UINT32_MAX
                        : wasm_func_obj_get_func_idx_bound(
-                           (WASMFuncObjectRef)table->elems[i]);
+                             (WASMFuncObjectRef)table->elems[i]);
 #endif
         if (func_idx == UINT32_MAX)
             continue;
@@ -2976,7 +3008,6 @@ wasm_instantiate_internal(WASMModule *module, WASMModuleInstance *parent,
     const bool is_sub_inst = parent != NULL;
     uint32 stack_size = args->v1.default_stack_size;
     uint32 heap_size = args->v1.host_managed_heap_size;
-    uint32 max_memory_pages = args->v1.max_memory_pages;
 
     if (!module)
         return NULL;
@@ -3197,7 +3228,7 @@ wasm_instantiate_internal(WASMModule *module, WASMModuleInstance *parent,
     /* Instantiate memories/tables/functions/tags */
     if ((module_inst->memory_count > 0
          && !(module_inst->memories = memories_instantiate(
-                  module, module_inst, parent, heap_size, max_memory_pages,
+                  module, module_inst, parent, heap_size, args,
 #if WASM_ENABLE_COMPONENT_MODEL != 0
                   prelinked_imports,
 #endif
@@ -4668,7 +4699,7 @@ wasm_enlarge_table(WASMModuleInstance *module_inst, uint32 table_idx,
 #else
             func_idx = init_val == NULL_REF ? UINT32_MAX
                                             : wasm_func_obj_get_func_idx_bound(
-                                                (WASMFuncObjectRef)init_val);
+                                                  (WASMFuncObjectRef)init_val);
 #endif
             if (!wasm_component_set_table_func_ref(module_inst, table_inst,
                                                    table_inst->cur_size + i,

@@ -175,6 +175,13 @@ struct WASMMemoryInstance {
     /* TODO: use it to replace the g_shared_memory_lock */
     DefPointer(korp_mutex *, memory_lock);
 
+    /* Optional host-owned aggregate committed-page quota. */
+    DefPointer(void *, page_quota_attachment);
+    DefPointer(wasm_memory_page_quota_reserve_callback_t, page_quota_reserve);
+    DefPointer(wasm_memory_page_quota_release_callback_t, page_quota_release);
+    uint32 page_quota_reserved_pages;
+    uint32 page_quota_padding;
+
 #if WASM_ENABLE_FAST_JIT != 0 || WASM_ENABLE_JIT != 0 \
     || WASM_ENABLE_WAMR_COMPILER != 0 || WASM_ENABLE_AOT != 0
     MemBound mem_bound_check_1byte;
