@@ -123,6 +123,38 @@ TEST_F(WasiP2FilesystemTest, Filesystem_MutationsRejectPathEscape)
     close(dir_fd);
 }
 
+TEST_F(WasiP2FilesystemTest, Filesystem_ContainedDotDotIsNormalized)
+{
+    int dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
+    ASSERT_NE(dir_fd, -1);
+    ASSERT_EQ(mkdirat(dir_fd, "nested", 0755), 0);
+
+    int inside_fd = openat(dir_fd, "inside.txt", O_CREAT | O_WRONLY, 0644);
+    ASSERT_NE(inside_fd, -1);
+    close(inside_fd);
+
+    wasi_descriptor_t opened_fd = -1;
+    int error = 0;
+    wasi_filesystem_open_at(dir_fd, 0, "nested/../inside.txt", 0,
+                            WASI_DESCRIPTOR_FLAGS_READ, 0, &opened_fd, &error);
+    ASSERT_EQ(error, WASI_ERROR_CODE_SUCCESS);
+    ASSERT_NE(opened_fd, -1);
+    close(opened_fd);
+
+    EXPECT_EQ(wasi_filesystem_rename_at(dir_fd, "nested/../inside.txt", dir_fd,
+                                        "nested/../renamed.txt"),
+              WASI_ERROR_CODE_SUCCESS);
+    EXPECT_EQ(wasi_filesystem_unlink_file_at(dir_fd,
+                                             "nested/../renamed.txt"),
+              WASI_ERROR_CODE_SUCCESS);
+
+    struct stat st;
+    EXPECT_NE(fstatat(dir_fd, "inside.txt", &st, 0), 0);
+    EXPECT_NE(fstatat(dir_fd, "renamed.txt", &st, 0), 0);
+
+    close(dir_fd);
+}
+
 TEST_F(WasiP2FilesystemTest, Filesystem_PathOperationsRejectIntermediateSymlink)
 {
     int dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
