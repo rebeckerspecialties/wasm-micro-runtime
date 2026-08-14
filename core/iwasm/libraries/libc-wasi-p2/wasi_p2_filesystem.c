@@ -113,41 +113,18 @@ wasi_validate_beneath_path(const char *path, int initial_depth,
     return WASI_ERROR_CODE_SUCCESS;
 }
 
-static size_t
-wasi_normalize_beneath_path(char *path)
+static int
+wasi_open_beneath_directory(int parent_fd, const char *path)
 {
-    const char *segment = path;
-    size_t output_len = 0;
-
-    while (segment && *segment) {
-        const char *slash = strchr(segment, '/');
-        size_t segment_len =
-            slash ? (size_t)(slash - segment) : strlen(segment);
-
-        if (segment_len == 2 && segment[0] == '.' && segment[1] == '.') {
-            while (output_len > 0 && path[output_len - 1] != '/') {
-                output_len--;
-            }
-            if (output_len > 0) {
-                output_len--;
-            }
-        }
-        else if (!(segment_len == 0
-                   || (segment_len == 1 && segment[0] == '.'))) {
-            if (output_len > 0) {
-                path[output_len++] = '/';
-            }
-            memmove(path + output_len, segment, segment_len);
-            output_len += segment_len;
-        }
-        segment = slash ? slash + 1 : NULL;
-    }
-
-    if (output_len == 0) {
-        path[output_len++] = '.';
-    }
-    path[output_len] = '\0';
-    return output_len;
+#if defined(__APPLE__)
+    return openat(parent_fd, path,
+                  O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY);
+#else
+    struct open_how how = { 0 };
+    how.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+    return syscall(SYS_openat2, parent_fd, path, &how, sizeof(how));
+#endif
 }
 
 static void
@@ -168,8 +145,10 @@ static int
 wasi_beneath_path_ref_init(wasi_descriptor_t root_fd, const char *path,
                            wasi_beneath_path_ref_t *ref)
 {
-    const char *parent_path;
-    size_t path_len, leaf_end, leaf_start;
+    int *directory_fds = NULL;
+    size_t directory_fd_count = 0;
+    size_t path_len;
+    char *cursor;
     int error;
 
     if (!ref) {
@@ -193,46 +172,100 @@ wasi_beneath_path_ref_init(wasi_descriptor_t root_fd, const char *path,
     }
     memcpy(ref->storage, path, path_len + 1);
     ref->trailing_slash = path[path_len - 1] == '/';
-    path_len = wasi_normalize_beneath_path(ref->storage);
 
-    leaf_end = path_len;
-
-    leaf_start = leaf_end;
-    while (leaf_start > 0 && ref->storage[leaf_start - 1] != '/') {
-        leaf_start--;
-    }
-    ref->leaf = ref->storage + leaf_start;
-    if (leaf_start == 0) {
-        parent_path = ".";
-        ref->parent_depth = 0;
-    }
-    else {
-        ref->storage[leaf_start - 1] = '\0';
-        parent_path = ref->storage;
-        error = wasi_validate_beneath_path(parent_path, 0, &ref->parent_depth);
-        if (error != WASI_ERROR_CODE_SUCCESS) {
-            goto fail;
-        }
+    directory_fds =
+        wasm_runtime_malloc((uint32_t)((path_len + 1) * sizeof(int)));
+    if (!directory_fds) {
+        error = ENOMEM;
+        goto fail;
     }
 
-#if defined(__APPLE__)
-    ref->parent_fd =
-        openat(root_fd, parent_path,
-               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY);
-#else
-    struct open_how how = { 0 };
-    how.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
-    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
-    ref->parent_fd =
-        syscall(SYS_openat2, root_fd, parent_path, &how, sizeof(how));
-#endif
-    if (ref->parent_fd < 0) {
+    directory_fds[0] = wasi_open_beneath_directory(root_fd, ".");
+    if (directory_fds[0] < 0) {
         error = wasi_sandbox_error(errno);
         goto fail;
     }
+    directory_fd_count = 1;
+
+    /* Keep each ancestor descriptor until the path is resolved.  A contained
+     * ".." pops this stack instead of asking the kernel to traverse a mutable
+     * parent relationship, so a concurrent rename cannot redirect it above
+     * root_fd.  Real components are opened before they can be canceled by a
+     * later "..", preserving openat2's existence/type/no-symlink semantics. */
+    cursor = ref->storage;
+    while (*cursor) {
+        char *segment, *segment_end, *next_segment;
+        bool is_last;
+
+        while (*cursor == '/') {
+            cursor++;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+
+        segment = cursor;
+        segment_end = segment;
+        while (*segment_end && *segment_end != '/') {
+            segment_end++;
+        }
+        next_segment = segment_end;
+        while (*next_segment == '/') {
+            next_segment++;
+        }
+        is_last = *next_segment == '\0';
+        if (*segment_end) {
+            *segment_end = '\0';
+        }
+
+        if (is_last) {
+            if (strcmp(segment, "..") == 0) {
+                close(directory_fds[--directory_fd_count]);
+                segment[0] = '.';
+                segment[1] = '\0';
+            }
+            ref->leaf = segment;
+            break;
+        }
+
+        if (strcmp(segment, ".") == 0) {
+            cursor = next_segment;
+            continue;
+        }
+        if (strcmp(segment, "..") == 0) {
+            close(directory_fds[--directory_fd_count]);
+            cursor = next_segment;
+            continue;
+        }
+
+        int child_fd = wasi_open_beneath_directory(
+            directory_fds[directory_fd_count - 1], segment);
+        if (child_fd < 0) {
+            error = wasi_sandbox_error(errno);
+            goto fail;
+        }
+        directory_fds[directory_fd_count++] = child_fd;
+        cursor = next_segment;
+    }
+
+    if (!ref->leaf || directory_fd_count == 0) {
+        error = EINVAL;
+        goto fail;
+    }
+
+    ref->parent_fd = directory_fds[--directory_fd_count];
+    ref->parent_depth = (int)directory_fd_count;
+    while (directory_fd_count > 0) {
+        close(directory_fds[--directory_fd_count]);
+    }
+    wasm_runtime_free(directory_fds);
     return WASI_ERROR_CODE_SUCCESS;
 
 fail:
+    while (directory_fd_count > 0) {
+        close(directory_fds[--directory_fd_count]);
+    }
+    wasm_runtime_free(directory_fds);
     wasi_beneath_path_ref_destroy(ref);
     return error;
 }
@@ -1173,9 +1206,8 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
 #endif
 
 #if defined(__APPLE__)
-    /* The held parent was opened without following symlinks, and its path was
-     * normalized before resolution.  O_NOFOLLOW_ANY protects the remaining
-     * final component. */
+    /* The held parent was reached component-by-component without following
+     * symlinks.  O_NOFOLLOW_ANY protects the remaining final component. */
     int r = openat(path_ref.parent_fd, path_ref.leaf,
                    internal_flags | O_NOFOLLOW_ANY,
                    (internal_flags & O_CREAT) ? mode : 0);
