@@ -73,9 +73,17 @@ wasi_validate_beneath_path(const char *path, int initial_depth,
                            int *final_depth)
 {
     int depth = initial_depth;
+    size_t path_len;
 
-    if (!path || path[0] == '\0') {
+    if (!path) {
         return EINVAL;
+    }
+    path_len = strnlen(path, (size_t)PATH_MAX + 1);
+    if (path_len == 0) {
+        return EINVAL;
+    }
+    if (path_len > PATH_MAX) {
+        return ENAMETOOLONG;
     }
     if (path[0] == '/') {
         return EPERM;
@@ -103,6 +111,43 @@ wasi_validate_beneath_path(const char *path, int initial_depth,
         *final_depth = depth;
     }
     return WASI_ERROR_CODE_SUCCESS;
+}
+
+static size_t
+wasi_normalize_beneath_path(char *path)
+{
+    const char *segment = path;
+    size_t output_len = 0;
+
+    while (segment && *segment) {
+        const char *slash = strchr(segment, '/');
+        size_t segment_len =
+            slash ? (size_t)(slash - segment) : strlen(segment);
+
+        if (segment_len == 2 && segment[0] == '.' && segment[1] == '.') {
+            while (output_len > 0 && path[output_len - 1] != '/') {
+                output_len--;
+            }
+            if (output_len > 0) {
+                output_len--;
+            }
+        }
+        else if (!(segment_len == 0
+                   || (segment_len == 1 && segment[0] == '.'))) {
+            if (output_len > 0) {
+                path[output_len++] = '/';
+            }
+            memmove(path + output_len, segment, segment_len);
+            output_len += segment_len;
+        }
+        segment = slash ? slash + 1 : NULL;
+    }
+
+    if (output_len == 0) {
+        path[output_len++] = '.';
+    }
+    path[output_len] = '\0';
+    return output_len;
 }
 
 static void
@@ -139,7 +184,7 @@ wasi_beneath_path_ref_init(wasi_descriptor_t root_fd, const char *path,
     }
 
     path_len = strlen(path);
-    if (path_len > PATH_MAX || path_len >= UINT_MAX) {
+    if (path_len >= UINT_MAX) {
         return ENAMETOOLONG;
     }
     ref->storage = wasm_runtime_malloc(path_len + 1);
@@ -147,17 +192,10 @@ wasi_beneath_path_ref_init(wasi_descriptor_t root_fd, const char *path,
         return ENOMEM;
     }
     memcpy(ref->storage, path, path_len + 1);
+    ref->trailing_slash = path[path_len - 1] == '/';
+    path_len = wasi_normalize_beneath_path(ref->storage);
 
     leaf_end = path_len;
-    while (leaf_end > 0 && ref->storage[leaf_end - 1] == '/') {
-        leaf_end--;
-    }
-    if (leaf_end == 0) {
-        error = EINVAL;
-        goto fail;
-    }
-    ref->trailing_slash = leaf_end != path_len;
-    ref->storage[leaf_end] = '\0';
 
     leaf_start = leaf_end;
     while (leaf_start > 0 && ref->storage[leaf_start - 1] != '/') {
@@ -1059,6 +1097,8 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
                         wasi_descriptor_flags_t flags, mode_t mode,
                         wasi_descriptor_t *ret, int *err)
 {
+    wasi_beneath_path_ref_t path_ref;
+
     if (ret)
         *ret = -1;
 
@@ -1072,7 +1112,7 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
 
     *ret = -1;
 
-    *err = wasi_validate_beneath_path(path, 0, NULL);
+    *err = wasi_beneath_path_ref_init(fd, path, &path_ref);
     if (*err != WASI_ERROR_CODE_SUCCESS) {
         return;
     }
@@ -1102,6 +1142,9 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     if (open_flags & WASI_OPEN_FLAGS_TRUNCATE) {
         internal_flags |= O_TRUNC;
     }
+    if (path_ref.trailing_slash) {
+        internal_flags |= O_DIRECTORY;
+    }
 
     // Translate WASI descriptor-flags (access rights) to POSIX O_ flags.
     int accmode =
@@ -1130,33 +1173,39 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
 #endif
 
 #if defined(__APPLE__)
-    /* O_NOFOLLOW_ANY is Apple's race-free equivalent of openat2's
-     * RESOLVE_NO_SYMLINKS for every component.  The common validator above
-     * supplies RESOLVE_BENEATH's absolute/".." policy. */
-    int r = openat(fd, path, internal_flags | O_NOFOLLOW_ANY,
+    /* The held parent was opened without following symlinks, and its path was
+     * normalized before resolution.  O_NOFOLLOW_ANY protects the remaining
+     * final component. */
+    int r = openat(path_ref.parent_fd, path_ref.leaf,
+                   internal_flags | O_NOFOLLOW_ANY,
                    (internal_flags & O_CREAT) ? mode : 0);
     if (r < 0) {
         /* Preserve ELOOP for the final-link error required by open-at while
          * still normalizing a beneath escape to the WASI capability error. */
         *err = errno == EXDEV ? EPERM : errno;
         *ret = -1;
+        wasi_beneath_path_ref_destroy(&path_ref);
         return;
     }
     *err = 0;
     *ret = r;
+    wasi_beneath_path_ref_destroy(&path_ref);
 #else
     struct open_how how = { 0 };
     how.flags = internal_flags;
     how.mode = (how.flags & (O_CREAT)) ? mode : 0;
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
-    int r = syscall(SYS_openat2, fd, path, &how, sizeof(how));
+    int r = syscall(SYS_openat2, path_ref.parent_fd, path_ref.leaf, &how,
+                    sizeof(how));
     if (r < 0) {
         *err = wasi_sandbox_error(errno);
         *ret = -1;
+        wasi_beneath_path_ref_destroy(&path_ref);
         return;
     }
     *err = 0;
     *ret = r;
+    wasi_beneath_path_ref_destroy(&path_ref);
 #endif
 }
 
