@@ -269,6 +269,14 @@ depending on WAMR's internal resource table:
   code or inspect guest memory. Unregister external notifiers synchronously,
   then release the signal reference before destroying their backing state.
 
+`wasm_component_terminate()` also wakes callback `pollable.block` and mixed
+`poll` waits when no notifier or other event exists. Termination uses a
+per-execution interrupt edge and remains distinct from host readiness: the
+guest observes the ordinary `terminated by user` failure, never a fabricated
+ready index. The interrupt is level-safe across terminate-before-wait and
+check-before-block races. As with other asynchronous termination, join the
+owner thread before deinstantiating the component.
+
 All constructors are valid only during the exact raw component callback whose
 result contains the nominal resource type. A structurally valid callback table
 transfers its attachment even when later construction fails; its drop callback

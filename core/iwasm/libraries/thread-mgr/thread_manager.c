@@ -1100,9 +1100,7 @@ set_thread_cancel_flags(WASMExecEnv *exec_env)
 
     os_mutex_unlock(&exec_env->wait_lock);
 
-#ifdef OS_ENABLE_WAKEUP_BLOCKING_OP
     wasm_runtime_interrupt_blocking_op(exec_env);
-#endif
 }
 
 static void
@@ -1338,8 +1336,10 @@ wasm_cluster_set_exception(WASMExecEnv *exec_env, const char *exception)
 
     os_mutex_lock(&cluster->lock);
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
-    if (has_exception) {
-        /* Save the stack frames of the crashed thread into the cluster */
+    if (has_exception && exec_env->handle == os_self_thread()) {
+        /* Interpreter/AOT frames are owned by the executing thread. Capture
+         * them only for a same-thread exception; asynchronous termination
+         * must not race the target while it mutates its frame stack. */
         WASMModuleInstance *module_inst =
             (WASMModuleInstance *)get_module_inst(exec_env);
 

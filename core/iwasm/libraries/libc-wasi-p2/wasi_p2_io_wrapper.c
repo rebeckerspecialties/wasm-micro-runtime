@@ -241,6 +241,7 @@ wasi_io_poll_pollable_block_wrapper(wasm_exec_env_t exec_env,
         wasm_get_component_func_type(exec_env);
 
     wit_value_t lifted_handle = NULL;
+    wasi_p2_wait_status_t wait_status = WASI_P2_WAIT_FAILED;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         goto end;
@@ -263,7 +264,12 @@ wasi_io_poll_pollable_block_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
 
-    wasi_pollable_block((wasi_pollable_context_t *)hr->data);
+    wait_status = wasi_pollable_block_interruptible(
+        exec_env, (wasi_pollable_context_t *)hr->data);
+    if (wait_status == WASI_P2_WAIT_FAILED) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "Could not wait on pollable resource");
+    }
 
 end:
     free_wit_value(lifted_handle);
@@ -296,6 +302,7 @@ wasi_io_poll_poll_wrapper(wasm_exec_env_t exec_env, uint32_t pollables,
     uint32_t constructed = 0;
     const wasi_pollable_context_t **my_pollables = NULL;
     wasi_list_u32_t wasi_ret = { 0 };
+    wasi_p2_wait_status_t wait_status = WASI_P2_WAIT_FAILED;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = wit_list_ctor(NULL, 0);
@@ -344,7 +351,16 @@ wasi_io_poll_poll_wrapper(wasm_exec_env_t exec_env, uint32_t pollables,
         my_pollables[idx] = (wasi_pollable_context_t *)hr->data;
     }
 
-    wasi_poll(my_pollables, pollables_len, &wasi_ret);
+    wait_status = wasi_poll_interruptible(exec_env, my_pollables, pollables_len,
+                                          &wasi_ret);
+    if (wait_status == WASI_P2_WAIT_INTERRUPTED) {
+        goto end;
+    }
+    if (wait_status == WASI_P2_WAIT_FAILED) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "Could not wait on pollable list");
+        goto end;
+    }
 
     if (!array_allocation_fits(wasi_ret.len, sizeof(wit_value_t))) {
         wasm_runtime_set_exception(exec_env->module_inst,

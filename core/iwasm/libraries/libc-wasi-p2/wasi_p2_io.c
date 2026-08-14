@@ -61,6 +61,159 @@ static FlushingStreamNode *flushing_streams_list = NULL;
  */
 static pthread_mutex_t flushing_streams_list_lock = PTHREAD_MUTEX_INITIALIZER;
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+struct WasiP2WaitInterrupt {
+    int read_fd;
+    int write_fd;
+    bool interrupted;
+};
+
+static bool
+wait_interrupt_set_nonblocking_cloexec(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    int fd_flags = 0;
+
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return false;
+    }
+    fd_flags = fcntl(fd, F_GETFD, 0);
+    return fd_flags >= 0 && fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) == 0;
+}
+
+static WasiP2WaitInterrupt *
+wait_interrupt_get(wasm_exec_env_t exec_env)
+{
+    WasiP2WaitInterrupt *interrupt = NULL;
+    int fds[2] = { -1, -1 };
+
+    if (!exec_env) {
+        return NULL;
+    }
+
+    os_mutex_lock(&exec_env->wait_lock);
+    interrupt = exec_env->wasi_p2_wait_interrupt;
+    if (interrupt) {
+        os_mutex_unlock(&exec_env->wait_lock);
+        return interrupt;
+    }
+
+    interrupt = wasm_runtime_malloc(sizeof(*interrupt));
+    if (!interrupt) {
+        os_mutex_unlock(&exec_env->wait_lock);
+        return NULL;
+    }
+    memset(interrupt, 0, sizeof(*interrupt));
+    interrupt->read_fd = -1;
+    interrupt->write_fd = -1;
+    if (pipe(fds) != 0 || !wait_interrupt_set_nonblocking_cloexec(fds[0])
+        || !wait_interrupt_set_nonblocking_cloexec(fds[1])) {
+        if (fds[0] >= 0) {
+            close(fds[0]);
+        }
+        if (fds[1] >= 0) {
+            close(fds[1]);
+        }
+        wasm_runtime_free(interrupt);
+        os_mutex_unlock(&exec_env->wait_lock);
+        return NULL;
+    }
+
+    interrupt->read_fd = fds[0];
+    interrupt->write_fd = fds[1];
+    interrupt->interrupted = (WASM_SUSPEND_FLAGS_GET(exec_env->suspend_flags)
+                              & WASM_SUSPEND_FLAG_TERMINATE)
+                             != 0;
+    exec_env->wasi_p2_wait_interrupt = interrupt;
+    os_mutex_unlock(&exec_env->wait_lock);
+    return interrupt;
+}
+
+static bool
+wait_interrupt_is_requested(wasm_exec_env_t exec_env,
+                            const WasiP2WaitInterrupt *interrupt)
+{
+    bool requested = false;
+
+    os_mutex_lock(&exec_env->wait_lock);
+    requested = exec_env->wasi_p2_wait_interrupt == interrupt
+                && (interrupt->interrupted
+                    || (WASM_SUSPEND_FLAGS_GET(exec_env->suspend_flags)
+                        & WASM_SUSPEND_FLAG_TERMINATE)
+                           != 0);
+    os_mutex_unlock(&exec_env->wait_lock);
+    return requested;
+}
+
+static bool
+wait_interrupt_exec_env_terminated(wasm_exec_env_t exec_env)
+{
+    return (WASM_SUSPEND_FLAGS_GET(exec_env->suspend_flags)
+            & WASM_SUSPEND_FLAG_TERMINATE)
+           != 0;
+}
+
+void
+wasi_p2_interrupt_wait_request(wasm_exec_env_t exec_env)
+{
+    WasiP2WaitInterrupt *interrupt = NULL;
+    uint8_t byte = 1;
+    ssize_t written = -1;
+
+    if (!exec_env) {
+        return;
+    }
+
+    os_mutex_lock(&exec_env->wait_lock);
+    interrupt = exec_env->wasi_p2_wait_interrupt;
+    if (interrupt && !interrupt->interrupted) {
+        interrupt->interrupted = true;
+        do {
+            written = write(interrupt->write_fd, &byte, sizeof(byte));
+        } while (written < 0 && errno == EINTR);
+        (void)written;
+    }
+    os_mutex_unlock(&exec_env->wait_lock);
+}
+
+void
+wasi_p2_interrupt_wait_destroy(wasm_exec_env_t exec_env)
+{
+    WasiP2WaitInterrupt *interrupt = NULL;
+
+    if (!exec_env) {
+        return;
+    }
+
+    os_mutex_lock(&exec_env->wait_lock);
+    interrupt = exec_env->wasi_p2_wait_interrupt;
+    exec_env->wasi_p2_wait_interrupt = NULL;
+    os_mutex_unlock(&exec_env->wait_lock);
+
+    if (interrupt) {
+        if (interrupt->read_fd >= 0) {
+            close(interrupt->read_fd);
+        }
+        if (interrupt->write_fd >= 0) {
+            close(interrupt->write_fd);
+        }
+        wasm_runtime_free(interrupt);
+    }
+}
+#else
+void
+wasi_p2_interrupt_wait_request(wasm_exec_env_t exec_env)
+{
+    (void)exec_env;
+}
+
+void
+wasi_p2_interrupt_wait_destroy(wasm_exec_env_t exec_env)
+{
+    (void)exec_env;
+}
+#endif
+
 /**
  * @brief Adds an output stream to the global list of flushing streams.
  * @details This is an internal helper function, likely called when a `flush`
@@ -151,38 +304,103 @@ pollable_get_events(const wasi_pollable_context_t *pollable)
     }
 }
 
-void
-wasi_pollable_block(wasi_pollable_context_t *pollable)
+wasi_p2_wait_status_t
+wasi_pollable_block_interruptible(wasm_exec_env_t exec_env,
+                                  wasi_pollable_context_t *pollable)
 {
-    struct pollfd pfd;
+    struct pollfd pfds[2];
+    uint32_t pollfd_count = 1;
+    int poll_result = 0;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+    WasiP2WaitInterrupt *interrupt = NULL;
+
+    if (exec_env) {
+        if (wait_interrupt_exec_env_terminated(exec_env)) {
+            return WASI_P2_WAIT_INTERRUPTED;
+        }
+        if (!(interrupt = wait_interrupt_get(exec_env))) {
+            return WASI_P2_WAIT_FAILED;
+        }
+        if (wait_interrupt_is_requested(exec_env, interrupt)) {
+            return WASI_P2_WAIT_INTERRUPTED;
+        }
+        pfds[1].fd = interrupt->read_fd;
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
+        pollfd_count = 2;
+    }
+#else
+    (void)exec_env;
+#endif
 
     if (!pollable || pollable->type == WASI_POLLABLE_ALWAYS_READY) {
-        return;
+        return pollable ? WASI_P2_WAIT_READY : WASI_P2_WAIT_FAILED;
     }
     if (pollable->type == WASI_POLLABLE_HOST_CALLBACK) {
         for (;;) {
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+            if (interrupt && wait_interrupt_is_requested(exec_env, interrupt)) {
+                return WASI_P2_WAIT_INTERRUPTED;
+            }
+#endif
             if (wasi_p2_host_pollable_ready(pollable->host_context)) {
-                return;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+                if (interrupt
+                    && wait_interrupt_is_requested(exec_env, interrupt)) {
+                    return WASI_P2_WAIT_INTERRUPTED;
+                }
+#endif
+                return WASI_P2_WAIT_READY;
             }
             wasi_p2_host_pollable_drain(pollable->host_context);
             if (wasi_p2_host_pollable_ready(pollable->host_context)) {
-                return;
-            }
-            pfd.fd = pollable->fd;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-            while (poll(&pfd, 1, -1) < 0) {
-                if (errno != EINTR) {
-                    return;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+                if (interrupt
+                    && wait_interrupt_is_requested(exec_env, interrupt)) {
+                    return WASI_P2_WAIT_INTERRUPTED;
                 }
+#endif
+                return WASI_P2_WAIT_READY;
+            }
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+            if (interrupt && wait_interrupt_is_requested(exec_env, interrupt)) {
+                return WASI_P2_WAIT_INTERRUPTED;
+            }
+#endif
+            pfds[0].fd = pollable->fd;
+            pfds[0].events = POLLIN;
+            pfds[0].revents = 0;
+            do {
+                pfds[1].revents = 0;
+                poll_result = poll(pfds, pollfd_count, -1);
+            } while (poll_result < 0 && errno == EINTR);
+            if (poll_result < 0) {
+                return WASI_P2_WAIT_FAILED;
             }
         }
     }
-    pfd.fd = pollable->fd;
-    pfd.events = pollable_get_events(pollable);
-    pfd.revents = 0;
-    while (poll(&pfd, 1, -1) < 0 && errno == EINTR) {
+    pfds[0].fd = pollable->fd;
+    pfds[0].events = pollable_get_events(pollable);
+    pfds[0].revents = 0;
+    do {
+        pfds[1].revents = 0;
+        poll_result = poll(pfds, pollfd_count, -1);
+    } while (poll_result < 0 && errno == EINTR);
+    if (poll_result < 0) {
+        return WASI_P2_WAIT_FAILED;
     }
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+    if (interrupt && wait_interrupt_is_requested(exec_env, interrupt)) {
+        return WASI_P2_WAIT_INTERRUPTED;
+    }
+#endif
+    return pfds[0].revents != 0 ? WASI_P2_WAIT_READY : WASI_P2_WAIT_FAILED;
+}
+
+void
+wasi_pollable_block(wasi_pollable_context_t *pollable)
+{
+    (void)wasi_pollable_block_interruptible(NULL, pollable);
 }
 
 /**
@@ -236,38 +454,84 @@ wasi_pollable_ready(wasi_pollable_context_t *pollable)
  * @param[out] ret A pointer to a list struct that will be populated with the
  *                 indices of the pollables that have become ready.
  */
-void
+static uint32_t
+collect_ready_pollables(const wasi_pollable_context_t **pollables,
+                        const struct pollfd *pfds, uint32_t n_pollables,
+                        uint32_t *ready_indices)
+{
+    uint32_t ready_count = 0;
 
-wasi_poll(const wasi_pollable_context_t **pollables, uint32_t n_pollables,
-          wasi_list_u32_t *ret)
+    for (uint32_t i = 0; i < n_pollables; i++) {
+        if (pollables[i]->type == WASI_POLLABLE_ALWAYS_READY
+            || (pollables[i]->type == WASI_POLLABLE_HOST_CALLBACK
+                && wasi_p2_host_pollable_ready(pollables[i]->host_context))
+            || (pollables[i]->type != WASI_POLLABLE_HOST_CALLBACK
+                && pfds[i].revents != 0)) {
+            ready_indices[ready_count++] = i;
+        }
+    }
+    return ready_count;
+}
+
+wasi_p2_wait_status_t
+wasi_poll_interruptible(wasm_exec_env_t exec_env,
+                        const wasi_pollable_context_t **pollables,
+                        uint32_t n_pollables, wasi_list_u32_t *ret)
 {
     uint32_t *ready_indices = NULL;
     uint32_t ready_count = 0;
+    uint32_t pollfd_count = n_pollables;
     int poll_result = 0;
+    wasi_p2_wait_status_t status = WASI_P2_WAIT_FAILED;
+    struct pollfd *pfds = NULL;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+    WasiP2WaitInterrupt *interrupt = NULL;
+#else
+    (void)exec_env;
+#endif
 
     if (!ret) {
-        return;
+        return WASI_P2_WAIT_FAILED;
     }
     ret->buf = NULL;
     ret->len = 0;
 
-    if (!pollables || n_pollables == 0
-        || n_pollables > UINT32_MAX / sizeof(struct pollfd)
+    if (n_pollables == 0) {
+        return WASI_P2_WAIT_READY;
+    }
+    if (!pollables || n_pollables > UINT32_MAX / sizeof(struct pollfd)
         || n_pollables > UINT32_MAX / sizeof(uint32_t)) {
-        return;
+        return WASI_P2_WAIT_FAILED;
     }
 
-    // Allocate a POSIX pollfd array to match the input pollables.
-    struct pollfd *pfds =
-        wasm_runtime_malloc(sizeof(struct pollfd) * n_pollables);
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+    if (exec_env) {
+        if (wait_interrupt_exec_env_terminated(exec_env)) {
+            return WASI_P2_WAIT_INTERRUPTED;
+        }
+        if (!(interrupt = wait_interrupt_get(exec_env))
+            || n_pollables == UINT32_MAX) {
+            return WASI_P2_WAIT_FAILED;
+        }
+        if (wait_interrupt_is_requested(exec_env, interrupt)) {
+            return WASI_P2_WAIT_INTERRUPTED;
+        }
+        pollfd_count++;
+    }
+#endif
+
+    if (pollfd_count > UINT32_MAX / sizeof(struct pollfd)) {
+        return WASI_P2_WAIT_FAILED;
+    }
+    pfds = wasm_runtime_malloc(sizeof(struct pollfd) * pollfd_count);
     if (!pfds) {
-        return;
+        return WASI_P2_WAIT_FAILED;
     }
 
     ready_indices = wasm_runtime_malloc(sizeof(uint32_t) * n_pollables);
     if (!ready_indices) {
         wasm_runtime_free(pfds);
-        return;
+        return WASI_P2_WAIT_FAILED;
     }
 
     // Initialize the pollfd array for both fd-backed and host pollables.
@@ -279,29 +543,41 @@ wasi_poll(const wasi_pollable_context_t **pollables, uint32_t n_pollables,
         pfds[i].events = pollable_get_events(pollables[i]);
         pfds[i].revents = 0;
     }
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+    if (interrupt) {
+        pfds[n_pollables].fd = interrupt->read_fd;
+        pfds[n_pollables].events = POLLIN;
+        pfds[n_pollables].revents = 0;
+    }
+#endif
 
     for (;;) {
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+        if (interrupt && wait_interrupt_is_requested(exec_env, interrupt)) {
+            status = WASI_P2_WAIT_INTERRUPTED;
+            break;
+        }
+#endif
         do {
-            poll_result = poll(pfds, n_pollables, 0);
+            poll_result = poll(pfds, pollfd_count, 0);
         } while (poll_result < 0 && errno == EINTR);
         if (poll_result < 0) {
             break;
         }
 
-        ready_count = 0;
-        for (uint32_t i = 0; i < n_pollables; i++) {
-            if (pollables[i]->type == WASI_POLLABLE_ALWAYS_READY
-                || (pollables[i]->type == WASI_POLLABLE_HOST_CALLBACK
-                    && wasi_p2_host_pollable_ready(pollables[i]->host_context))
-                || (pollables[i]->type != WASI_POLLABLE_HOST_CALLBACK
-                    && pfds[i].revents != 0)) {
-                ready_indices[ready_count++] = i;
-            }
+        ready_count = collect_ready_pollables(pollables, pfds, n_pollables,
+                                              ready_indices);
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+        if (interrupt && wait_interrupt_is_requested(exec_env, interrupt)) {
+            status = WASI_P2_WAIT_INTERRUPTED;
+            break;
         }
+#endif
         if (ready_count != 0) {
             ret->buf = ready_indices;
             ret->len = ready_count;
             ready_indices = NULL;
+            status = WASI_P2_WAIT_READY;
             break;
         }
 
@@ -313,33 +589,43 @@ wasi_poll(const wasi_pollable_context_t **pollables, uint32_t n_pollables,
             }
             pfds[i].revents = 0;
         }
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+        if (interrupt) {
+            pfds[n_pollables].revents = 0;
+            if (wait_interrupt_is_requested(exec_env, interrupt)) {
+                status = WASI_P2_WAIT_INTERRUPTED;
+                break;
+            }
+        }
+#endif
 
         do {
-            poll_result = poll(pfds, n_pollables, 0);
+            poll_result = poll(pfds, pollfd_count, 0);
         } while (poll_result < 0 && errno == EINTR);
         if (poll_result < 0) {
             break;
         }
-        ready_count = 0;
-        for (uint32_t i = 0; i < n_pollables; i++) {
-            if (pollables[i]->type == WASI_POLLABLE_ALWAYS_READY
-                || (pollables[i]->type == WASI_POLLABLE_HOST_CALLBACK
-                    && wasi_p2_host_pollable_ready(pollables[i]->host_context))
-                || (pollables[i]->type != WASI_POLLABLE_HOST_CALLBACK
-                    && pfds[i].revents != 0)) {
-                ready_indices[ready_count++] = i;
-            }
+        ready_count = collect_ready_pollables(pollables, pfds, n_pollables,
+                                              ready_indices);
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
+        if (interrupt && wait_interrupt_is_requested(exec_env, interrupt)) {
+            status = WASI_P2_WAIT_INTERRUPTED;
+            break;
+        }
+#endif
+        for (uint32_t i = 0; i < pollfd_count; i++) {
             pfds[i].revents = 0;
         }
         if (ready_count != 0) {
             ret->buf = ready_indices;
             ret->len = ready_count;
             ready_indices = NULL;
+            status = WASI_P2_WAIT_READY;
             break;
         }
 
         do {
-            poll_result = poll(pfds, n_pollables, -1);
+            poll_result = poll(pfds, pollfd_count, -1);
         } while (poll_result < 0 && errno == EINTR);
         if (poll_result < 0) {
             break;
@@ -351,6 +637,14 @@ cleanup:
         wasm_runtime_free(ready_indices);
     }
     wasm_runtime_free(pfds);
+    return status;
+}
+
+void
+wasi_poll(const wasi_pollable_context_t **pollables, uint32_t n_pollables,
+          wasi_list_u32_t *ret)
+{
+    (void)wasi_poll_interruptible(NULL, pollables, n_pollables, ret);
 }
 
 // wasi:io/streams

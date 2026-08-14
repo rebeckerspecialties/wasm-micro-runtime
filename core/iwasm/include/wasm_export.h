@@ -1686,9 +1686,11 @@ wasm_component_deinstantiate(WASMComponentInstance *comp_inst);
  *
  * This is the component API which may be called by a control thread while the
  * instance's owning thread is executing Wasm.  It recursively terminates the
- * instance's defined core and nested component instances.  The owner must
- * return from execution and be joined before prepared calls, the instance, or
- * its component buffer are destroyed.
+ * instance's defined core and nested component instances. Interruptible
+ * wasi:io poll waits return as termination, never as a ready event, even when
+ * no host notifier or other event occurs. The owner must return from execution
+ * and be joined before prepared calls, the instance, or its component buffer
+ * are destroyed.
  */
 WASM_RUNTIME_API_EXTERN void
 wasm_component_terminate(WASMComponentInstance *comp_inst);

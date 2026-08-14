@@ -61,6 +61,11 @@ struct HostIoState {
     pthread_cond_t signal_ready;
     wasm_component_wasi_pollable_signal_t signal;
     bool cancel_notifier;
+    bool pause_pollable_factory;
+    bool release_pollable_factory;
+    uint32_t pause_ready_query_at;
+    bool release_ready_query;
+    uint32_t ready_query_epoch;
     atomic_bool poll_level_ready;
     bool notify_result;
 };
@@ -161,13 +166,25 @@ static bool
 poll_ready(void *attachment)
 {
     PollAttachment *pollable = attachment;
+    bool ready = false;
 
     if (!pollable || !pollable->state || pollable->dropped) {
         abort();
     }
+    pthread_mutex_lock(&pollable->state->signal_lock);
     pollable->state->poll_ready_queries++;
-    return atomic_load_explicit(&pollable->state->poll_level_ready,
-                                memory_order_acquire);
+    pollable->state->ready_query_epoch++;
+    pthread_cond_broadcast(&pollable->state->signal_ready);
+    while (pollable->state->pause_ready_query_at
+               == pollable->state->ready_query_epoch
+           && !pollable->state->release_ready_query) {
+        pthread_cond_wait(&pollable->state->signal_ready,
+                          &pollable->state->signal_lock);
+    }
+    pthread_mutex_unlock(&pollable->state->signal_lock);
+    ready = atomic_load_explicit(&pollable->state->poll_level_ready,
+                                 memory_order_acquire);
+    return ready;
 }
 
 static void
@@ -306,6 +323,10 @@ event_pollable_raw(wasm_exec_env_t exec_env, uint64_t *canonical_cells)
     else {
         state->signal = signal;
         pthread_cond_broadcast(&state->signal_ready);
+        while (state->pause_pollable_factory
+               && !state->release_pollable_factory) {
+            pthread_cond_wait(&state->signal_ready, &state->signal_lock);
+        }
     }
     pthread_mutex_unlock(&state->signal_lock);
     canonical_cells[0] = handle;
@@ -485,6 +506,230 @@ notify_pollable(void *attachment)
     atomic_store_explicit(&state->poll_level_ready, true, memory_order_release);
     state->notify_result = wasm_component_wasi_pollable_notify(signal);
     return NULL;
+}
+
+typedef struct AsyncComponentCall {
+    WASMComponentInstance *instance;
+    const char *export_name;
+    bool succeeded;
+    atomic_bool completed;
+    char error[ERROR_BUFFER_SIZE];
+} AsyncComponentCall;
+
+typedef enum TerminationCaseMode {
+    TERMINATE_BEFORE_ARM,
+    TERMINATE_DURING_READY_CHECK,
+    TERMINATE_WHILE_WAITING,
+} TerminationCaseMode;
+
+static bool
+host_state_init(HostIoState *state)
+{
+    memset(state, 0, sizeof(*state));
+    state->cookie = CUSTOM_DATA_COOKIE;
+    state->next_file_representation = FIRST_FILE_REPRESENTATION;
+    state->next_scanner_representation = FIRST_SCANNER_REPRESENTATION;
+    if (pthread_mutex_init(&state->signal_lock, NULL) != 0) {
+        return false;
+    }
+    if (pthread_cond_init(&state->signal_ready, NULL) != 0) {
+        pthread_mutex_destroy(&state->signal_lock);
+        return false;
+    }
+    atomic_init(&state->poll_level_ready, false);
+    return true;
+}
+
+static void
+host_state_destroy(HostIoState *state)
+{
+    pthread_cond_destroy(&state->signal_ready);
+    pthread_mutex_destroy(&state->signal_lock);
+}
+
+static WASMComponentInstance *
+instantiate_component(WASMComponent *component, HostIoState *state, char *error,
+                      uint32_t error_size)
+{
+    struct InstantiationArgs2 *args = NULL;
+    WASMComponentInstance *instance = NULL;
+
+    if (!wasm_runtime_instantiation_args_create(&args)) {
+        return NULL;
+    }
+    wasm_runtime_instantiation_args_set_default_stack_size(args, 256 * 1024);
+    wasm_runtime_instantiation_args_set_host_managed_heap_size(args, 0);
+    wasm_runtime_instantiation_args_set_custom_data(args, state);
+    instance =
+        wasm_component_instantiate_ex2(component, args, error, error_size);
+    wasm_runtime_instantiation_args_destroy(args);
+    return instance;
+}
+
+static void *
+call_export_async(void *attachment)
+{
+    AsyncComponentCall *call = attachment;
+    wasm_val_t result = { 0 };
+
+    call->succeeded = call_export(call->instance, call->export_name, 1, &result,
+                                  call->error, (uint32_t)sizeof(call->error));
+    atomic_store_explicit(&call->completed, true, memory_order_release);
+    return NULL;
+}
+
+static bool
+wait_for_host_progress(HostIoState *state, uint32_t ready_query_epoch)
+{
+    struct timespec deadline;
+    int wait_result = 0;
+    bool reached = false;
+
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+        return false;
+    }
+    deadline.tv_sec += 2;
+
+    pthread_mutex_lock(&state->signal_lock);
+    while (
+        (state->signal == NULL || state->ready_query_epoch < ready_query_epoch)
+        && wait_result == 0) {
+        wait_result = pthread_cond_timedwait(&state->signal_ready,
+                                             &state->signal_lock, &deadline);
+    }
+    reached =
+        state->signal != NULL && state->ready_query_epoch >= ready_query_epoch;
+    pthread_mutex_unlock(&state->signal_lock);
+    return reached;
+}
+
+static bool
+join_completed_call(pthread_t thread, AsyncComponentCall *call)
+{
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 1000 * 1000 };
+
+    for (uint32_t i = 0; i < 2000; i++) {
+        if (atomic_load_explicit(&call->completed, memory_order_acquire)) {
+            pthread_join(thread, NULL);
+            return true;
+        }
+        nanosleep(&delay, NULL);
+    }
+    return false;
+}
+
+static bool
+run_termination_case(WASMComponent *component, const char *export_name,
+                     TerminationCaseMode mode, bool repeat_termination)
+{
+    HostIoState state;
+    AsyncComponentCall call = { 0 };
+    WASMComponentInstance *instance = NULL;
+    wasm_component_wasi_pollable_signal_t signal = NULL;
+    pthread_t thread;
+    struct timespec wait_delay = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
+    const char *exception = NULL;
+    char error[ERROR_BUFFER_SIZE] = { 0 };
+    bool passed = false;
+
+    if (!host_state_init(&state)) {
+        return false;
+    }
+    state.pause_pollable_factory = mode == TERMINATE_BEFORE_ARM;
+    state.pause_ready_query_at = mode == TERMINATE_DURING_READY_CHECK ? 2 : 0;
+
+    instance = instantiate_component(component, &state, error, sizeof(error));
+    if (!instance) {
+        fprintf(stderr, "termination fixture instantiation failed: %s\n",
+                error);
+        goto cleanup;
+    }
+
+    call.instance = instance;
+    call.export_name = export_name;
+    atomic_init(&call.completed, false);
+    if (pthread_create(&thread, NULL, call_export_async, &call) != 0) {
+        fprintf(stderr, "failed to start termination fixture call\n");
+        goto cleanup;
+    }
+    if (!wait_for_host_progress(&state, mode == TERMINATE_BEFORE_ARM ? 0 : 2)) {
+        fprintf(stderr, "termination fixture did not reach wait setup\n");
+        goto terminate_and_join;
+    }
+    if (mode == TERMINATE_WHILE_WAITING) {
+        nanosleep(&wait_delay, NULL);
+    }
+
+    wasm_component_terminate(instance);
+    if (repeat_termination) {
+        wasm_component_terminate(instance);
+    }
+
+    pthread_mutex_lock(&state.signal_lock);
+    state.release_pollable_factory = true;
+    state.release_ready_query = true;
+    pthread_cond_broadcast(&state.signal_ready);
+    pthread_mutex_unlock(&state.signal_lock);
+
+    if (!join_completed_call(thread, &call)) {
+        fprintf(stderr, "terminated component call did not return\n");
+        abort();
+    }
+    exception = wasm_component_runtime_get_exception(instance);
+    if (call.succeeded || !exception
+        || strstr(exception, "terminated by user") == NULL
+        || state.callback_failures != 0 || state.poll_constructions != 1) {
+        fprintf(stderr, "termination fixture returned wrong outcome: %s\n",
+                exception ? exception : call.error);
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&state.signal_lock);
+    signal = state.signal;
+    state.signal = NULL;
+    pthread_mutex_unlock(&state.signal_lock);
+    if (!signal || !wasm_component_wasi_pollable_notify(signal)) {
+        fprintf(stderr, "late termination notify was not lifetime-safe\n");
+        goto cleanup;
+    }
+    wasm_component_deinstantiate(instance);
+    instance = NULL;
+    if (state.poll_drops != 1 || state.scanner_drops != 1
+        || wasm_component_wasi_pollable_notify(signal)) {
+        fprintf(stderr, "termination fixture signal/drop lifetime failed\n");
+        goto cleanup;
+    }
+    wasm_component_wasi_pollable_signal_release(signal);
+    signal = NULL;
+    passed = true;
+    goto cleanup;
+
+terminate_and_join:
+    wasm_component_terminate(instance);
+    pthread_mutex_lock(&state.signal_lock);
+    state.release_pollable_factory = true;
+    state.release_ready_query = true;
+    pthread_cond_broadcast(&state.signal_ready);
+    pthread_mutex_unlock(&state.signal_lock);
+    if (!join_completed_call(thread, &call)) {
+        abort();
+    }
+
+cleanup:
+    if (instance) {
+        wasm_component_deinstantiate(instance);
+    }
+    if (!signal) {
+        pthread_mutex_lock(&state.signal_lock);
+        signal = state.signal;
+        state.signal = NULL;
+        pthread_mutex_unlock(&state.signal_lock);
+    }
+    if (signal) {
+        wasm_component_wasi_pollable_signal_release(signal);
+    }
+    host_state_destroy(&state);
+    return passed;
 }
 
 int
@@ -703,6 +948,7 @@ deinstantiate:
         pthread_join(notifier, NULL);
     }
     wasm_component_deinstantiate(instance);
+    instance = NULL;
     if (exit_code == 0
         && (state.stream_drops != state.stream_constructions
             || state.poll_drops != state.poll_constructions)) {
@@ -711,6 +957,18 @@ deinstantiate:
                 "pollables=%u/%u\n",
                 state.stream_drops, state.stream_constructions,
                 state.poll_drops, state.poll_constructions);
+        exit_code = 1;
+    }
+    if (exit_code == 0
+        && (!run_termination_case(component, "poll-block-wait",
+                                  TERMINATE_BEFORE_ARM, false)
+            || !run_termination_case(component, "poll-block-wait",
+                                     TERMINATE_DURING_READY_CHECK, false)
+            || !run_termination_case(component, "poll-block-wait",
+                                     TERMINATE_WHILE_WAITING, true)
+            || !run_termination_case(component, "poll-wait",
+                                     TERMINATE_WHILE_WAITING, true))) {
+        fprintf(stderr, "component no-notifier termination exercise failed\n");
         exit_code = 1;
     }
 unload_component:
