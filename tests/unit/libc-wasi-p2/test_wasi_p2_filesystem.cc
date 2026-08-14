@@ -123,7 +123,7 @@ TEST_F(WasiP2FilesystemTest, Filesystem_MutationsRejectPathEscape)
     close(dir_fd);
 }
 
-TEST_F(WasiP2FilesystemTest, Filesystem_ContainedDotDotIsNormalized)
+TEST_F(WasiP2FilesystemTest, Filesystem_ContainedDotDotStaysBeneathRoot)
 {
     int dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
     ASSERT_NE(dir_fd, -1);
@@ -187,6 +187,11 @@ TEST_F(WasiP2FilesystemTest, Filesystem_PathOperationsRejectIntermediateSymlink)
     wasi_filesystem_open_at(dir_fd, 0, "portal/victim.txt", 0,
                             WASI_DESCRIPTOR_FLAGS_READ, 0, &opened_fd, &error);
     EXPECT_NE(error, WASI_ERROR_CODE_SUCCESS);
+    EXPECT_EQ(opened_fd, -1);
+
+    wasi_filesystem_open_at(dir_fd, 0, "portal/../inside.txt", 0,
+                            WASI_DESCRIPTOR_FLAGS_READ, 0, &opened_fd, &error);
+    EXPECT_EQ(error, EPERM);
     EXPECT_EQ(opened_fd, -1);
 
     wasi_descriptor_stat_t descriptor_stat;
