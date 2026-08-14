@@ -1079,9 +1079,15 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
 
     int internal_flags = O_CLOEXEC;
 
+#if defined(__APPLE__)
+    /* O_NOFOLLOW_ANY below already covers the final component.  Darwin
+     * rejects combining O_NOFOLLOW_ANY with O_NOFOLLOW as EINVAL. */
+    (void)path_flags;
+#else
     if (!(path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW)) {
         internal_flags |= O_NOFOLLOW;
     }
+#endif
 
     // Translate WASI open-flags to POSIX O_ flags.
     if (open_flags & WASI_OPEN_FLAGS_CREATE) {
