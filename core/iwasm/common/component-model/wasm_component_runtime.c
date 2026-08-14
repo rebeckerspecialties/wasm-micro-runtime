@@ -2324,8 +2324,9 @@ get_active_component_callback_memory(WASMExecEnv *exec_env)
 {
     WASMMemoryInstance *memory = NULL;
 
-    if (!exec_env || !exec_env->component_inst || !exec_env->core_func
-        || !exec_env->cx || !exec_env->cx->canonical_opts
+    if (!exec_env || !exec_env->component_callback_active
+        || !exec_env->component_inst || !exec_env->core_func || !exec_env->cx
+        || !exec_env->cx->canonical_opts
         || !exec_env->core_func->component_function || !exec_env->memory) {
         return NULL;
     }
@@ -2552,21 +2553,29 @@ fail:
     return false;
 }
 
-uint32_t
-wasm_runtime_call_realloc(LiftLowerContext *cx, int32_t old_ptr,
-                          int32_t old_size, int32_t align, int32_t new_size)
+static bool
+call_canonical_realloc(LiftLowerContext *cx, int32_t old_ptr, int32_t old_size,
+                       int32_t align, int32_t new_size, uint32_t *out_ptr)
 {
     WASMFunctionInstance *realloc_func = get_realloc_func(cx);
+    wasm_val_t results[1] = { 0 };
+
+    if (out_ptr) {
+        *out_ptr = 0;
+    }
+    if (!out_ptr) {
+        return false;
+    }
     if (!realloc_func) {
         set_component_exception(cx, "realloc function not provided");
-        return 0;
+        return false;
     }
 
     WASMExecEnv *exec_env = wasm_runtime_get_exec_env_singleton(
         (WASMModuleInstanceCommon *)realloc_func->module_instance);
     if (!exec_env) {
         set_component_exception(cx, "create singleton exec_env failed");
-        return 0;
+        return false;
     }
 
     // The singleton exec_env may be changed by a nested import call, thus we
@@ -2580,8 +2589,6 @@ wasm_runtime_call_realloc(LiftLowerContext *cx, int32_t old_ptr,
                            { .kind = WASM_I32, .of.i32 = old_size },
                            { .kind = WASM_I32, .of.i32 = align },
                            { .kind = WASM_I32, .of.i32 = new_size } };
-    wasm_val_t results[1];
-
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     WASMExecEnv *saved_tls = wasm_runtime_get_exec_env_tls();
     wasm_runtime_set_exec_env_tls(NULL);
@@ -2596,13 +2603,111 @@ wasm_runtime_call_realloc(LiftLowerContext *cx, int32_t old_ptr,
 #endif
         wasm_exec_env_restore_module_inst(exec_env, saved_module_inst);
         set_component_exception(cx, ex ? ex : "realloc call failed");
-        return 0;
+        return false;
     }
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     wasm_runtime_set_exec_env_tls(saved_tls);
 #endif
     wasm_exec_env_restore_module_inst(exec_env, saved_module_inst);
-    return results[0].of.i32;
+    *out_ptr = results[0].of.i32;
+    return true;
+}
+
+uint32_t
+wasm_runtime_call_realloc(LiftLowerContext *cx, int32_t old_ptr,
+                          int32_t old_size, int32_t align, int32_t new_size)
+{
+    uint32_t ptr = 0;
+
+    if (!call_canonical_realloc(cx, old_ptr, old_size, align, new_size, &ptr)) {
+        return 0;
+    }
+    return ptr;
+}
+
+bool
+wasm_component_cabi_realloc(wasm_exec_env_t exec_env, uint32_t old_offset,
+                            uint32_t old_size, uint32_t alignment,
+                            uint32_t new_size, uint32_t *out_offset)
+{
+    WASMExecEnv *internal_exec_env = (WASMExecEnv *)exec_env;
+    WASMComponentInstance *saved_component_inst = NULL;
+    WASMFunctionInstance *saved_core_func = NULL;
+    WASMMemoryInstance *saved_memory = NULL;
+    WASMModuleInstanceCommon *saved_module_inst = NULL;
+    LiftLowerContext *saved_cx = NULL;
+    void *saved_attachment = NULL;
+    uint32_t new_offset = 0;
+    bool realloc_succeeded = false;
+    bool context_preserved = false;
+
+    if (out_offset) {
+        *out_offset = 0;
+    }
+    if (!out_offset || !internal_exec_env
+        || !internal_exec_env->component_callback_active
+        || !(saved_memory =
+                 get_active_component_callback_memory(internal_exec_env))
+        || alignment == 0 || alignment > 8 || (alignment & (alignment - 1)) != 0
+        || ((old_offset == 0) != (old_size == 0))) {
+        return false;
+    }
+
+    saved_component_inst = internal_exec_env->component_inst;
+    saved_core_func = internal_exec_env->core_func;
+    saved_module_inst = wasm_runtime_get_module_inst(internal_exec_env);
+    saved_cx = internal_exec_env->cx;
+    saved_attachment = internal_exec_env->attachment;
+
+    if (old_size != 0
+        && ((old_offset & (alignment - 1)) != 0
+            || !wasm_component_validate_memory_range(exec_env, old_offset,
+                                                     old_size))) {
+        return false;
+    }
+
+    realloc_succeeded = call_canonical_realloc(
+        saved_cx, (int32_t)old_offset, (int32_t)old_size, (int32_t)alignment,
+        (int32_t)new_size, &new_offset);
+
+    context_preserved =
+        internal_exec_env->component_callback_active
+        && internal_exec_env->component_inst == saved_component_inst
+        && internal_exec_env->core_func == saved_core_func
+        && internal_exec_env->memory == saved_memory
+        && internal_exec_env->cx == saved_cx
+        && internal_exec_env->attachment == saved_attachment
+        && wasm_runtime_get_module_inst(internal_exec_env) == saved_module_inst;
+    if (!context_preserved) {
+        internal_exec_env->component_inst = saved_component_inst;
+        internal_exec_env->core_func = saved_core_func;
+        internal_exec_env->memory = saved_memory;
+        internal_exec_env->cx = saved_cx;
+        internal_exec_env->attachment = saved_attachment;
+        internal_exec_env->component_callback_active = true;
+        wasm_exec_env_restore_module_inst(internal_exec_env, saved_module_inst);
+        set_component_exception(
+            saved_cx, "cabi_realloc changed component callback context");
+        return false;
+    }
+    if (!realloc_succeeded) {
+        return false;
+    }
+
+    if (new_size == 0) {
+        return true;
+    }
+    if (new_offset == 0 || (new_offset & (alignment - 1)) != 0) {
+        set_component_exception(
+            saved_cx, "cabi_realloc returned a null or misaligned pointer");
+        return false;
+    }
+    if (!wasm_component_validate_memory_range(exec_env, new_offset, new_size)) {
+        return false;
+    }
+
+    *out_offset = new_offset;
+    return true;
 }
 
 /// @brief convert numeric offset to start of memory area inside wasm linear

@@ -134,6 +134,70 @@ struct WASMComponentPreparedCall;
 typedef struct WASMComponentPreparedCall WASMComponentPreparedCall;
 typedef bool (*wasm_component_host_resource_drop_callback_t)(
     void *attachment, uint32_t representation);
+
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
+/** Maximum bytes passed to one callback-backed input-stream operation. */
+#define WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES (64U * 1024U)
+
+typedef enum wasm_component_wasi_input_stream_status_t {
+    WASM_COMPONENT_WASI_INPUT_STREAM_OK = 0,
+    WASM_COMPONENT_WASI_INPUT_STREAM_CLOSED = 1,
+    WASM_COMPONENT_WASI_INPUT_STREAM_FAILED = 2,
+} wasm_component_wasi_input_stream_status_t;
+
+/**
+ * Fill WAMR-owned buffer synchronously on the component owner thread.
+ * buffer is valid only for this call and must not be retained. For a positive
+ * capacity, OK requires 1..capacity bytes; CLOSED and FAILED require zero.
+ */
+typedef wasm_component_wasi_input_stream_status_t (
+    *wasm_component_wasi_input_stream_read_callback_t)(
+    void *attachment, uint8_t *buffer, uint32_t capacity,
+    uint32_t *out_bytes_read);
+
+/**
+ * Skip synchronously on the component owner thread. For a positive max_bytes,
+ * OK requires 1..max_bytes skipped; CLOSED and FAILED require zero.
+ */
+typedef wasm_component_wasi_input_stream_status_t (
+    *wasm_component_wasi_input_stream_skip_callback_t)(
+    void *attachment, uint64_t max_bytes, uint64_t *out_bytes_skipped);
+
+/**
+ * Release attachment exactly once: synchronously on constructor failure, or
+ * on the component owner thread after successful construction.
+ */
+typedef void (*wasm_component_wasi_input_stream_drop_callback_t)(
+    void *attachment);
+
+typedef struct wasm_component_wasi_input_stream_callbacks_t {
+    uint32_t struct_size;
+    wasm_component_wasi_input_stream_read_callback_t read;
+    wasm_component_wasi_input_stream_skip_callback_t skip;
+    wasm_component_wasi_input_stream_drop_callback_t drop;
+} wasm_component_wasi_input_stream_callbacks_t;
+
+struct wasm_component_wasi_pollable_signal;
+typedef struct wasm_component_wasi_pollable_signal
+    *wasm_component_wasi_pollable_signal_t;
+
+/**
+ * Non-blocking level query made on the component owner thread, outside WAMR
+ * wait locks. It must not enter WAMR or retain/access guest memory.
+ */
+typedef bool (*wasm_component_wasi_pollable_ready_callback_t)(void *attachment);
+/**
+ * Release attachment exactly once: synchronously on constructor failure, or
+ * on the component owner thread after successful construction.
+ */
+typedef void (*wasm_component_wasi_pollable_drop_callback_t)(void *attachment);
+
+typedef struct wasm_component_wasi_pollable_callbacks_t {
+    uint32_t struct_size;
+    wasm_component_wasi_pollable_ready_callback_t ready;
+    wasm_component_wasi_pollable_drop_callback_t drop;
+} wasm_component_wasi_pollable_callbacks_t;
+#endif
 #endif
 
 /* Function instance */
@@ -1783,6 +1847,92 @@ WASM_RUNTIME_API_EXTERN bool
 wasm_component_get_memory_range_const(wasm_exec_env_t exec_env,
                                       uint32_t app_offset, uint32_t size,
                                       const uint8_t **p_native_addr);
+
+/**
+ * Invoke the canonical realloc selected for the active component callback.
+ *
+ * This is valid only during an exact raw component host-import callback. The
+ * alignment must be a power of two no greater than eight, the old allocation
+ * must be absent (both offset and size zero) or a valid aligned memory range,
+ * and the returned allocation is checked for alignment and wasm32 bounds.
+ * new_size zero frees the old allocation and returns offset zero.
+ *
+ * Calling guest realloc may re-enter WebAssembly and grow canonical memory.
+ * Hosts must not retain a pointer obtained from wasm_component_get_memory_range
+ * across this call; translate offsets again after it returns.
+ *
+ * @param out_offset receives zero on every failure
+ * @return true on success, false for invalid arguments/context, a guest trap,
+ *         or an invalid realloc result
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_cabi_realloc(wasm_exec_env_t exec_env, uint32_t old_offset,
+                            uint32_t old_size, uint32_t alignment,
+                            uint32_t new_size, uint32_t *out_offset);
+
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
+/**
+ * Create an owned callback-backed wasi:io/streams input-stream@0.2.6.
+ *
+ * The constructor is callback-only and resolves the nominal input-stream from
+ * the current function's result type. It returns the canonical owned handle;
+ * the caller remains responsible for writing that handle to its flat result
+ * cell. Read and skip callbacks are synchronous and receive at most
+ * WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES per invocation. A
+ * positive request reported as OK must make progress without blocking.
+ * Callback-backed streams therefore subscribe as always-ready pollables.
+ *
+ * The callback table is copied. Once a structurally valid table is accepted,
+ * WAMR consumes attachment even if later construction fails and invokes drop
+ * exactly once. Invalid tables are rejected without invoking their callbacks.
+ * On success attachment remains owned until explicit resource drop or
+ * component teardown. No callback is made after drop returns.
+ *
+ * @param out_handle receives zero on every failure
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_wasi_input_stream_new(
+    wasm_exec_env_t exec_env,
+    const wasm_component_wasi_input_stream_callbacks_t *callbacks,
+    void *attachment, uint32_t *out_handle);
+
+/**
+ * Create an owned, externally wakeable wasi:io/poll pollable@0.2.6.
+ *
+ * ready is a level query made only on the component owner thread and never
+ * while an internal wait lock is held. The returned signal owns a separate
+ * reference for the caller; notify may be called from any thread and never
+ * invokes host callbacks. Each successful constructor call creates a distinct
+ * canonical own handle and signal.
+ *
+ * The callback table and attachment follow the same consume-on-valid-table,
+ * exact-once-drop rules as wasm_component_wasi_input_stream_new(). On failure
+ * out_signal is NULL and out_handle is zero. On success the caller must release
+ * out_signal after synchronously unregistering every external notifier and
+ * before destroying the WAMR runtime.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_wasi_pollable_new(
+    wasm_exec_env_t exec_env,
+    const wasm_component_wasi_pollable_callbacks_t *callbacks, void *attachment,
+    wasm_component_wasi_pollable_signal_t *out_signal, uint32_t *out_handle);
+
+/**
+ * Wake waits involving a callback-backed pollable.
+ *
+ * The operation is thread-safe and level-neutral: ready remains authoritative.
+ * It returns false once the guest resource has been dropped. The caller must
+ * retain its signal reference for the complete duration of this call.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_wasi_pollable_notify(
+    wasm_component_wasi_pollable_signal_t signal);
+
+/** Release the caller-owned reference returned by pollable_new. */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_wasi_pollable_signal_release(
+    wasm_component_wasi_pollable_signal_t signal);
+#endif
 #endif
 
 /**

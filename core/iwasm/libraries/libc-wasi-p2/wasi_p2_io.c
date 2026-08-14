@@ -12,6 +12,7 @@
 
 #include "wasi_p2_io.h"
 #include "wasi_p2_error.h"
+#include "wasi_p2_host_io.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -143,6 +144,8 @@ pollable_get_events(const wasi_pollable_context_t *pollable)
             return POLLOUT;
         case WASI_POLLABLE_SOCK:
             return POLLIN | POLLPRI | POLLOUT;
+        case WASI_POLLABLE_HOST_CALLBACK:
+            return POLLIN;
         default:
             return 0;
     }
@@ -152,9 +155,34 @@ void
 wasi_pollable_block(wasi_pollable_context_t *pollable)
 {
     struct pollfd pfd;
+
+    if (!pollable || pollable->type == WASI_POLLABLE_ALWAYS_READY) {
+        return;
+    }
+    if (pollable->type == WASI_POLLABLE_HOST_CALLBACK) {
+        for (;;) {
+            if (wasi_p2_host_pollable_ready(pollable->host_context)) {
+                return;
+            }
+            wasi_p2_host_pollable_drain(pollable->host_context);
+            if (wasi_p2_host_pollable_ready(pollable->host_context)) {
+                return;
+            }
+            pfd.fd = pollable->fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            while (poll(&pfd, 1, -1) < 0) {
+                if (errno != EINTR) {
+                    return;
+                }
+            }
+        }
+    }
     pfd.fd = pollable->fd;
     pfd.events = pollable_get_events(pollable);
-    poll(&pfd, 1, -1);
+    pfd.revents = 0;
+    while (poll(&pfd, 1, -1) < 0 && errno == EINTR) {
+    }
 }
 
 /**
@@ -170,8 +198,19 @@ bool
 wasi_pollable_ready(wasi_pollable_context_t *pollable)
 {
     struct pollfd pfd;
+
+    if (!pollable) {
+        return false;
+    }
+    if (pollable->type == WASI_POLLABLE_ALWAYS_READY) {
+        return true;
+    }
+    if (pollable->type == WASI_POLLABLE_HOST_CALLBACK) {
+        return wasi_p2_host_pollable_ready(pollable->host_context);
+    }
     pfd.fd = pollable->fd;
     pfd.events = pollable_get_events(pollable);
+    pfd.revents = 0;
 
     // Use the underlying POSIX poll function with a timeout of 0.
     // This makes the call non-blocking, returning immediately with the
@@ -202,11 +241,21 @@ void
 wasi_poll(const wasi_pollable_context_t **pollables, uint32_t n_pollables,
           wasi_list_u32_t *ret)
 {
-    if (!pollables || !ret) {
+    uint32_t *ready_indices = NULL;
+    uint32_t ready_count = 0;
+    int poll_result = 0;
+
+    if (!ret) {
         return;
     }
     ret->buf = NULL;
     ret->len = 0;
+
+    if (!pollables || n_pollables == 0
+        || n_pollables > UINT32_MAX / sizeof(struct pollfd)
+        || n_pollables > UINT32_MAX / sizeof(uint32_t)) {
+        return;
+    }
 
     // Allocate a POSIX pollfd array to match the input pollables.
     struct pollfd *pfds =
@@ -215,37 +264,92 @@ wasi_poll(const wasi_pollable_context_t **pollables, uint32_t n_pollables,
         return;
     }
 
-    // Initialize the pollfd array for the poll system call.
+    ready_indices = wasm_runtime_malloc(sizeof(uint32_t) * n_pollables);
+    if (!ready_indices) {
+        wasm_runtime_free(pfds);
+        return;
+    }
+
+    // Initialize the pollfd array for both fd-backed and host pollables.
     for (uint32_t i = 0; i < n_pollables; i++) {
+        if (!pollables[i]) {
+            goto cleanup;
+        }
         pfds[i].fd = pollables[i]->fd;
         pfds[i].events = pollable_get_events(pollables[i]);
+        pfds[i].revents = 0;
     }
 
-    // Block indefinitely (-1 timeout) until at least one descriptor is ready.
-    int n = poll(pfds, n_pollables, -1);
-    if (n <= 0) {
-        // Handle error or unexpected timeout.
-        wasm_runtime_free(pfds);
-        return;
-    }
+    for (;;) {
+        do {
+            poll_result = poll(pfds, n_pollables, 0);
+        } while (poll_result < 0 && errno == EINTR);
+        if (poll_result < 0) {
+            break;
+        }
 
-    // Allocate the return buffer to hold the indices of the ready pollables.
-    ret->buf = wasm_runtime_malloc(sizeof(uint32_t) * n);
-    if (!ret->buf) {
-        wasm_runtime_free(pfds);
-        return;
-    }
+        ready_count = 0;
+        for (uint32_t i = 0; i < n_pollables; i++) {
+            if (pollables[i]->type == WASI_POLLABLE_ALWAYS_READY
+                || (pollables[i]->type == WASI_POLLABLE_HOST_CALLBACK
+                    && wasi_p2_host_pollable_ready(pollables[i]->host_context))
+                || (pollables[i]->type != WASI_POLLABLE_HOST_CALLBACK
+                    && pfds[i].revents != 0)) {
+                ready_indices[ready_count++] = i;
+            }
+        }
+        if (ready_count != 0) {
+            ret->buf = ready_indices;
+            ret->len = ready_count;
+            ready_indices = NULL;
+            break;
+        }
 
-    // Iterate through the results and populate the return list with the
-    // indices of the pollables that have the POLLIN event set.
-    uint32_t j = 0;
-    for (uint32_t i = 0; i < n_pollables; i++) {
-        if (pfds[i].revents) {
-            ret->buf[j++] = i;
+        /* A notify is only a wake edge. Drain it, then recheck the host's
+         * level before entering the blocking poll to avoid a lost wake. */
+        for (uint32_t i = 0; i < n_pollables; i++) {
+            if (pollables[i]->type == WASI_POLLABLE_HOST_CALLBACK) {
+                wasi_p2_host_pollable_drain(pollables[i]->host_context);
+            }
+            pfds[i].revents = 0;
+        }
+
+        do {
+            poll_result = poll(pfds, n_pollables, 0);
+        } while (poll_result < 0 && errno == EINTR);
+        if (poll_result < 0) {
+            break;
+        }
+        ready_count = 0;
+        for (uint32_t i = 0; i < n_pollables; i++) {
+            if (pollables[i]->type == WASI_POLLABLE_ALWAYS_READY
+                || (pollables[i]->type == WASI_POLLABLE_HOST_CALLBACK
+                    && wasi_p2_host_pollable_ready(pollables[i]->host_context))
+                || (pollables[i]->type != WASI_POLLABLE_HOST_CALLBACK
+                    && pfds[i].revents != 0)) {
+                ready_indices[ready_count++] = i;
+            }
+            pfds[i].revents = 0;
+        }
+        if (ready_count != 0) {
+            ret->buf = ready_indices;
+            ret->len = ready_count;
+            ready_indices = NULL;
+            break;
+        }
+
+        do {
+            poll_result = poll(pfds, n_pollables, -1);
+        } while (poll_result < 0 && errno == EINTR);
+        if (poll_result < 0) {
+            break;
         }
     }
-    ret->len = j;
 
+cleanup:
+    if (ready_indices) {
+        wasm_runtime_free(ready_indices);
+    }
     wasm_runtime_free(pfds);
 }
 
@@ -712,7 +816,10 @@ wasi_output_stream_blocking_write_and_flush(
 
     uint64_t remaining = payload->buf_len;
     uint8_t *buf = payload->buf;
-    wasi_pollable_context_t pollable = { stream, false, WASI_POLLABLE_OUT };
+    wasi_pollable_context_t pollable = { .fd = stream,
+                                         .own_fd = false,
+                                         .type = WASI_POLLABLE_OUT,
+                                         .host_context = NULL };
 
     // Loop until the entire payload has been written.
     while (remaining > 0) {
@@ -870,7 +977,10 @@ wasi_output_stream_blocking_flush(wasi_output_stream_t stream,
     }
 
     // 2. Poll until the stream is ready for writing again.
-    wasi_pollable_context_t pollable = { stream, false, WASI_POLLABLE_OUT };
+    wasi_pollable_context_t pollable = { .fd = stream,
+                                         .own_fd = false,
+                                         .type = WASI_POLLABLE_OUT,
+                                         .host_context = NULL };
     while (true) {
         wasi_pollable_block(&pollable);
 
@@ -974,7 +1084,10 @@ wasi_output_stream_blocking_write_zeroes_and_flush(
     uint64_t remaining = len;
 
     // Loop until the specified number of zero bytes has been written.
-    wasi_pollable_context_t pollable = { stream, false, WASI_POLLABLE_OUT };
+    wasi_pollable_context_t pollable = { .fd = stream,
+                                         .own_fd = false,
+                                         .type = WASI_POLLABLE_OUT,
+                                         .host_context = NULL };
     while (remaining > 0) {
         wasi_pollable_block(&pollable);
         wasi_result_u64_stream_error_t check_res;
