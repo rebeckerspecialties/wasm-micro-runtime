@@ -360,9 +360,6 @@ run_prelinked_table_instance(WASMModule *owner_module,
                 }
                 if (clear_ok) {
                     restore_ok = wasm_table_set(&table_api, 0, foreign_ref);
-                    if (restore_ok) {
-                        foreign_ref = nullptr;
-                    }
                 }
                 host_table_api_ok =
                     restore_ok

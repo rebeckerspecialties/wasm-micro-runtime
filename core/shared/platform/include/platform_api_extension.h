@@ -18,6 +18,9 @@
 extern "C" {
 #endif
 
+/* Committed mapping created by POSIX HW-bound thread signal setup. */
+#define OS_THREAD_SIGNAL_ALT_STACK_SIZE (32 * 1024)
+
 /***************************************************
  *                                                 *
  *                Extension interface              *

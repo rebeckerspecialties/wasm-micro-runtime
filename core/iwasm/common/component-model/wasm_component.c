@@ -384,11 +384,16 @@ wasm_component_register_host_resource_drop_callback(
     const char *resource_name,
     wasm_component_host_resource_drop_callback_t callback)
 {
+    WASMAllocationQuotaScope scope;
     WASMComponentHostResourceDropRegistration *registration;
     char *interface_copy = NULL, *resource_copy = NULL;
+    bool success = false;
 
     if (!component || !interface_name || !interface_name[0] || !resource_name
         || !resource_name[0] || !callback) {
+        return false;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, component)) {
         return false;
     }
 
@@ -397,7 +402,8 @@ wasm_component_register_host_resource_drop_callback(
         if (strcmp(registration->interface_name, interface_name) == 0
             && strcmp(registration->resource_name, resource_name) == 0) {
             registration->callback = callback;
-            return true;
+            success = true;
+            goto done;
         }
     }
 
@@ -434,7 +440,8 @@ wasm_component_register_host_resource_drop_callback(
     registration->interface_name = interface_copy;
     registration->resource_name = resource_copy;
     registration->callback = callback;
-    return true;
+    success = true;
+    goto done;
 
 fail:
     if (interface_copy) {
@@ -443,7 +450,10 @@ fail:
     if (resource_copy) {
         wasm_runtime_free(resource_copy);
     }
-    return false;
+
+done:
+    wasm_allocation_quota_scope_leave(&scope);
+    return success;
 }
 
 bool

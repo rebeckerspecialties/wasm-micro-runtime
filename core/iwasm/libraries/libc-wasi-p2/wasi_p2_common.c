@@ -5,12 +5,174 @@
 
 #include "wasi_p2_common.h"
 #include "wasi_p2_types.h"
+#include "component-model/wasm_component_resource.h"
+#include "component-model/wasm_component_resource_table.h"
 
 #include <errno.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
 #include <netdb.h>
+
+bool
+wasi_p2_native_fd_quota_reserve(wasm_exec_env_t exec_env, uint32_t fd_count,
+                                WasiP2NativeFdQuotaLease *out_lease)
+{
+    const struct InstantiationArgs2 *args = NULL;
+
+    if (!out_lease)
+        return false;
+    memset(out_lease, 0, sizeof(*out_lease));
+    if (fd_count == 0 || !exec_env || !exec_env->component_inst)
+        return true;
+
+    args = &exec_env->component_inst->instantiation_args;
+    if (!args->native_fd_quota_reserve || !args->native_fd_quota_release)
+        return true;
+    if (!args->native_fd_quota_reserve(args->native_fd_quota_attachment,
+                                       fd_count))
+        return false;
+
+    out_lease->attachment = args->native_fd_quota_attachment;
+    out_lease->release_callback = args->native_fd_quota_release;
+    out_lease->fd_count = fd_count;
+    return true;
+}
+
+bool
+wasi_p2_native_fd_quota_lease_take(WasiP2NativeFdQuotaLease *lease,
+                                   uint32_t fd_count,
+                                   WasiP2NativeFdQuotaLease *out_lease)
+{
+    if (!lease || !out_lease || lease == out_lease)
+        return false;
+    if (fd_count > lease->fd_count) {
+        if (!lease->release_callback) {
+            memset(out_lease, 0, sizeof(*out_lease));
+            return true;
+        }
+        return false;
+    }
+    memset(out_lease, 0, sizeof(*out_lease));
+    if (fd_count == 0)
+        return true;
+    out_lease->attachment = lease->attachment;
+    out_lease->release_callback = lease->release_callback;
+    out_lease->fd_count = fd_count;
+    lease->fd_count -= fd_count;
+    if (lease->fd_count == 0) {
+        lease->attachment = NULL;
+        lease->release_callback = NULL;
+    }
+    return true;
+}
+
+void
+wasi_p2_native_fd_quota_release(WasiP2NativeFdQuotaLease *lease)
+{
+    void *attachment;
+    wasm_native_fd_quota_release_callback_t release_callback;
+    uint32_t fd_count;
+
+    if (!lease || !lease->release_callback || lease->fd_count == 0)
+        return;
+    attachment = lease->attachment;
+    release_callback = lease->release_callback;
+    fd_count = lease->fd_count;
+    memset(lease, 0, sizeof(*lease));
+    release_callback(attachment, fd_count);
+}
+
+void
+wasi_p2_native_fd_quota_transfer_to_host_resource(
+    HostResource *resource, WasiP2NativeFdQuotaLease *lease)
+{
+    if (!resource || !lease || !lease->release_callback || lease->fd_count == 0)
+        return;
+    host_resource_set_native_fd_quota(resource, lease->attachment,
+                                      lease->release_callback, lease->fd_count);
+    memset(lease, 0, sizeof(*lease));
+}
+
+static bool
+drop_lowered_builtin_wasi_rep(WASMComponentResourceTable *table, uint32_t rep)
+{
+    uint32_t i;
+    uint32_t scan_limit;
+
+    if (!table || !table->array || rep == 0) {
+        return false;
+    }
+
+    scan_limit = table->next_index < table->array_size ? table->next_index
+                                                       : table->array_size;
+    for (i = 1; i < scan_limit; i++) {
+        WASMTableElement *element = table->array[i];
+        WASMResourceHandle *handle;
+
+        if (!element || element->transaction
+            || element->type != WASM_TABLE_ELEM_RESOURCE_HANDLE
+            || !element->ptr) {
+            continue;
+        }
+        handle = (WASMResourceHandle *)element->ptr;
+        if (!handle->own || handle->rep != rep || !handle->rt
+            || !handle->rt->is_builtin_wasi) {
+            continue;
+        }
+
+        return wasm_component_table_drop_resource(table, i);
+    }
+
+    return false;
+}
+
+void
+wasi_p2_cleanup_failed_owned_host_resources(wasm_exec_env_t exec_env,
+                                            const uint32_t *reps,
+                                            uint32_t rep_count)
+{
+    WASMComponentResourceTable *component_table = NULL;
+    HostResourceTable *host_table = get_global_host_resource_table();
+    uint32_t i;
+
+    if (!reps || rep_count == 0 || !host_table) {
+        return;
+    }
+    if (exec_env && exec_env->cx && exec_env->cx->inst) {
+        component_table = exec_env->cx->inst->table;
+    }
+
+    for (i = 0; i < rep_count; i++) {
+        uint32_t rep = reps[i];
+
+        if (rep == 0) {
+            continue;
+        }
+        if (!drop_lowered_builtin_wasi_rep(component_table, rep)) {
+            (void)host_resource_table_delete(host_table, rep);
+        }
+    }
+}
+
+bool
+wasi_p2_store_owned_host_resource_result(wasm_exec_env_t exec_env,
+                                         uint32_t offset_addr,
+                                         WASMComponentTypeInstance *result_type,
+                                         wit_value_t result,
+                                         const uint32_t *reps,
+                                         uint32_t rep_count)
+{
+    bool stored = false;
+
+    if (exec_env && exec_env->cx && result_type && result) {
+        stored = store(exec_env->cx, offset_addr, result_type, result);
+    }
+    if (!stored) {
+        wasi_p2_cleanup_failed_owned_host_resources(exec_env, reps, rep_count);
+    }
+    return stored;
+}
 
 bool
 lower_owned_host_resource(wasm_exec_env_t exec_env,
@@ -254,13 +416,33 @@ copy_wasm_string_to_native(wasm_exec_env_t exec_env,
 StringEncoding
 wasm_get_string_encoding(WASMExecEnv *exec_env)
 {
+    StringEncoding target_encoding;
+
     if (!exec_env || !exec_env->cx || !exec_env->cx->canonical_opts
-        || exec_env->cx->canonical_opts->lift_lower_opts
-        || exec_env->cx->canonical_opts->lift_lower_opts->lift_opts
-               ->string_encoding)
+        || !exec_env->cx->canonical_opts->lift_lower_opts
+        || !exec_env->cx->canonical_opts->lift_lower_opts->lift_opts) {
         return ENCODING_UTF_8;
-    return exec_env->cx->canonical_opts->lift_lower_opts->lift_opts
-        ->string_encoding;
+    }
+
+    target_encoding = exec_env->cx->canonical_opts->lift_lower_opts->lift_opts
+                          ->string_encoding;
+    switch (target_encoding) {
+        case ENCODING_UTF_8:
+        case ENCODING_UTF_16:
+        case ENCODING_LATIN_1_UTF_16:
+            /* Wrapper-created ComponentWITString values are host-side UTF-8.
+               The canonical store path subsequently transcodes them to this
+               validated target encoding. Returning the target encoding here
+               would pre-encode and then double-encode UTF-16/compact strings.
+             */
+            return ENCODING_UTF_8;
+        default:
+            if (exec_env->module_inst) {
+                wasm_runtime_set_exception(exec_env->module_inst,
+                                           "unknown canonical string encoding");
+            }
+            return ENCODING_UTF_8;
+    }
 }
 
 wasi_filesystem_error_code_t
@@ -407,7 +589,14 @@ wit_value_t
 get_result_error_val(uint32_t error_code)
 {
     wit_value_t error_val = wit_enum_ctor(error_code);
-    return wit_result_ctor(true, error_val);
+    wit_value_t result;
+
+    if (!error_val)
+        return NULL;
+    result = wit_result_ctor(true, error_val);
+    if (!result)
+        free_wit_value(error_val);
+    return result;
 }
 
 wit_value_t
@@ -415,18 +604,52 @@ get_datetime(uint64_t seconds, uint32_t nanoseconds)
 {
     wit_value_t seconds_val = wit_u64_ctor(seconds);
     wit_value_t nanoseconds_val = wit_u32_ctor(nanoseconds);
-    ComponentWITRecordField *datetime_fields =
-        (ComponentWITRecordField *)wasm_runtime_malloc(
-            2 * sizeof(ComponentWITRecordField));
-    init_record_field(&datetime_fields[0], "seconds", 7, seconds_val);
-    init_record_field(&datetime_fields[1], "nanoseconds", 11, nanoseconds_val);
+    ComponentWITRecordField *datetime_fields = NULL;
+    wit_value_t datetime = NULL;
 
-    return wit_record_ctor(datetime_fields, 2);
+    if (!seconds_val || !nanoseconds_val)
+        goto fail;
+    datetime_fields = (ComponentWITRecordField *)wasm_runtime_calloc(
+        2, sizeof(ComponentWITRecordField));
+    if (!datetime_fields)
+        goto fail;
+    init_record_field(&datetime_fields[0], "seconds", 7, seconds_val);
+    if (!datetime_fields[0].key)
+        goto fail;
+    seconds_val = NULL;
+    init_record_field(&datetime_fields[1], "nanoseconds", 11, nanoseconds_val);
+    if (!datetime_fields[1].key)
+        goto fail;
+    nanoseconds_val = NULL;
+
+    datetime = wit_record_ctor(datetime_fields, 2);
+    if (!datetime)
+        goto fail;
+    return datetime;
+
+fail:
+    free_wit_value(seconds_val);
+    free_wit_value(nanoseconds_val);
+    if (datetime_fields) {
+        free_wit_value(datetime_fields[0].value);
+        wasm_runtime_free(datetime_fields[0].key);
+        free_wit_value(datetime_fields[1].value);
+        wasm_runtime_free(datetime_fields[1].key);
+        wasm_runtime_free(datetime_fields);
+    }
+    return NULL;
 }
 
 wit_value_t
 get_result_datetime(uint64_t seconds, uint32_t nanoseconds)
 {
     wit_value_t datetime_val = get_datetime(seconds, nanoseconds);
-    return wit_result_ctor(false, datetime_val);
+    wit_value_t result;
+
+    if (!datetime_val)
+        return NULL;
+    result = wit_result_ctor(false, datetime_val);
+    if (!result)
+        free_wit_value(datetime_val);
+    return result;
 }

@@ -10,11 +10,13 @@
 #include "wasm_loader.h"
 #include "wasm_component_runtime.h"
 #include "wasm_component_canon.h"
+#include "wasm_component_host_resource.h"
 #include "bh_log.h"
 #include "stdio.h"
 #include "wasm_component_canonical.h"
 #include "wasm_component_task.h"
 #include "bh_assert.h"
+#include "wasm_allocation_quota.h"
 #include "../../libraries/libc-wasi-p2/wasi_p2_cli.h"
 #include "../../../product-mini/platforms/common/libc_wasi.h"
 
@@ -1182,6 +1184,25 @@ wasm_component_instance_allocate(WASMComponentIndexCount *index_count,
         return NULL;
     }
     memset(comp_instance, 0, total_size);
+    if (os_mutex_init(&comp_instance->lifecycle_lock) != BHT_OK) {
+        wasm_runtime_free(comp_instance);
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Failed to initialize component instance "
+                         "lifecycle lock\n");
+        return NULL;
+    }
+    comp_instance->lifecycle_lock_initialized = true;
+    if (os_recursive_mutex_init(&comp_instance->operation_lock) != BHT_OK) {
+        os_mutex_destroy(&comp_instance->lifecycle_lock);
+        comp_instance->lifecycle_lock_initialized = false;
+        wasm_runtime_free(comp_instance);
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Failed to initialize component instance "
+                         "operation lock\n");
+        return NULL;
+    }
+    comp_instance->operation_lock_initialized = true;
+    comp_instance->lifecycle_root = comp_instance;
     wasm_runtime_instantiation_args_set_defaults(
         &comp_instance->instantiation_args);
     wasm_runtime_instantiation_args_set_default_stack_size(
@@ -1315,10 +1336,28 @@ wasm_component_instance_allocate(WASMComponentIndexCount *index_count,
     // Start with initial size of 10, grow by 50% when needed
     comp_instance->table = wasm_component_table_init(10, 50);
     if (!comp_instance->table) {
+        os_mutex_destroy(&comp_instance->operation_lock);
+        comp_instance->operation_lock_initialized = false;
+        os_mutex_destroy(&comp_instance->lifecycle_lock);
+        comp_instance->lifecycle_lock_initialized = false;
         wasm_runtime_free(comp_instance);
         set_error_buf_ex(
             error_buf, error_buf_size,
             "ERROR: Failed to initialize component instance table\n");
+        return NULL;
+    }
+    if (!wasm_allocation_quota_allocations_share_owner(comp_instance,
+                                                       comp_instance->table)) {
+        wasm_component_table_destroy(comp_instance->table);
+        os_mutex_destroy(&comp_instance->operation_lock);
+        comp_instance->operation_lock_initialized = false;
+        os_mutex_destroy(&comp_instance->lifecycle_lock);
+        comp_instance->lifecycle_lock_initialized = false;
+        wasm_runtime_free(comp_instance);
+        set_error_buf_ex(
+            error_buf, error_buf_size,
+            "ERROR: Component instance table has a different allocation "
+            "quota owner\n");
         return NULL;
     }
 
@@ -1326,6 +1365,226 @@ wasm_component_instance_allocate(WASMComponentIndexCount *index_count,
         "Component instance memory allocation successfull, total size is %d\n",
         total_size);
     return comp_instance;
+}
+
+static WASMComponentInstance *
+component_instance_lifecycle_root(WASMComponentInstance *comp_instance)
+{
+    return comp_instance ? comp_instance->lifecycle_root : NULL;
+}
+
+#define COMPONENT_LIFECYCLE_GATE_CLOSED (1U << 31)
+#define COMPONENT_LIFECYCLE_GATE_USERS_MASK \
+    (COMPONENT_LIFECYCLE_GATE_CLOSED - 1)
+
+static bool
+component_lifecycle_gate_compare_exchange(bh_atomic_32_t *state,
+                                          uint32 *expected, uint32 desired)
+{
+#if BH_ATOMIC_32_IS_ATOMIC != 0
+    return __atomic_compare_exchange_n(state, expected, desired, false,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+#else
+    if (*state != *expected) {
+        *expected = *state;
+        return false;
+    }
+    *state = desired;
+    return true;
+#endif
+}
+
+static bool
+component_lifecycle_gate_enter(WASMComponentInstance *root)
+{
+    uint32 state, expected;
+
+    if (!root) {
+        return false;
+    }
+
+    state = BH_ATOMIC_32_LOAD(root->lifecycle_gate_state);
+    for (;;) {
+        if ((state & COMPONENT_LIFECYCLE_GATE_CLOSED) != 0
+            || (state & COMPONENT_LIFECYCLE_GATE_USERS_MASK)
+                   == COMPONENT_LIFECYCLE_GATE_USERS_MASK) {
+            return false;
+        }
+        expected = state;
+        if (component_lifecycle_gate_compare_exchange(
+                &root->lifecycle_gate_state, &expected, state + 1)) {
+            return true;
+        }
+        state = expected;
+    }
+}
+
+static void
+component_lifecycle_gate_leave(WASMComponentInstance *root)
+{
+    uint32 state = BH_ATOMIC_32_LOAD(root->lifecycle_gate_state), expected;
+
+    for (;;) {
+        if ((state & COMPONENT_LIFECYCLE_GATE_USERS_MASK) == 0) {
+            LOG_ERROR("component: lifecycle lock-user counter underflow");
+            return;
+        }
+        expected = state;
+        if (component_lifecycle_gate_compare_exchange(
+                &root->lifecycle_gate_state, &expected, state - 1)) {
+            return;
+        }
+        state = expected;
+    }
+}
+
+static bool
+component_lifecycle_lock(WASMComponentInstance *root)
+{
+    if (!root || !component_lifecycle_gate_enter(root)) {
+        return false;
+    }
+    if (!root->lifecycle_lock_initialized) {
+        component_lifecycle_gate_leave(root);
+        return false;
+    }
+
+    os_mutex_lock(&root->lifecycle_lock);
+    if ((BH_ATOMIC_32_LOAD(root->lifecycle_gate_state)
+         & COMPONENT_LIFECYCLE_GATE_CLOSED)
+        != 0) {
+        os_mutex_unlock(&root->lifecycle_lock);
+        component_lifecycle_gate_leave(root);
+        return false;
+    }
+    return true;
+}
+
+static void
+component_lifecycle_unlock(WASMComponentInstance *root)
+{
+    os_mutex_unlock(&root->lifecycle_lock);
+    component_lifecycle_gate_leave(root);
+}
+
+static bool
+component_instance_bind_lifecycle_root(WASMComponentInstance *comp_instance,
+                                       WASMComponentInstance *root,
+                                       uint32 depth)
+{
+    uint32 idx;
+
+    if (!comp_instance || !root || depth > MAX_DEPTH_RECURSION) {
+        return false;
+    }
+    comp_instance->lifecycle_root = root;
+    for (idx = 0; idx < comp_instance->defined_instances_count; idx++) {
+        if (comp_instance->defined_instances[idx]
+            && !component_instance_bind_lifecycle_root(
+                comp_instance->defined_instances[idx], root, depth + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool
+wasm_component_instance_begin_operation(WASMComponentInstance *comp_instance)
+{
+    WASMComponentInstance *root =
+        component_instance_lifecycle_root(comp_instance);
+    bool success = false;
+
+    if (!root || !component_lifecycle_gate_enter(root)) {
+        return false;
+    }
+    if (!root->operation_lock_initialized
+        || !root->lifecycle_lock_initialized) {
+        component_lifecycle_gate_leave(root);
+        return false;
+    }
+
+    /* Keep the lifecycle-gate reference while waiting: teardown may close the
+     * gate, but it cannot free either lock until this entrant has observed the
+     * closed state and left. */
+    os_mutex_lock(&root->operation_lock);
+    os_mutex_lock(&root->lifecycle_lock);
+    if (!root->deinstantiating && !comp_instance->deinstantiating
+        && (BH_ATOMIC_32_LOAD(root->lifecycle_gate_state)
+            & COMPONENT_LIFECYCLE_GATE_CLOSED)
+               == 0
+        && root->lifecycle_active_operations != UINT32_MAX) {
+        root->lifecycle_active_operations++;
+        success = true;
+    }
+    os_mutex_unlock(&root->lifecycle_lock);
+    if (!success) {
+        os_mutex_unlock(&root->operation_lock);
+        component_lifecycle_gate_leave(root);
+    }
+    return success;
+}
+
+void
+wasm_component_instance_end_operation(WASMComponentInstance *comp_instance)
+{
+    WASMComponentInstance *root =
+        component_instance_lifecycle_root(comp_instance);
+
+    if (!root || !root->operation_lock_initialized
+        || !root->lifecycle_lock_initialized) {
+        LOG_ERROR("component: lifecycle operation ended without a root lock");
+        return;
+    }
+    os_mutex_lock(&root->lifecycle_lock);
+    if (root->lifecycle_active_operations == 0) {
+        LOG_ERROR("component: lifecycle operation counter underflow");
+    }
+    else {
+        root->lifecycle_active_operations--;
+    }
+    os_mutex_unlock(&root->lifecycle_lock);
+    os_mutex_unlock(&root->operation_lock);
+    component_lifecycle_gate_leave(root);
+}
+
+bool
+wasm_component_instance_register_prepared_call(
+    WASMComponentInstance *comp_instance)
+{
+    WASMComponentInstance *root =
+        component_instance_lifecycle_root(comp_instance);
+    bool success = false;
+
+    if (!component_lifecycle_lock(root)) {
+        return false;
+    }
+    if (!root->deinstantiating && !comp_instance->deinstantiating
+        && comp_instance->outstanding_prepared_calls != UINT32_MAX) {
+        comp_instance->outstanding_prepared_calls++;
+        success = true;
+    }
+    component_lifecycle_unlock(root);
+    return success;
+}
+
+bool
+wasm_component_instance_unregister_prepared_call(
+    WASMComponentInstance *comp_instance)
+{
+    WASMComponentInstance *root =
+        component_instance_lifecycle_root(comp_instance);
+    bool success = false;
+
+    if (!component_lifecycle_lock(root)) {
+        return false;
+    }
+    if (comp_instance->outstanding_prepared_calls > 0) {
+        comp_instance->outstanding_prepared_calls--;
+        success = true;
+    }
+    component_lifecycle_unlock(root);
+    return success;
 }
 
 uint64
@@ -1364,6 +1623,95 @@ get_core_index_count(WASMInstExpr *instance_expression)
     return total_size;
 }
 
+static bool
+component_allocation_has_owner(const WASMComponentInstance *owner,
+                               const void *allocation, const char *kind)
+{
+    if (!allocation
+        || wasm_allocation_quota_allocations_share_owner(owner, allocation)) {
+        return true;
+    }
+
+    LOG_ERROR("component: %s has a different allocation quota owner", kind);
+    return false;
+}
+
+static bool
+component_instance_owner_graph_is_valid(const WASMComponentInstance *owner,
+                                        const WASMComponentInstance *instance,
+                                        uint32 depth)
+{
+    uint32 idx;
+
+    if (!owner || !instance || depth > MAX_DEPTH_RECURSION
+        || !owner->lifecycle_root
+        || instance->lifecycle_root != owner->lifecycle_root
+        || !component_allocation_has_owner(owner, instance,
+                                           "nested component instance")
+        || !component_allocation_has_owner(owner, instance->lifecycle_root,
+                                           "component lifecycle root")
+        || !component_allocation_has_owner(owner, instance->parent,
+                                           "component parent")
+        || !component_allocation_has_owner(owner, instance->component,
+                                           "loaded component")
+        || !component_allocation_has_owner(owner, instance->table,
+                                           "resource table")
+        || !component_allocation_has_owner(owner, instance->exec_env_singleton,
+                                           "component exec env")
+        || !component_allocation_has_owner(owner, instance->cur_exec_env,
+                                           "active component exec env")
+        || !component_allocation_has_owner(owner, instance->owned_export_names,
+                                           "owned export names")) {
+        return false;
+    }
+
+    for (idx = 0; idx < instance->components_count; idx++) {
+        if (!component_allocation_has_owner(owner, instance->components[idx],
+                                            "nested loaded component")) {
+            return false;
+        }
+    }
+    for (idx = 0; idx < instance->core_modules_count; idx++) {
+        if (!component_allocation_has_owner(owner, instance->core_modules[idx],
+                                            "core module")) {
+            return false;
+        }
+    }
+    for (idx = 0; idx < instance->component_instances_count; idx++) {
+        if (!component_allocation_has_owner(owner,
+                                            instance->component_instances[idx],
+                                            "component instance index entry")) {
+            return false;
+        }
+    }
+    for (idx = 0; idx < instance->core_module_instances_count; idx++) {
+        if (!component_allocation_has_owner(
+                owner, instance->core_module_instances[idx],
+                "core module instance index entry")) {
+            return false;
+        }
+    }
+    for (idx = 0; idx < instance->defined_core_instances_count; idx++) {
+        if (!component_allocation_has_owner(
+                owner, instance->defined_core_instances[idx],
+                "defined core module instance")) {
+            return false;
+        }
+    }
+    for (idx = 0; idx < instance->defined_instances_count; idx++) {
+        WASMComponentInstance *child = instance->defined_instances[idx];
+
+        if (child
+            && (!component_allocation_has_owner(owner, child,
+                                                "defined component instance")
+                || !component_instance_owner_graph_is_valid(owner, child,
+                                                            depth + 1))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 WASMComponentInstance *
 wasm_component_instantiate_internal_ex(
     WASMComponent *component,
@@ -1371,22 +1719,42 @@ wasm_component_instantiate_internal_ex(
     const struct InstantiationArgs2 *args, char *error_buf,
     uint32 error_buf_size)
 {
+    WASMAllocationQuotaScope quota_scope;
+    WASMComponentIndexCount *index_count = NULL;
+    WASMComponentInstance *comp_instance = NULL;
+
     LOG_DEBUG("Instantiate internal");
     if (!component) {
         set_error_buf_ex(error_buf, error_buf_size,
                          "ERROR: Invalid component\n");
         return NULL;
     }
-    WASMComponentIndexCount *index_count =
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&quota_scope,
+                                                          component)) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Component allocation quota owner scope could "
+                         "not be established\n");
+        return NULL;
+    }
+    if (instance_expression && instance_expression->parent
+        && !wasm_allocation_quota_allocations_share_owner(
+            component, instance_expression->parent)) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Nested component and parent have different "
+                         "allocation quota owners\n");
+        goto done;
+    }
+
+    index_count =
         wasm_component_get_index_count(component, error_buf, error_buf_size);
     if (!index_count) {
         set_error_buf_ex(error_buf, error_buf_size,
                          "ERROR: failed to retrieve component index count\n");
-        return NULL;
+        goto done;
     }
 
-    WASMComponentInstance *comp_instance = wasm_component_instance_allocate(
-        index_count, error_buf, error_buf_size);
+    comp_instance = wasm_component_instance_allocate(index_count, error_buf,
+                                                     error_buf_size);
     if (!comp_instance) {
         set_error_buf_ex(error_buf, error_buf_size,
                          "ERROR: component instance allocation failed\n");
@@ -1623,10 +1991,35 @@ wasm_component_instantiate_internal_ex(
                 break;
         }
     }
+    /* A nested instance is not yet published in its parent's owned graph.
+     * Keep it self-rooted so a caller can safely tear it down if parent-side
+     * insertion fails. The parent normalizes the complete graph when its own
+     * instantiation succeeds (or before failure cleanup). */
+    if (!component_instance_bind_lifecycle_root(comp_instance, comp_instance,
+                                                0)) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Component lifecycle graph is too deep\n");
+        wasm_component_deinstantiate(comp_instance);
+        comp_instance = NULL;
+        goto done;
+    }
+    if (!component_instance_owner_graph_is_valid(comp_instance, comp_instance,
+                                                 0)) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Component instance allocation quota owner "
+                         "graph is inconsistent\n");
+        wasm_component_deinstantiate(comp_instance);
+        comp_instance = NULL;
+        goto done;
+    }
+
     comp_instance->may_leave = true;
     LOG_DEBUG("Instantiation done\n");
 done:
-    wasm_runtime_free(index_count);
+    if (index_count) {
+        wasm_runtime_free(index_count);
+    }
+    wasm_allocation_quota_scope_leave(&quota_scope);
     return comp_instance;
 }
 
@@ -2104,72 +2497,250 @@ wasm_component_runtime_destroy_wasi(WASMComponentInstance *comp_instance)
 }
 #endif
 
-void
-wasm_component_deinstantiate(WASMComponentInstance *comp_instance)
+static bool
+component_has_outstanding_prepared_calls(
+    const WASMComponentInstance *comp_instance, uint32 depth)
 {
+    uint32 idx;
+
     if (!comp_instance) {
+        return false;
+    }
+    if (depth > MAX_DEPTH_RECURSION
+        || comp_instance->outstanding_prepared_calls > 0) {
+        return true;
+    }
+    for (idx = 0; idx < comp_instance->defined_instances_count; idx++) {
+        if (component_has_outstanding_prepared_calls(
+                comp_instance->defined_instances[idx], depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+component_mark_deinstantiating_and_seal(WASMComponentInstance *comp_instance,
+                                        uint32 depth)
+{
+    uint32 idx;
+
+    if (!comp_instance || depth > MAX_DEPTH_RECURSION) {
         return;
     }
-    uint32 idx = 0;
-
-    /* Drop owned resources while all destructor implementations are still
-     * live. This must precede both nested-component and core deinstantiation.
-     */
+    comp_instance->deinstantiating = true;
     if (comp_instance->table) {
-        wasm_component_table_destroy(comp_instance->table);
+        wasm_component_table_seal(comp_instance->table);
+    }
+    for (idx = 0; idx < comp_instance->defined_instances_count; idx++) {
+        component_mark_deinstantiating_and_seal(
+            comp_instance->defined_instances[idx], depth + 1);
+    }
+}
+
+static bool
+component_destroy_resource_tables_marked(WASMComponentInstance *comp_instance,
+                                         uint32 depth)
+{
+    uint32 idx;
+
+    if (!comp_instance)
+        return true;
+    if (depth > MAX_DEPTH_RECURSION)
+        return false;
+
+    if (comp_instance->table) {
+        if (!wasm_component_table_destroy(comp_instance->table))
+            return false;
         comp_instance->table = NULL;
     }
 
-    // Free nested component instances
+    for (idx = 0; idx < comp_instance->defined_instances_count; idx++) {
+        if (!component_destroy_resource_tables_marked(
+                comp_instance->defined_instances[idx], depth + 1))
+            return false;
+    }
+    return true;
+}
+
+static void
+component_deinstantiate_storage_marked(WASMComponentInstance *comp_instance,
+                                       uint32 depth)
+{
+    uint32 idx;
+
+    if (!comp_instance || depth > MAX_DEPTH_RECURSION)
+        return;
+
     for (idx = 0; idx < comp_instance->defined_instances_count; idx++) {
         if (comp_instance->defined_instances[idx]) {
-            wasm_component_deinstantiate(comp_instance->defined_instances[idx]);
+            component_deinstantiate_storage_marked(
+                comp_instance->defined_instances[idx], depth + 1);
             comp_instance->defined_instances[idx] = NULL;
         }
     }
 
-    // Free core instances after every component resource has been dropped
+    /* The graph-wide resource-table pass has completed, so no remaining
+       resource destructor can call into this node or any sibling core. */
     for (idx = 0; idx < comp_instance->defined_core_instances_count; idx++) {
-        if (!comp_instance->defined_core_instances[idx]->e) {
-            wasm_runtime_free(
-                comp_instance->defined_core_instances
-                    [idx]); // This instance was generated from exports list,
-                            // not from a core module
+        WASMModuleInstance *core_instance =
+            comp_instance->defined_core_instances[idx];
+
+        if (!core_instance) {
+            continue;
         }
-        else
-            wasm_deinstantiate(comp_instance->defined_core_instances[idx],
-                               false);
+        if (!core_instance->e) {
+            /* Synthesized export-only core instances have no interpreter
+             * extra state, but are still runtime-owned quota allocations. */
+            wasm_runtime_free(core_instance);
+        }
+        else {
+            wasm_deinstantiate(core_instance, false);
+        }
         comp_instance->defined_core_instances[idx] = NULL;
     }
 
-    // Free runtime canonical options for component functions (canon.lift)
     for (idx = 0; idx < comp_instance->defined_functions_count; idx++) {
         WASMComponentFunctionInstance *func =
             &comp_instance->defined_functions[idx];
-        if (func && func->canon_options) {
+        if (func->canon_options) {
+            free_canonical_options(func->canon_options);
+            func->canon_options = NULL;
+        }
+    }
+    for (idx = 0; idx < comp_instance->defined_core_functions_count; idx++) {
+        WASMFunctionInstance *func =
+            &comp_instance->defined_core_functions[idx];
+        if (func->canon_options) {
             free_canonical_options(func->canon_options);
             func->canon_options = NULL;
         }
     }
 
-    // Free runtime canonical options for core functions (canon.lower)
-    for (idx = 0; idx < comp_instance->defined_core_functions_count; idx++) {
-        WASMFunctionInstance *func =
-            &comp_instance->defined_core_functions[idx];
-        if (func && func->canon_options) {
-            free_canonical_options(func->canon_options);
-            func->canon_options = NULL;
-        }
+    if (comp_instance->owned_export_names) {
+        wasm_runtime_free(comp_instance->owned_export_names);
+        comp_instance->owned_export_names = NULL;
+        comp_instance->owned_export_names_count = 0;
     }
 
 #if WASM_ENABLE_LIBC_WASI_P2 != 0
     if (comp_instance->wasi_ctx && !comp_instance->parent) {
-        // destroy component wasi context
         wasm_component_runtime_destroy_wasi(comp_instance);
     }
 #endif
+    if (comp_instance->lifecycle_lock_initialized) {
+        os_mutex_destroy(&comp_instance->lifecycle_lock);
+        comp_instance->lifecycle_lock_initialized = false;
+    }
+    if (comp_instance->operation_lock_initialized) {
+        os_mutex_destroy(&comp_instance->operation_lock);
+        comp_instance->operation_lock_initialized = false;
+    }
     wasm_runtime_free(comp_instance);
-    comp_instance = NULL;
+}
+
+void
+wasm_component_deinstantiate(WASMComponentInstance *comp_instance)
+{
+    WASMAllocationQuotaScope quota_scope;
+    WASMComponentInstance *root;
+    bool lifecycle_locked = false;
+    bool lifecycle_gate_held = false;
+
+    if (!comp_instance) {
+        return;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&quota_scope,
+                                                          comp_instance)) {
+        LOG_ERROR("component: allocation quota owner scope could not be "
+                  "established for deinstantiation");
+        return;
+    }
+    root = component_instance_lifecycle_root(comp_instance);
+    if (!root) {
+        LOG_ERROR("component: lifecycle root lock is not initialized");
+        goto done;
+    }
+    if (root != comp_instance) {
+        LOG_ERROR("component: an owned nested instance must be deinstantiated "
+                  "with its lifecycle root");
+        goto done;
+    }
+    if (!component_lifecycle_gate_enter(root)) {
+        LOG_ERROR("component: reentrant deinstantiation was rejected");
+        goto done;
+    }
+    lifecycle_gate_held = true;
+    if (!root->lifecycle_lock_initialized) {
+        LOG_ERROR("component: lifecycle root lock is not initialized");
+        goto done;
+    }
+
+    os_mutex_lock(&root->lifecycle_lock);
+    lifecycle_locked = true;
+    if ((BH_ATOMIC_32_LOAD(root->lifecycle_gate_state)
+         & COMPONENT_LIFECYCLE_GATE_CLOSED)
+            != 0
+        || root->deinstantiating || comp_instance->deinstantiating) {
+        LOG_ERROR("component: reentrant deinstantiation was rejected");
+        goto done;
+    }
+    if (root->lifecycle_active_operations > 0) {
+        LOG_ERROR("component: deinstantiation rejected while an operation is "
+                  "active");
+        goto done;
+    }
+    if (!component_instance_bind_lifecycle_root(comp_instance, root, 0)) {
+        snprintf(comp_instance->cur_exception,
+                 sizeof(comp_instance->cur_exception),
+                 "Exception: component lifecycle graph is too deep");
+        goto done;
+    }
+    if (!component_instance_owner_graph_is_valid(comp_instance, comp_instance,
+                                                 0)) {
+        snprintf(comp_instance->cur_exception,
+                 sizeof(comp_instance->cur_exception),
+                 "Exception: component allocation quota owner graph is "
+                 "inconsistent");
+        goto done;
+    }
+    if (component_has_outstanding_prepared_calls(comp_instance, 0)) {
+        snprintf(comp_instance->cur_exception,
+                 sizeof(comp_instance->cur_exception),
+                 "Exception: component has outstanding prepared calls");
+        goto done;
+    }
+
+    /* Mark the complete owned graph before running resource callbacks. This
+     * prevents a callback from creating a prepared call while teardown is in
+     * progress, and the preflight above guarantees teardown is all-or-none. */
+    BH_ATOMIC_32_FETCH_OR(root->lifecycle_gate_state,
+                          COMPONENT_LIFECYCLE_GATE_CLOSED);
+    component_mark_deinstantiating_and_seal(comp_instance, 0);
+    os_mutex_unlock(&root->lifecycle_lock);
+    lifecycle_locked = false;
+    component_lifecycle_gate_leave(root);
+    lifecycle_gate_held = false;
+    while ((BH_ATOMIC_32_LOAD(root->lifecycle_gate_state)
+            & COMPONENT_LIFECYCLE_GATE_USERS_MASK)
+           != 0) {
+        os_usleep(0);
+    }
+    if (!component_destroy_resource_tables_marked(comp_instance, 0)) {
+        LOG_ERROR("component: failed to destroy every resource table; "
+                  "retaining core instances to avoid destructor UAF");
+        goto done;
+    }
+    component_deinstantiate_storage_marked(comp_instance, 0);
+
+done:
+    if (lifecycle_locked) {
+        os_mutex_unlock(&root->lifecycle_lock);
+    }
+    if (lifecycle_gate_held) {
+        component_lifecycle_gate_leave(root);
+    }
+    wasm_allocation_quota_scope_leave(&quota_scope);
 }
 
 WASMComponentFunctionInstance *
@@ -2906,6 +3477,8 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
 #endif
     uint64 app_offset = 0, ptr_len = 0;
     int n_fps = 0;
+    HostResourcePinScope host_resource_scope;
+    bool host_resource_scope_active = false;
 
 #if WASM_ENABLE_SIMD != 0 && WASM_ENABLE_FAST_INTERP != 0
     /* SIMD assembly: each xmm slot = 16 bytes = 2 uint64 slots */
@@ -3051,6 +3624,32 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
         argv_src += 2;
     }
 
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    if (!host_resource_pin_scope_enter_for_unwind_target(
+            &host_resource_scope, exec_env->jmpbuf_stack_top)) {
+#else
+    if (!host_resource_pin_scope_enter(&host_resource_scope)) {
+#endif
+        wasm_set_exception(module, "failed to enter host resource pin scope");
+        goto fail;
+    }
+    host_resource_scope_active = true;
+
+#if WASM_ENABLE_INTERP != 0 && WASM_ENABLE_FAST_INTERP != 0
+    /* Argument validation, adapter allocation, and host-resource pinning are
+       all pre-entry work. Commit transferred own parameters only after those
+       fallible prerequisites and immediately before invoking host code. */
+    if (!wasm_exec_env_consume_call_pre_entry(exec_env)) {
+        if (!wasm_get_exception(module)) {
+            wasm_set_exception(
+                module, wasm_exec_env_call_pre_entry_is_terminated(exec_env)
+                            ? "terminated before function entry"
+                            : "component: pre-entry callback failed");
+        }
+        goto fail;
+    }
+#endif
+
     exec_env->attachment = attachment;
     if (result_count == 0) {
         invokeNative_Void(func_ptr, argv1, n_stacks);
@@ -3107,6 +3706,8 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
         }
     }
     exec_env->attachment = saved_attachment;
+    host_resource_pin_scope_leave(&host_resource_scope);
+    host_resource_scope_active = false;
 
     subtask->state = SUBTASK_STATE_RETURNED;
 
@@ -3115,6 +3716,8 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     ret = !wasm_copy_exception(module, NULL);
 
 fail:
+    if (host_resource_scope_active)
+        host_resource_pin_scope_leave(&host_resource_scope);
     exec_env->attachment = saved_attachment;
     exec_env->cx = saved_cx;
     exec_env->memory = saved_memory;

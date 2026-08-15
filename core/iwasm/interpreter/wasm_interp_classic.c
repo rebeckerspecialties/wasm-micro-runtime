@@ -1502,6 +1502,10 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
 
         wit_value_t args = NULL;
         wit_value_t results = NULL;
+        CanonicalResourceTransferScope param_lift_scope = { 0 };
+        CanonicalResourceTransferScope param_lower_scope = { 0 };
+        CanonicalResourceTransferScope result_lift_scope = { 0 };
+        CanonicalResourceTransferScope result_lower_scope = { 0 };
 
         FlatTypes flat_param_types;
         flat_types_init(&flat_param_types);
@@ -1581,6 +1585,13 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         vi_init(&vi, core_args, total_flat_params);
 
         // 1. CANON LOWER — lift Caller's flat params to WIT values
+        if (!canonical_resource_transfer_scope_enter(
+                &param_lift_scope, &cx_lower,
+                WASM_COMPONENT_TABLE_TRANSACTION_LIFT)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to begin parameter lift");
+            goto canon_cleanup;
+        }
         if (!lift_flat_values(&cx_lower, MAX_FLAT_PARAMS, &vi, ft->params, NULL,
                               &args)) {
             wasm_set_exception(module_inst,
@@ -1591,10 +1602,27 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         // 2. CANON LIFT — lower WIT params to Callee's flat representation
         CoreValueList flat_args_callee;
         cvl_init(&flat_args_callee);
+        if (!canonical_resource_transfer_scope_enter(
+                &param_lower_scope, &cx_lift,
+                WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to begin parameter lower");
+            goto canon_cleanup;
+        }
         if (!lower_flat_values(&cx_lift, MAX_FLAT_PARAMS, args, ft->params,
                                NULL, NULL, &flat_args_callee)) {
             wasm_set_exception(module_inst,
                                "component: failed to lower parameters");
+            goto canon_cleanup;
+        }
+        if (!canonical_resource_transfer_scope_can_commit(&param_lower_scope)
+            || !canonical_resource_transfer_scope_can_commit(&param_lift_scope)
+            || !canonical_resource_transfer_scope_leave(&param_lower_scope,
+                                                        true)
+            || !canonical_resource_transfer_scope_leave(&param_lift_scope,
+                                                        true)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to transfer parameters");
             goto canon_cleanup;
         }
 
@@ -1741,6 +1769,13 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         CoreValueIter result_vi;
         vi_init(&result_vi, core_results, num_wasm_results);
 
+        if (!canonical_resource_transfer_scope_enter(
+                &result_lift_scope, &cx_lift,
+                WASM_COMPONENT_TABLE_TRANSACTION_LIFT)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to begin result lift");
+            goto canon_cleanup;
+        }
         if (!lift_flat_values(&cx_lift, MAX_FLAT_RESULTS, &result_vi, NULL,
                               ft->results, &results)) {
             wasm_set_exception(module_inst,
@@ -1751,6 +1786,13 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         // 5. CANON LOWER — lower WIT results into Caller's flat representation
         CoreValueList flat_results_caller;
         cvl_init(&flat_results_caller);
+        if (!canonical_resource_transfer_scope_enter(
+                &result_lower_scope, &cx_lower,
+                WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to begin result lower");
+            goto canon_cleanup;
+        }
         if (!lower_flat_values(&cx_lower, MAX_FLAT_RESULTS, results, NULL,
                                ft->results, &vi, &flat_results_caller)) {
             wasm_set_exception(module_inst,
@@ -1853,9 +1895,32 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
             }
         }
 
-        prev_frame->sp += cell_idx; // advance the stack pointer
+        if (!canonical_resource_transfer_scope_can_commit(&result_lower_scope)
+            || !canonical_resource_transfer_scope_can_commit(&result_lift_scope)
+            || !canonical_resource_transfer_scope_leave(&result_lower_scope,
+                                                        true)
+            || !canonical_resource_transfer_scope_leave(&result_lift_scope,
+                                                        true)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to publish results");
+            goto canon_cleanup;
+        }
+        prev_frame->sp += cell_idx; // publish results to the caller
 
     canon_cleanup:
+        if (result_lower_scope.active)
+            (void)canonical_resource_transfer_scope_leave(&result_lower_scope,
+                                                          false);
+        if (result_lift_scope.active
+            && !canonical_resource_transfer_scope_discard(&result_lift_scope))
+            (void)canonical_resource_transfer_scope_leave(&result_lift_scope,
+                                                          false);
+        if (param_lower_scope.active)
+            (void)canonical_resource_transfer_scope_leave(&param_lower_scope,
+                                                          false);
+        if (param_lift_scope.active)
+            (void)canonical_resource_transfer_scope_leave(&param_lift_scope,
+                                                          false);
         free_wit_value(args);
         free_wit_value(results);
         task_destroy(task);

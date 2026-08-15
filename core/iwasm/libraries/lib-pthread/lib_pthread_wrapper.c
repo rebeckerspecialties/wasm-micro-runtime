@@ -6,6 +6,7 @@
 #include "bh_common.h"
 #include "bh_log.h"
 #include "wasm_export.h"
+#include "wasm_allocation_quota.h"
 #include "../interpreter/wasm.h"
 #include "../common/wasm_runtime_common.h"
 #include "thread_manager.h"
@@ -1134,6 +1135,16 @@ posix_memalign_wrapper(wasm_exec_env_t exec_env, void **memptr, int32 align,
 
 #if WASM_ENABLE_LIB_PTHREAD_SEMAPHORE != 0
 
+static bool
+named_semaphore_allowed_for_current_owner(void)
+{
+    /* sem_info_map is process-global and its keys refer to guest-provided
+       names. It has no per-instance namespace or lifetime pinning, so sharing
+       it with a quota-owned hostile guest would permit cross-owner lookup and
+       leave native semaphores outside the quota. */
+    return wasm_allocation_quota_get_current() == NULL;
+}
+
 static int32
 sem_open_wrapper(wasm_exec_env_t exec_env, const char *name, int32 oflags,
                  int32 mode, int32 val)
@@ -1147,7 +1158,8 @@ sem_open_wrapper(wasm_exec_env_t exec_env, const char *name, int32 oflags,
      * For Unix like system, it's dedicated for multiple processes.
      */
 
-    if (!name) { /* avoid passing NULL to bh_hash_map_find and os_sem_open */
+    if (!named_semaphore_allowed_for_current_owner()
+        || !name) { /* avoid NULL map lookup and os_sem_open */
         return -1;
     }
 
@@ -1200,6 +1212,9 @@ sem_close_wrapper(wasm_exec_env_t exec_env, uint32 sem)
     int ret = -1;
     SemCallbackArgs args = { sem, NULL };
 
+    if (!named_semaphore_allowed_for_current_owner())
+        return -1;
+
     bh_hash_map_traverse(sem_info_map, sem_fetch_cb, &args);
 
     if (args.node) {
@@ -1218,6 +1233,9 @@ sem_wait_wrapper(wasm_exec_env_t exec_env, uint32 sem)
     (void)exec_env;
     SemCallbackArgs args = { sem, NULL };
 
+    if (!named_semaphore_allowed_for_current_owner())
+        return -1;
+
     bh_hash_map_traverse(sem_info_map, sem_fetch_cb, &args);
 
     if (args.node) {
@@ -1233,6 +1251,9 @@ sem_trywait_wrapper(wasm_exec_env_t exec_env, uint32 sem)
     (void)exec_env;
     SemCallbackArgs args = { sem, NULL };
 
+    if (!named_semaphore_allowed_for_current_owner())
+        return -1;
+
     bh_hash_map_traverse(sem_info_map, sem_fetch_cb, &args);
 
     if (args.node) {
@@ -1247,6 +1268,9 @@ sem_post_wrapper(wasm_exec_env_t exec_env, uint32 sem)
 {
     (void)exec_env;
     SemCallbackArgs args = { sem, NULL };
+
+    if (!named_semaphore_allowed_for_current_owner())
+        return -1;
 
     bh_hash_map_traverse(sem_info_map, sem_fetch_cb, &args);
 
@@ -1265,6 +1289,9 @@ sem_getvalue_wrapper(wasm_exec_env_t exec_env, uint32 sem, int32 *sval)
 
     (void)exec_env;
     SemCallbackArgs args = { sem, NULL };
+
+    if (!named_semaphore_allowed_for_current_owner())
+        return -1;
 
     if (validate_native_addr(sval, (uint64)sizeof(int32))) {
 
@@ -1285,7 +1312,8 @@ sem_unlink_wrapper(wasm_exec_env_t exec_env, const char *name)
 
     ThreadInfoNode *info_node;
 
-    if (!name) { /* avoid passing NULL to bh_hash_map_find */
+    if (!named_semaphore_allowed_for_current_owner()
+        || !name) { /* avoid passing NULL to bh_hash_map_find */
         return -1;
     }
 

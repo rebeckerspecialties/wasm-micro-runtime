@@ -21,6 +21,7 @@
  * build the component model and must not reference wasm.h. */
 #include "wasm.h"
 #include "wasm_component.h"
+#include "wasm_component_host_resource.h"
 #include "wasm_component_runtime.h"
 #endif
 #if WASM_ENABLE_LIBC_WASI != 0

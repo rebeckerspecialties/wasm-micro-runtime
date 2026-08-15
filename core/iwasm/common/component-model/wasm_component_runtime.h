@@ -14,6 +14,7 @@
 #include "wasm_component_resource_table.h"
 #include "mem_alloc.h"
 #include "wasm_export.h"
+#include "bh_atomic.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -462,6 +463,11 @@ typedef struct WASMComponentInstance {
     WASMComponentExportInstance *exports;
     uint32 exports_count;
 
+    /* Inline instance expressions synthesize export-name wrappers which are
+     * owned by the runtime instance rather than the loaded component. */
+    WASMComponentExportName *owned_export_names;
+    uint32 owned_export_names_count;
+
     void *defined_types;
     WASMFunctionInstance *defined_core_functions;
     WASMComponentFunctionInstance *defined_functions;
@@ -481,6 +487,21 @@ typedef struct WASMComponentInstance {
     uint32 defined_canon_opts_size;
 
     uint32 resources_count;
+    uint32 outstanding_prepared_calls;
+    uint32 lifecycle_active_operations;
+    struct WASMComponentInstance *lifecycle_root;
+    /* High bit closes the gate; low bits count callers which may touch the
+     * lifecycle mutex. Keeping both in one atomic word makes close-and-drain
+     * immune to a late entrant appearing after teardown observed zero. */
+    bh_atomic_32_t lifecycle_gate_state;
+    korp_mutex lifecycle_lock;
+    bool lifecycle_lock_initialized;
+    /* Public calls are serialized per root instance because the component
+     * handle table transfers ownership through raw entries.  Recursive host
+     * callbacks on the same native thread remain supported. */
+    korp_mutex operation_lock;
+    bool operation_lock_initialized;
+    bool deinstantiating;
     bool may_leave;
 
     union {
@@ -512,6 +533,25 @@ wasm_component_get_index_count(WASMComponent *component, char *error_buf,
 WASMComponentInstance *
 wasm_component_instance_allocate(WASMComponentIndexCount *index_count,
                                  char *error_buf, uint32 error_buf_size);
+
+/*
+ * Pin the root component-instance graph while a public operation is in
+ * progress.  The lifecycle lock is held only while changing the refcount;
+ * guest code and host callbacks must run after this function returns.
+ */
+bool
+wasm_component_instance_begin_operation(WASMComponentInstance *comp_instance);
+
+void
+wasm_component_instance_end_operation(WASMComponentInstance *comp_instance);
+
+bool
+wasm_component_instance_register_prepared_call(
+    WASMComponentInstance *comp_instance);
+
+bool
+wasm_component_instance_unregister_prepared_call(
+    WASMComponentInstance *comp_instance);
 
 bool
 wasm_get_inst_decl_size(WASMComponentInstType *instance_type,
@@ -604,6 +644,11 @@ wasm_component_application_execute_func(WASMComponentInstance *, char *argv);
 bool
 wasm_component_application_execute_func_ex(WASMComponentInstance *, char *argv,
                                            uint32 *argc1, uint32 **argv1);
+/* Internal WAVE adapter policy: resource-bearing values have no CLI ownership
+ * channel and are rejected before invocation. */
+bool
+wasm_component_application_wave_type_supported(
+    const WASMComponentTypeInstance *type);
 
 WASMComponentPreparedCall *
 wasm_component_prepare_export_call(WASMComponentInstance *comp_inst,

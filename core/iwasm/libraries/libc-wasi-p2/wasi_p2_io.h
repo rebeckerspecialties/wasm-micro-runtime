@@ -13,6 +13,8 @@
 
 struct WASMExecEnv;
 typedef struct WASMExecEnv *wasm_exec_env_t;
+struct HostResource;
+struct StreamResourceType;
 
 #ifdef __cplusplus
 extern "C" {
@@ -106,6 +108,50 @@ void
 wasi_output_stream_blocking_splice(wasi_output_stream_t stream,
                                    wasi_input_stream_t src, uint64_t len,
                                    wasi_result_u64_stream_error_t *ret);
+
+/* Resource-aware stream operations. File streams carry a logical cursor and
+ * use positional I/O so duplicating a filesystem descriptor never aliases its
+ * kernel cursor or append flags. Non-file streams delegate to the ordinary
+ * descriptor-based operations above. */
+void
+wasi_p2_stream_resource_read(struct StreamResourceType *stream, uint64_t len,
+                             bool blocking,
+                             wasi_result_list_u8_stream_error_t *ret);
+
+void
+wasi_p2_stream_resource_skip(struct StreamResourceType *stream, uint64_t len,
+                             bool blocking,
+                             wasi_result_u64_stream_error_t *ret);
+
+void
+wasi_p2_stream_resource_write(struct StreamResourceType *stream,
+                              const wasi_list_u8_t *payload, bool blocking,
+                              bool flush, wasi_result_void_stream_error_t *ret);
+
+void
+wasi_p2_stream_resource_write_zeroes(struct StreamResourceType *stream,
+                                     uint64_t len, bool blocking, bool flush,
+                                     wasi_result_void_stream_error_t *ret);
+
+void
+wasi_p2_stream_resources_splice(struct StreamResourceType *stream,
+                                struct StreamResourceType *src, uint64_t len,
+                                bool blocking,
+                                wasi_result_u64_stream_error_t *ret);
+
+void
+wasi_p2_callback_input_stream_to_resource_splice(
+    struct HostResource *src, struct StreamResourceType *stream, uint64_t len,
+    bool blocking, wasi_result_u64_stream_error_t *ret);
+
+/* Filesystem descriptor writes/truncates use the same lock as logical file
+ * streams so append selection and positional mutations are serialized across
+ * every guest-visible file operation in this process. */
+void
+wasi_p2_file_io_lock(void);
+
+void
+wasi_p2_file_io_unlock(void);
 
 void
 pollable_dtor(void *data);

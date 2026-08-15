@@ -42,12 +42,26 @@ struct WASMAllocationQuotaToken {
 #if defined(os_thread_local_attribute)
 static os_thread_local_attribute WASMAllocationQuotaToken
     *current_allocation_quota;
+static os_thread_local_attribute WASMAllocationQuotaThreadLease
+    *current_allocation_quota_thread_lease;
+static os_thread_local_attribute WASMAllocationQuotaScope
+    *current_allocation_quota_scope;
 #elif defined(_MSC_VER)
 static __declspec(thread) WASMAllocationQuotaToken *current_allocation_quota;
+static __declspec(thread)
+    WASMAllocationQuotaThreadLease *current_allocation_quota_thread_lease;
+static __declspec(thread)
+    WASMAllocationQuotaScope *current_allocation_quota_scope;
 #elif defined(__GNUC__) || defined(__clang__)
 static __thread WASMAllocationQuotaToken *current_allocation_quota;
+static __thread WASMAllocationQuotaThreadLease
+    *current_allocation_quota_thread_lease;
+static __thread WASMAllocationQuotaScope *current_allocation_quota_scope;
 #else
 static _Thread_local WASMAllocationQuotaToken *current_allocation_quota;
+static _Thread_local WASMAllocationQuotaThreadLease
+    *current_allocation_quota_thread_lease;
+static _Thread_local WASMAllocationQuotaScope *current_allocation_quota_scope;
 #endif
 
 #if WASM_ENABLE_SHARED_HEAP != 0
@@ -1273,6 +1287,8 @@ wasm_allocation_quota_scope_enter_token(WASMAllocationQuotaScope *scope,
         return false;
 
     scope->token = token;
+    scope->previous_scope = current_allocation_quota_scope;
+    current_allocation_quota_scope = scope;
     scope->previous = wasm_allocation_quota_set_current(token);
     scope->active = true;
     return true;
@@ -1337,6 +1353,188 @@ wasm_allocation_quota_scope_enter_for_allocation(
 }
 
 bool
+wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+    WASMAllocationQuotaBorrowedScope *scope, const void *allocation)
+{
+    WASMAllocationHeader *header;
+    WASMAllocationQuotaToken *current;
+
+    if (!scope || !allocation)
+        return false;
+    memset(scope, 0, sizeof(*scope));
+
+    header = wasm_allocation_header_from_user((void *)allocation);
+    if (!header)
+        return false;
+
+    current = wasm_allocation_quota_get_current();
+    if (!header->data.owner)
+        return current == NULL;
+    if (current && current != header->data.owner)
+        return false;
+
+    scope->token = header->data.owner;
+    scope->previous = wasm_allocation_quota_set_current(header->data.owner);
+    scope->active = true;
+    return true;
+}
+
+void
+wasm_allocation_quota_borrowed_scope_leave(
+    WASMAllocationQuotaBorrowedScope *scope)
+{
+    if (!scope || !scope->active)
+        return;
+
+    bh_assert(wasm_allocation_quota_get_current() == scope->token);
+    wasm_allocation_quota_set_current(scope->previous);
+    memset(scope, 0, sizeof(*scope));
+}
+
+bool
+wasm_allocation_quota_reservation_acquire_for_allocation(
+    WASMAllocationQuotaReservation *reservation, const void *allocation,
+    uint64 bytes, uint32 allocations)
+{
+    WASMAllocationHeader *header;
+    WASMAllocationQuotaToken *current;
+
+    if (!reservation || !allocation || (bytes == 0 && allocations == 0))
+        return false;
+    memset(reservation, 0, sizeof(*reservation));
+
+    header = wasm_allocation_header_from_user((void *)allocation);
+    if (!header)
+        return false;
+
+    current = wasm_allocation_quota_get_current();
+    if (!header->data.owner)
+        return current == NULL;
+    if (current && current != header->data.owner)
+        return false;
+    if (!wasm_allocation_quota_token_retain(header->data.owner))
+        return false;
+    if (!wasm_allocation_quota_token_reserve(header->data.owner, bytes,
+                                             allocations)) {
+        wasm_allocation_quota_token_release(header->data.owner);
+        return false;
+    }
+
+    reservation->token = header->data.owner;
+    reservation->bytes = bytes;
+    reservation->allocations = allocations;
+    reservation->active = true;
+    return true;
+}
+
+void
+wasm_allocation_quota_reservation_release(
+    WASMAllocationQuotaReservation *reservation)
+{
+    WASMAllocationQuotaToken *token;
+    uint64 bytes;
+    uint32 allocations;
+
+    if (!reservation || !reservation->active)
+        return;
+
+    token = reservation->token;
+    bytes = reservation->bytes;
+    allocations = reservation->allocations;
+    memset(reservation, 0, sizeof(*reservation));
+    wasm_allocation_quota_token_refund(token, bytes, allocations);
+    wasm_allocation_quota_token_release(token);
+}
+
+void
+wasm_allocation_quota_reservation_move(
+    WASMAllocationQuotaReservation *destination,
+    WASMAllocationQuotaReservation *source)
+{
+    if (!destination || !source || destination == source
+        || destination->active) {
+        return;
+    }
+
+    *destination = *source;
+    memset(source, 0, sizeof(*source));
+}
+
+bool
+wasm_allocation_quota_thread_lease_enter_for_allocation(
+    WASMAllocationQuotaThreadLease *lease, const void *allocation)
+{
+    WASMAllocationHeader *header;
+    WASMAllocationQuotaToken *current;
+
+    if (!lease || !allocation || current_allocation_quota_thread_lease)
+        return false;
+    memset(lease, 0, sizeof(*lease));
+
+    header = wasm_allocation_header_from_user((void *)allocation);
+    if (!header)
+        return false;
+    current = wasm_allocation_quota_get_current();
+    if (!header->data.owner)
+        return current == NULL;
+    if (current && current != header->data.owner)
+        return false;
+    if (!wasm_allocation_quota_token_retain(header->data.owner))
+        return false;
+
+    lease->token = header->data.owner;
+    lease->previous = wasm_allocation_quota_set_current(header->data.owner);
+    lease->active = true;
+    current_allocation_quota_thread_lease = lease;
+    return true;
+}
+
+void
+wasm_allocation_quota_thread_lease_leave(WASMAllocationQuotaThreadLease *lease)
+{
+    WASMAllocationQuotaToken *token;
+
+    if (!lease || !lease->active)
+        return;
+
+    token = lease->token;
+    bh_assert(current_allocation_quota_thread_lease == lease);
+    current_allocation_quota_thread_lease = NULL;
+    wasm_allocation_quota_set_current(lease->previous);
+    memset(lease, 0, sizeof(*lease));
+    wasm_allocation_quota_token_release(token);
+}
+
+void
+wasm_allocation_quota_thread_scope_unwind_current(void)
+{
+    WASMAllocationQuotaScope *scope;
+
+    /* A guest pthread_exit can bypass every active C frame. Release retained
+       scopes in LIFO order while their abandoned stack records are valid. */
+    while ((scope = current_allocation_quota_scope) != NULL) {
+        WASMAllocationQuotaToken *token = scope->token;
+
+        current_allocation_quota_scope = scope->previous_scope;
+        wasm_allocation_quota_set_current(scope->previous);
+        memset(scope, 0, sizeof(*scope));
+        wasm_allocation_quota_token_release(token);
+    }
+}
+
+void
+wasm_allocation_quota_thread_lease_leave_current(void)
+{
+    WASMAllocationQuotaThreadLease *lease =
+        current_allocation_quota_thread_lease;
+
+    wasm_allocation_quota_thread_scope_unwind_current();
+
+    if (lease)
+        wasm_allocation_quota_thread_lease_leave(lease);
+}
+
+bool
 wasm_allocation_quota_allocations_share_owner(const void *first,
                                               const void *second)
 {
@@ -1372,6 +1570,8 @@ wasm_allocation_quota_scope_leave(WASMAllocationQuotaScope *scope)
 
     token = scope->token;
     bh_assert(wasm_allocation_quota_get_current() == token);
+    bh_assert(current_allocation_quota_scope == scope);
+    current_allocation_quota_scope = scope->previous_scope;
     wasm_allocation_quota_set_current(scope->previous);
     memset(scope, 0, sizeof(*scope));
     wasm_allocation_quota_token_release(token);
@@ -1591,6 +1791,11 @@ wasm_runtime_realloc(void *ptr, unsigned int size)
         LOG_ERROR("wasm_runtime_realloc failed: invalid allocation header\n");
         return NULL;
     }
+    if (wasm_allocation_quota_get_current()
+        && header->data.owner != wasm_allocation_quota_get_current()) {
+        LOG_ERROR("wasm_runtime_realloc failed: allocation owner mismatch\n");
+        return NULL;
+    }
 
     old_header = *header;
     if (old_header.data.explicitly_aligned)
@@ -1678,6 +1883,11 @@ wasm_runtime_free(void *ptr)
     header = wasm_allocation_header_from_user(ptr);
     if (!header) {
         LOG_ERROR("wasm_runtime_free failed: invalid allocation header\n");
+        return;
+    }
+    if (wasm_allocation_quota_get_current()
+        && header->data.owner != wasm_allocation_quota_get_current()) {
+        LOG_ERROR("wasm_runtime_free failed: allocation owner mismatch\n");
         return;
     }
 

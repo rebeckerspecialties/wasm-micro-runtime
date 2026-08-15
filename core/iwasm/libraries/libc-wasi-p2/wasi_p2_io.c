@@ -15,6 +15,7 @@
 #include "wasi_p2_host_io.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -50,6 +51,12 @@ typedef struct FlushingStreamNode {
     struct FlushingStreamNode *next;
 } FlushingStreamNode;
 
+typedef struct FlushingStreamReservation {
+    FlushingStreamNode *node;
+    bool regular_file;
+    bool track_output_queue;
+} FlushingStreamReservation;
+
 /**
  * @brief The head of the global linked list of flushing streams. Access to this
  *        list must be protected by the `flushing_streams_list_lock`.
@@ -61,11 +68,30 @@ static FlushingStreamNode *flushing_streams_list = NULL;
  */
 static pthread_mutex_t flushing_streams_list_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* A duplicated descriptor shares its open-file description. Keep every
+ * guest-visible positional file mutation under one lock so logical stream
+ * cursors and append-at-EOF selection remain race-free without changing the
+ * descriptor resource's kernel cursor or status flags. */
+static pthread_mutex_t file_io_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void
+wasi_p2_file_io_lock(void)
+{
+    pthread_mutex_lock(&file_io_lock);
+}
+
+void
+wasi_p2_file_io_unlock(void)
+{
+    pthread_mutex_unlock(&file_io_lock);
+}
+
 #if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_THREAD_MGR != 0
 struct WasiP2WaitInterrupt {
     int read_fd;
     int write_fd;
     bool interrupted;
+    WasiP2NativeFdQuotaLease fd_lease;
 };
 
 static bool
@@ -106,6 +132,11 @@ wait_interrupt_get(wasm_exec_env_t exec_env)
     memset(interrupt, 0, sizeof(*interrupt));
     interrupt->read_fd = -1;
     interrupt->write_fd = -1;
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 2, &interrupt->fd_lease)) {
+        wasm_runtime_free(interrupt);
+        os_mutex_unlock(&exec_env->wait_lock);
+        return NULL;
+    }
     if (pipe(fds) != 0 || !wait_interrupt_set_nonblocking_cloexec(fds[0])
         || !wait_interrupt_set_nonblocking_cloexec(fds[1])) {
         if (fds[0] >= 0) {
@@ -114,6 +145,7 @@ wait_interrupt_get(wasm_exec_env_t exec_env)
         if (fds[1] >= 0) {
             close(fds[1]);
         }
+        wasi_p2_native_fd_quota_release(&interrupt->fd_lease);
         wasm_runtime_free(interrupt);
         os_mutex_unlock(&exec_env->wait_lock);
         return NULL;
@@ -197,6 +229,7 @@ wasi_p2_interrupt_wait_destroy(wasm_exec_env_t exec_env)
         if (interrupt->write_fd >= 0) {
             close(interrupt->write_fd);
         }
+        wasi_p2_native_fd_quota_release(&interrupt->fd_lease);
         wasm_runtime_free(interrupt);
     }
 }
@@ -214,23 +247,67 @@ wasi_p2_interrupt_wait_destroy(wasm_exec_env_t exec_env)
 }
 #endif
 
-/**
- * @brief Adds an output stream to the global list of flushing streams.
- * @details This is an internal helper function, likely called when a `flush`
- *          operation is initiated on a stream. Thread safety is handled by
- *          the calling function.
- * @param stream The output stream handle to add to the list.
- */
 static void
-add_to_flushing_list(wasi_output_stream_t stream)
+set_flush_error(wasi_result_void_stream_error_t *ret, int error)
 {
-    FlushingStreamNode *node = wasm_runtime_malloc(sizeof(FlushingStreamNode));
-    if (!node)
-        return;
+    ret->is_err = true;
+    ret->u.err.kind = WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED;
+    ret->u.err.payload.error = error;
+}
 
-    node->stream = stream;
-    node->next = flushing_streams_list;
-    flushing_streams_list = node;
+static void
+release_flushing_stream_reservation(FlushingStreamReservation *reservation)
+{
+    if (reservation && reservation->node) {
+        wasm_runtime_free(reservation->node);
+        reservation->node = NULL;
+    }
+}
+
+/* Reserve every quota-sensitive flush-tracking allocation before a caller can
+ * mutate the stream.  Regular files and FIFOs never enter the tracking list;
+ * Darwin also has no TIOCOUTQ path and therefore never needs a node. */
+static bool
+prepare_flushing_stream_reservation(wasi_output_stream_t stream,
+                                    FlushingStreamReservation *reservation,
+                                    wasi_result_void_stream_error_t *ret)
+{
+    struct stat statbuf;
+
+    memset(reservation, 0, sizeof(*reservation));
+    if (fstat(stream, &statbuf) < 0) {
+        set_flush_error(ret, errno);
+        return false;
+    }
+
+    reservation->regular_file = S_ISREG(statbuf.st_mode);
+    if (reservation->regular_file || S_ISFIFO(statbuf.st_mode)) {
+        return true;
+    }
+
+#if defined(__APPLE__)
+    return true;
+#else
+    reservation->track_output_queue = true;
+    reservation->node = wasm_runtime_malloc(sizeof(*reservation->node));
+    if (!reservation->node) {
+        set_flush_error(ret, ENOMEM);
+        return false;
+    }
+    reservation->node->stream = stream;
+    reservation->node->next = NULL;
+    return true;
+#endif
+}
+
+/* Thread safety is handled by the caller.  Ownership of the reserved node is
+ * transferred to the flushing list without another allocation. */
+static void
+add_reserved_to_flushing_list(FlushingStreamReservation *reservation)
+{
+    reservation->node->next = flushing_streams_list;
+    flushing_streams_list = reservation->node;
+    reservation->node = NULL;
 }
 
 /**
@@ -284,6 +361,16 @@ remove_from_flushing_list(wasi_output_stream_t stream)
         p = &(*p)->next;
     }
 }
+
+static void
+output_stream_flush_reserved(wasi_output_stream_t stream,
+                             FlushingStreamReservation *reservation,
+                             wasi_result_void_stream_error_t *ret);
+
+static void
+output_stream_blocking_flush_reserved(wasi_output_stream_t stream,
+                                      FlushingStreamReservation *reservation,
+                                      wasi_result_void_stream_error_t *ret);
 
 // wasi:io/poll
 
@@ -649,6 +736,21 @@ wasi_poll(const wasi_pollable_context_t **pollables, uint32_t n_pollables,
 
 // wasi:io/streams
 
+/* A zero-length read must not consume input, but it still must not turn an
+ * invalid or write-only descriptor into a successful input stream. */
+static void
+validate_zero_length_input_stream(wasi_input_stream_t stream,
+                                  wasi_result_list_u8_stream_error_t *ret)
+{
+    int flags = fcntl(stream, F_GETFL, 0);
+
+    if (flags < 0 || (flags & O_ACCMODE) == O_WRONLY) {
+        ret->is_err = true;
+        ret->u.err.kind = WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED;
+        ret->u.err.payload.error = flags < 0 ? errno : EBADF;
+    }
+}
+
 /**
  * @brief Perform a non-blocking read from an input stream.
  * @details Implements the `read` method on the `input-stream` resource from the
@@ -667,11 +769,26 @@ void
 wasi_input_stream_read(wasi_input_stream_t stream, uint64_t len,
                        wasi_result_list_u8_stream_error_t *ret)
 {
+    uint8_t *buf = NULL;
+    ssize_t s;
+
     if (!ret) {
         return;
     }
+    memset(ret, 0, sizeof(*ret));
 
-    uint8_t *buf = wasm_runtime_malloc(len);
+    if (len == 0) {
+        validate_zero_length_input_stream(stream, ret);
+        return;
+    }
+    if (len > UINT32_MAX) {
+        ret->is_err = true;
+        ret->u.err.kind = WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED;
+        ret->u.err.payload.error = EOVERFLOW;
+        return;
+    }
+
+    buf = wasm_runtime_malloc((uint32_t)len);
     if (!buf) {
         ret->is_err = true;
         ret->u.err.kind = WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED;
@@ -679,19 +796,22 @@ wasi_input_stream_read(wasi_input_stream_t stream, uint64_t len,
         return;
     }
 
-    ssize_t s = read(stream, buf, len);
+    s = read(stream, buf, (size_t)len);
     if (s < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        int read_error = errno;
+
+        wasm_runtime_free(buf);
+        buf = NULL;
+        if (read_error == EAGAIN || read_error == EWOULDBLOCK) {
             ret->is_err = false;
             ret->u.ok.buf = NULL;
             ret->u.ok.buf_len = 0;
             return;
         }
         else {
-            wasm_runtime_free(buf);
             ret->is_err = true;
             ret->u.err.kind = WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED;
-            ret->u.err.payload.error = errno;
+            ret->u.err.payload.error = read_error;
             return;
         }
     }
@@ -700,31 +820,6 @@ wasi_input_stream_read(wasi_input_stream_t stream, uint64_t len,
         ret->is_err = true;
         ret->u.err.kind = WASI_STREAM_ERROR_KIND_CLOSED;
         return;
-    }
-
-    if (len == 0) {
-        ret->is_err = false;
-        ret->u.ok.buf = NULL;
-        ret->u.ok.buf_len = 0;
-        return;
-    }
-
-    if ((uint64_t)s < len) {
-        if (s > 0) {
-            uint8_t *new_buf = wasm_runtime_realloc(buf, s);
-            if (!new_buf) {
-                wasm_runtime_free(buf);
-                ret->is_err = true;
-                ret->u.err.kind = WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED;
-                ret->u.err.payload.error = ENOMEM;
-                return;
-            }
-            buf = new_buf;
-        }
-        else {
-            wasm_runtime_free(buf);
-            buf = NULL;
-        }
     }
 
     ret->is_err = false;
@@ -751,6 +846,18 @@ wasi_input_stream_blocking_read(wasi_input_stream_t stream, uint64_t len,
                                 wasi_result_list_u8_stream_error_t *ret)
 {
     if (!ret) {
+        return;
+    }
+    memset(ret, 0, sizeof(*ret));
+
+    if (len == 0) {
+        validate_zero_length_input_stream(stream, ret);
+        return;
+    }
+    if (len > UINT32_MAX) {
+        ret->is_err = true;
+        ret->u.err.kind = WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED;
+        ret->u.err.payload.error = EOVERFLOW;
         return;
     }
 
@@ -1099,15 +1206,12 @@ wasi_output_stream_write(wasi_output_stream_t stream,
  * @param[out] ret A pointer to the result struct. On success, `is_err` is
  * false. On failure, it contains a stream error.
  */
-void
-wasi_output_stream_blocking_write_and_flush(
+static void
+output_stream_blocking_write_and_flush_reserved(
     wasi_output_stream_t stream, const wasi_list_u8_t *payload,
+    FlushingStreamReservation *reservation,
     wasi_result_void_stream_error_t *ret)
 {
-    if (!payload || !ret) {
-        return;
-    }
-
     uint64_t remaining = payload->buf_len;
     uint8_t *buf = payload->buf;
     wasi_pollable_context_t pollable = { .fd = stream,
@@ -1123,7 +1227,7 @@ wasi_output_stream_blocking_write_and_flush(
         if (check_res.is_err) {
             ret->is_err = true;
             ret->u.err = check_res.u.err;
-            return;
+            goto cleanup;
         }
 
         uint64_t n = check_res.u.ok;
@@ -1140,7 +1244,7 @@ wasi_output_stream_blocking_write_and_flush(
         if (write_res.is_err) {
             ret->is_err = true;
             ret->u.err = write_res.u.err;
-            return;
+            goto cleanup;
         }
 
         // Advance the buffer pointer and update the remaining byte count.
@@ -1150,7 +1254,28 @@ wasi_output_stream_blocking_write_and_flush(
 
     // After all bytes have been written, perform a blocking flush to ensure
     // all data is sent to its final destination.
-    wasi_output_stream_blocking_flush(stream, ret);
+    output_stream_blocking_flush_reserved(stream, reservation, ret);
+
+cleanup:
+    return;
+}
+
+void
+wasi_output_stream_blocking_write_and_flush(
+    wasi_output_stream_t stream, const wasi_list_u8_t *payload,
+    wasi_result_void_stream_error_t *ret)
+{
+    FlushingStreamReservation reservation;
+
+    if (!payload || !ret) {
+        return;
+    }
+    if (!prepare_flushing_stream_reservation(stream, &reservation, ret)) {
+        return;
+    }
+    output_stream_blocking_write_and_flush_reserved(stream, payload,
+                                                    &reservation, ret);
+    release_flushing_stream_reservation(&reservation);
 }
 
 /**
@@ -1166,27 +1291,16 @@ wasi_output_stream_blocking_write_and_flush(
  * @param[out] ret A pointer to the result struct. On success, `is_err` is
  * false. On failure, it contains a stream error.
  */
-void
-wasi_output_stream_flush(wasi_output_stream_t stream,
-                         wasi_result_void_stream_error_t *ret)
+static void
+output_stream_flush_reserved(wasi_output_stream_t stream,
+                             FlushingStreamReservation *reservation,
+                             wasi_result_void_stream_error_t *ret)
 {
-    if (!ret) {
-        return;
-    }
-
-    struct stat statbuf;
-    if (fstat(stream, &statbuf) < 0) {
-        ret->is_err = true;
-        ret->u.err.kind = WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED;
-        ret->u.err.payload.error = errno;
-        return;
-    }
-
-    if (S_ISREG(statbuf.st_mode) || S_ISFIFO(statbuf.st_mode)) {
+    if (!reservation->track_output_queue) {
         // For regular files and pipes, flush is a no-op because writes are
         // generally buffered by the OS or immediately available. The
-        // blocking-flush function is responsible for ensuring data is
-        // physically written to disk (for files).
+        // blocking-flush function is responsible for fsync on files. Darwin
+        // also has no TIOCOUTQ support, so socket flushes complete here.
         ret->is_err = false;
         return;
     }
@@ -1216,13 +1330,34 @@ wasi_output_stream_flush(wasi_output_stream_t stream,
     // If there is data in the output queue, mark the stream as flushing.
     if (queue_size > 0) {
         if (!is_in_flushing_list(stream)) {
-            add_to_flushing_list(stream);
+            if (!reservation->node) {
+                pthread_mutex_unlock(&flushing_streams_list_lock);
+                set_flush_error(ret, ENOMEM);
+                return;
+            }
+            add_reserved_to_flushing_list(reservation);
         }
     }
 
     pthread_mutex_unlock(&flushing_streams_list_lock);
 
     ret->is_err = false;
+}
+
+void
+wasi_output_stream_flush(wasi_output_stream_t stream,
+                         wasi_result_void_stream_error_t *ret)
+{
+    FlushingStreamReservation reservation;
+
+    if (!ret) {
+        return;
+    }
+    if (!prepare_flushing_stream_reservation(stream, &reservation, ret)) {
+        return;
+    }
+    output_stream_flush_reserved(stream, &reservation, ret);
+    release_flushing_stream_reservation(&reservation);
 }
 
 /**
@@ -1235,17 +1370,13 @@ wasi_output_stream_flush(wasi_output_stream_t stream,
  * @param[out] ret A pointer to the result struct. On success, `is_err` is
  * false. On failure, it contains a stream error.
  */
-void
-wasi_output_stream_blocking_flush(wasi_output_stream_t stream,
-                                  wasi_result_void_stream_error_t *ret)
+static void
+output_stream_blocking_flush_reserved(wasi_output_stream_t stream,
+                                      FlushingStreamReservation *reservation,
+                                      wasi_result_void_stream_error_t *ret)
 {
-    if (!ret) {
-        return;
-    }
-
     // For regular files, fsync is the correct blocking flush operation.
-    struct stat statbuf;
-    if (fstat(stream, &statbuf) == 0 && S_ISREG(statbuf.st_mode)) {
+    if (reservation->regular_file) {
         if (fsync(stream) != 0) {
             // fsync can fail with EINVAL or EROFS on file systems that
             // don't support it for the given descriptor. In these cases,
@@ -1264,7 +1395,7 @@ wasi_output_stream_blocking_flush(wasi_output_stream_t stream,
     // For other stream types (sockets, pipes), use the polling mechanism.
     // 1. Initiate the flush.
     wasi_result_void_stream_error_t flush_res;
-    wasi_output_stream_flush(stream, &flush_res);
+    output_stream_flush_reserved(stream, reservation, &flush_res);
     if (flush_res.is_err) {
         *ret = flush_res;
         return;
@@ -1295,6 +1426,22 @@ wasi_output_stream_blocking_flush(wasi_output_stream_t stream,
     }
 
     ret->is_err = false;
+}
+
+void
+wasi_output_stream_blocking_flush(wasi_output_stream_t stream,
+                                  wasi_result_void_stream_error_t *ret)
+{
+    FlushingStreamReservation reservation;
+
+    if (!ret) {
+        return;
+    }
+    if (!prepare_flushing_stream_reservation(stream, &reservation, ret)) {
+        return;
+    }
+    output_stream_blocking_flush_reserved(stream, &reservation, ret);
+    release_flushing_stream_reservation(&reservation);
 }
 
 /**
@@ -1366,15 +1513,12 @@ wasi_output_stream_write_zeroes(wasi_output_stream_t stream, uint64_t len,
  * @param[out] ret A pointer to the result struct. On success, `is_err` is
  * false. On failure, it contains a stream error.
  */
-void
-wasi_output_stream_blocking_write_zeroes_and_flush(
+static void
+output_stream_blocking_write_zeroes_and_flush_reserved(
     wasi_output_stream_t stream, uint64_t len,
+    FlushingStreamReservation *reservation,
     wasi_result_void_stream_error_t *ret)
 {
-    if (!ret) {
-        return;
-    }
-
     uint64_t remaining = len;
 
     // Loop until the specified number of zero bytes has been written.
@@ -1389,7 +1533,7 @@ wasi_output_stream_blocking_write_zeroes_and_flush(
         if (check_res.is_err) {
             ret->is_err = true;
             ret->u.err = check_res.u.err;
-            return;
+            goto cleanup;
         }
 
         uint64_t n = check_res.u.ok;
@@ -1407,13 +1551,34 @@ wasi_output_stream_blocking_write_zeroes_and_flush(
         if (write_res.is_err) {
             ret->is_err = true;
             ret->u.err = write_res.u.err;
-            return;
+            goto cleanup;
         }
         remaining -= write_len;
     }
 
     // After all bytes have been written, perform a blocking flush.
-    wasi_output_stream_blocking_flush(stream, ret);
+    output_stream_blocking_flush_reserved(stream, reservation, ret);
+
+cleanup:
+    return;
+}
+
+void
+wasi_output_stream_blocking_write_zeroes_and_flush(
+    wasi_output_stream_t stream, uint64_t len,
+    wasi_result_void_stream_error_t *ret)
+{
+    FlushingStreamReservation reservation;
+
+    if (!ret) {
+        return;
+    }
+    if (!prepare_flushing_stream_reservation(stream, &reservation, ret)) {
+        return;
+    }
+    output_stream_blocking_write_zeroes_and_flush_reserved(stream, len,
+                                                           &reservation, ret);
+    release_flushing_stream_reservation(&reservation);
 }
 
 /**
@@ -1641,4 +1806,1064 @@ wasi_output_stream_blocking_splice(wasi_output_stream_t stream,
 
     ret->is_err = false;
     ret->u.ok = total_spliced;
+}
+
+static void
+set_resource_stream_error(wasi_stream_error_t *error,
+                          wasi_stream_error_kind_t kind, int code)
+{
+    error->kind = kind;
+    error->payload.error = code;
+}
+
+static bool
+file_stream_validate_locked(StreamResourceType *stream, bool writing,
+                            int *fd_out)
+{
+    int fd;
+    int flags;
+    int access_mode;
+
+    if (!stream || stream->type != STREAM_TYPE_FILE || !stream->position_valid
+        || stream->fd > INT_MAX || stream->position > INT64_MAX) {
+        errno = EINVAL;
+        return false;
+    }
+
+    fd = (int)stream->fd;
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return false;
+    }
+    access_mode = flags & O_ACCMODE;
+    if ((writing && access_mode == O_RDONLY)
+        || (!writing && access_mode == O_WRONLY)) {
+        errno = EBADF;
+        return false;
+    }
+
+    /* Linux redirects pwrite() to EOF on an O_APPEND open-file description.
+     * Append streams want that behavior, but a positional stream cannot honor
+     * its logical cursor without mutating shared status flags. */
+    if (writing && !stream->append && (flags & O_APPEND) != 0) {
+        errno = ENOTSUP;
+        return false;
+    }
+
+    *fd_out = fd;
+    return true;
+}
+
+static void
+file_stream_read(StreamResourceType *stream, uint64_t len,
+                 wasi_result_list_u8_stream_error_t *ret)
+{
+    uint8_t *buf = NULL;
+    ssize_t bytes_read;
+    int fd = -1;
+    int saved_error = 0;
+
+    memset(ret, 0, sizeof(*ret));
+    if (len > UINT32_MAX || len > (uint64_t)SSIZE_MAX) {
+        ret->is_err = true;
+        set_resource_stream_error(&ret->u.err,
+                                  WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                                  EOVERFLOW);
+        return;
+    }
+
+    wasi_p2_file_io_lock();
+    if (!file_stream_validate_locked(stream, false, &fd)) {
+        saved_error = errno;
+        goto fail_locked;
+    }
+    if (len == 0) {
+        wasi_p2_file_io_unlock();
+        return;
+    }
+    if (len > (uint64_t)INT64_MAX - stream->position) {
+        saved_error = EOVERFLOW;
+        goto fail_locked;
+    }
+
+    buf = wasm_runtime_malloc((uint32_t)len);
+    if (!buf) {
+        saved_error = ENOMEM;
+        goto fail_locked;
+    }
+
+    do {
+        bytes_read = pread(fd, buf, (size_t)len, (off_t)stream->position);
+    } while (bytes_read < 0 && errno == EINTR);
+    if (bytes_read < 0) {
+        saved_error = errno;
+        wasm_runtime_free(buf);
+        buf = NULL;
+        if (saved_error == EAGAIN || saved_error == EWOULDBLOCK) {
+            wasi_p2_file_io_unlock();
+            return;
+        }
+        goto fail_locked;
+    }
+    if (bytes_read == 0) {
+        wasm_runtime_free(buf);
+        wasi_p2_file_io_unlock();
+        ret->is_err = true;
+        set_resource_stream_error(&ret->u.err, WASI_STREAM_ERROR_KIND_CLOSED,
+                                  0);
+        return;
+    }
+
+    stream->position += (uint64_t)bytes_read;
+    wasi_p2_file_io_unlock();
+    ret->u.ok.buf = buf;
+    ret->u.ok.buf_len = (uint64_t)bytes_read;
+    return;
+
+fail_locked:
+    wasi_p2_file_io_unlock();
+    ret->is_err = true;
+    set_resource_stream_error(
+        &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, saved_error);
+}
+
+static void
+file_stream_skip(StreamResourceType *stream, uint64_t len,
+                 wasi_result_u64_stream_error_t *ret)
+{
+    struct stat statbuf;
+    uint64_t available;
+    uint64_t skipped;
+    int fd = -1;
+    int saved_error = 0;
+
+    memset(ret, 0, sizeof(*ret));
+    wasi_p2_file_io_lock();
+    if (!file_stream_validate_locked(stream, false, &fd)) {
+        saved_error = errno;
+        goto fail_locked;
+    }
+    if (len == 0) {
+        wasi_p2_file_io_unlock();
+        return;
+    }
+    if (fstat(fd, &statbuf) < 0 || statbuf.st_size < 0) {
+        saved_error = errno ? errno : EOVERFLOW;
+        goto fail_locked;
+    }
+    if (stream->position >= (uint64_t)statbuf.st_size) {
+        wasi_p2_file_io_unlock();
+        ret->is_err = true;
+        set_resource_stream_error(&ret->u.err, WASI_STREAM_ERROR_KIND_CLOSED,
+                                  0);
+        return;
+    }
+
+    available = (uint64_t)statbuf.st_size - stream->position;
+    skipped = len < available ? len : available;
+    stream->position += skipped;
+    wasi_p2_file_io_unlock();
+    ret->u.ok = skipped;
+    return;
+
+fail_locked:
+    wasi_p2_file_io_unlock();
+    ret->is_err = true;
+    set_resource_stream_error(
+        &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, saved_error);
+}
+
+void
+wasi_p2_stream_resource_read(StreamResourceType *stream, uint64_t len,
+                             bool blocking,
+                             wasi_result_list_u8_stream_error_t *ret)
+{
+    wasi_input_stream_t fd;
+
+    if (!ret) {
+        return;
+    }
+    if (!stream) {
+        memset(ret, 0, sizeof(*ret));
+        ret->is_err = true;
+        set_resource_stream_error(
+            &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, EINVAL);
+        return;
+    }
+    if (stream->type == STREAM_TYPE_FILE) {
+        file_stream_read(stream, len, ret);
+        return;
+    }
+
+    fd = (wasi_input_stream_t)stream->fd;
+    if (blocking) {
+        wasi_input_stream_blocking_read(fd, len, ret);
+    }
+    else {
+        wasi_input_stream_read(fd, len, ret);
+    }
+}
+
+void
+wasi_p2_stream_resource_skip(StreamResourceType *stream, uint64_t len,
+                             bool blocking, wasi_result_u64_stream_error_t *ret)
+{
+    wasi_input_stream_t fd;
+
+    if (!ret) {
+        return;
+    }
+    if (!stream) {
+        memset(ret, 0, sizeof(*ret));
+        ret->is_err = true;
+        set_resource_stream_error(
+            &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, EINVAL);
+        return;
+    }
+    if (stream->type == STREAM_TYPE_FILE) {
+        file_stream_skip(stream, len, ret);
+        return;
+    }
+
+    fd = (wasi_input_stream_t)stream->fd;
+    if (blocking) {
+        wasi_input_stream_blocking_skip(fd, len, ret);
+    }
+    else {
+        wasi_input_stream_skip(fd, len, ret);
+    }
+}
+
+static bool
+file_stream_native_range(uint64_t position, uint64_t len,
+                         off_t *native_position)
+{
+    off_t start;
+    off_t end;
+
+    if (position > (uint64_t)INT64_MAX
+        || len > (uint64_t)INT64_MAX - position) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    start = (off_t)position;
+    end = (off_t)(position + len);
+    if (start < 0 || end < 0 || (uint64_t)start != position
+        || (uint64_t)end != position + len) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    *native_position = start;
+    return true;
+}
+
+static bool
+file_stream_write_position_locked(StreamResourceType *stream, int fd,
+                                  uint64_t len, uint64_t *position,
+                                  off_t *native_position)
+{
+    struct stat statbuf;
+    uint64_t resolved_position = stream->position;
+
+    if (stream->append) {
+        if (fstat(fd, &statbuf) < 0) {
+            return false;
+        }
+        if (statbuf.st_size < 0
+            || (uint64_t)statbuf.st_size > (uint64_t)INT64_MAX) {
+            errno = EOVERFLOW;
+            return false;
+        }
+        resolved_position = (uint64_t)statbuf.st_size;
+    }
+    if (!file_stream_native_range(resolved_position, len, native_position)) {
+        return false;
+    }
+    *position = resolved_position;
+    return true;
+}
+
+static void
+file_stream_write(StreamResourceType *stream, const wasi_list_u8_t *payload,
+                  uint64_t *written_out, wasi_result_void_stream_error_t *ret)
+{
+    uint64_t write_position;
+    uint64_t len;
+    ssize_t bytes_written;
+    off_t native_write_position;
+    int fd = -1;
+    int saved_error = 0;
+
+    memset(ret, 0, sizeof(*ret));
+    if (written_out) {
+        *written_out = 0;
+    }
+    if (!payload || (payload->buf_len > 0 && !payload->buf)) {
+        ret->is_err = true;
+        set_resource_stream_error(
+            &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, EINVAL);
+        return;
+    }
+
+    len = payload->buf_len;
+    if (len > (uint64_t)SSIZE_MAX) {
+        ret->is_err = true;
+        set_resource_stream_error(&ret->u.err,
+                                  WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                                  EOVERFLOW);
+        return;
+    }
+
+    wasi_p2_file_io_lock();
+    if (!file_stream_validate_locked(stream, true, &fd)) {
+        saved_error = errno;
+        goto fail_locked;
+    }
+    if (len == 0) {
+        wasi_p2_file_io_unlock();
+        return;
+    }
+
+    if (!file_stream_write_position_locked(stream, fd, len, &write_position,
+                                           &native_write_position)) {
+        saved_error = errno;
+        goto fail_locked;
+    }
+
+    do {
+        bytes_written =
+            pwrite(fd, payload->buf, (size_t)len, native_write_position);
+    } while (bytes_written < 0 && errno == EINTR);
+    if (bytes_written < 0) {
+        saved_error = errno;
+        goto fail_locked;
+    }
+
+    if (bytes_written > 0) {
+        stream->position = write_position + (uint64_t)bytes_written;
+        if (written_out) {
+            *written_out = (uint64_t)bytes_written;
+        }
+    }
+    if ((uint64_t)bytes_written != len) {
+        saved_error = EACCES;
+        goto fail_locked;
+    }
+
+    wasi_p2_file_io_unlock();
+    return;
+
+fail_locked:
+    wasi_p2_file_io_unlock();
+    ret->is_err = true;
+    set_resource_stream_error(
+        &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, saved_error);
+}
+
+void
+wasi_p2_stream_resource_write(StreamResourceType *stream,
+                              const wasi_list_u8_t *payload, bool blocking,
+                              bool flush, wasi_result_void_stream_error_t *ret)
+{
+    wasi_output_stream_t fd;
+    FlushingStreamReservation reservation = { 0 };
+
+    if (!ret) {
+        return;
+    }
+    if (!stream) {
+        memset(ret, 0, sizeof(*ret));
+        ret->is_err = true;
+        set_resource_stream_error(
+            &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, EINVAL);
+        return;
+    }
+    fd = (wasi_output_stream_t)stream->fd;
+    if (flush && !prepare_flushing_stream_reservation(fd, &reservation, ret)) {
+        return;
+    }
+    if (stream->type == STREAM_TYPE_FILE) {
+        file_stream_write(stream, payload, NULL, ret);
+        if (!ret->is_err && flush) {
+            if (blocking) {
+                output_stream_blocking_flush_reserved(fd, &reservation, ret);
+            }
+            else {
+                output_stream_flush_reserved(fd, &reservation, ret);
+            }
+        }
+        goto cleanup;
+    }
+
+    if (blocking && flush) {
+        output_stream_blocking_write_and_flush_reserved(fd, payload,
+                                                        &reservation, ret);
+        goto cleanup;
+    }
+
+    wasi_output_stream_write(fd, payload, ret);
+    if (!ret->is_err && flush) {
+        if (blocking) {
+            output_stream_blocking_flush_reserved(fd, &reservation, ret);
+        }
+        else {
+            output_stream_flush_reserved(fd, &reservation, ret);
+        }
+    }
+
+cleanup:
+    release_flushing_stream_reservation(&reservation);
+}
+
+static void
+file_stream_write_zeroes(StreamResourceType *stream, uint64_t len,
+                         wasi_result_void_stream_error_t *ret)
+{
+    const uint8_t zeroes[4096] = { 0 };
+    uint64_t write_position;
+    uint64_t remaining = len;
+    off_t native_write_position;
+    int fd = -1;
+    int saved_error = 0;
+
+    memset(ret, 0, sizeof(*ret));
+    wasi_p2_file_io_lock();
+    if (!file_stream_validate_locked(stream, true, &fd)) {
+        saved_error = errno;
+        goto fail_locked;
+    }
+    if (len == 0) {
+        wasi_p2_file_io_unlock();
+        return;
+    }
+    if (!file_stream_write_position_locked(stream, fd, len, &write_position,
+                                           &native_write_position)) {
+        saved_error = errno;
+        goto fail_locked;
+    }
+
+    while (remaining > 0) {
+        size_t write_len =
+            remaining < sizeof(zeroes) ? (size_t)remaining : sizeof(zeroes);
+        ssize_t bytes_written;
+
+        do {
+            bytes_written =
+                pwrite(fd, zeroes, write_len, native_write_position);
+        } while (bytes_written < 0 && errno == EINTR);
+        if (bytes_written < 0) {
+            saved_error = errno;
+            goto fail_locked;
+        }
+        if (bytes_written > 0) {
+            uint64_t advanced = (uint64_t)bytes_written;
+            write_position += advanced;
+            native_write_position += (off_t)bytes_written;
+            stream->position = write_position;
+            remaining -= advanced;
+        }
+        if ((size_t)bytes_written != write_len) {
+            saved_error = EACCES;
+            goto fail_locked;
+        }
+    }
+
+    wasi_p2_file_io_unlock();
+    return;
+
+fail_locked:
+    wasi_p2_file_io_unlock();
+    ret->is_err = true;
+    set_resource_stream_error(
+        &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, saved_error);
+}
+
+void
+wasi_p2_stream_resource_write_zeroes(StreamResourceType *stream, uint64_t len,
+                                     bool blocking, bool flush,
+                                     wasi_result_void_stream_error_t *ret)
+{
+    wasi_output_stream_t fd;
+    FlushingStreamReservation reservation = { 0 };
+
+    if (!ret) {
+        return;
+    }
+    if (!stream) {
+        memset(ret, 0, sizeof(*ret));
+        ret->is_err = true;
+        set_resource_stream_error(
+            &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, EINVAL);
+        return;
+    }
+    fd = (wasi_output_stream_t)stream->fd;
+    if (flush && !prepare_flushing_stream_reservation(fd, &reservation, ret)) {
+        return;
+    }
+    if (stream->type == STREAM_TYPE_FILE) {
+        file_stream_write_zeroes(stream, len, ret);
+        if (!ret->is_err && flush) {
+            if (blocking) {
+                output_stream_blocking_flush_reserved(fd, &reservation, ret);
+            }
+            else {
+                output_stream_flush_reserved(fd, &reservation, ret);
+            }
+        }
+        goto cleanup;
+    }
+
+    if (blocking && flush) {
+        output_stream_blocking_write_zeroes_and_flush_reserved(
+            fd, len, &reservation, ret);
+        goto cleanup;
+    }
+    wasi_output_stream_write_zeroes(fd, len, ret);
+    if (!ret->is_err && flush) {
+        if (blocking) {
+            output_stream_blocking_flush_reserved(fd, &reservation, ret);
+        }
+        else {
+            output_stream_flush_reserved(fd, &reservation, ret);
+        }
+    }
+
+cleanup:
+    release_flushing_stream_reservation(&reservation);
+}
+
+static void
+file_streams_splice(StreamResourceType *stream, StreamResourceType *src,
+                    uint64_t len, bool blocking,
+                    wasi_result_u64_stream_error_t *ret)
+{
+    uint8_t buf[4096];
+    struct stat source_stat;
+    uint64_t source_position;
+    uint64_t write_position;
+    uint64_t transfer_len;
+    uint64_t total_spliced = 0;
+    off_t native_source_position;
+    off_t native_write_position;
+    int source_fd = -1;
+    int stream_fd = -1;
+    int saved_error = 0;
+
+    memset(ret, 0, sizeof(*ret));
+    wasi_p2_file_io_lock();
+    if (stream == src) {
+        saved_error = EINVAL;
+        goto fail_locked;
+    }
+    if (!file_stream_validate_locked(src, false, &source_fd)
+        || !file_stream_validate_locked(stream, true, &stream_fd)) {
+        saved_error = errno;
+        goto fail_locked;
+    }
+    if (len == 0) {
+        wasi_p2_file_io_unlock();
+        return;
+    }
+    if (fstat(source_fd, &source_stat) < 0) {
+        saved_error = errno;
+        goto fail_locked;
+    }
+    if (source_stat.st_size < 0
+        || (uint64_t)source_stat.st_size > (uint64_t)INT64_MAX) {
+        saved_error = EOVERFLOW;
+        goto fail_locked;
+    }
+    source_position = src->position;
+    if (source_position >= (uint64_t)source_stat.st_size) {
+        wasi_p2_file_io_unlock();
+        ret->is_err = true;
+        set_resource_stream_error(&ret->u.err, WASI_STREAM_ERROR_KIND_CLOSED,
+                                  0);
+        return;
+    }
+
+    transfer_len = (uint64_t)source_stat.st_size - source_position;
+    if (transfer_len > len) {
+        transfer_len = len;
+    }
+    if (!blocking && transfer_len > sizeof(buf)) {
+        transfer_len = sizeof(buf);
+    }
+    if (!file_stream_native_range(source_position, transfer_len,
+                                  &native_source_position)
+        || !file_stream_write_position_locked(stream, stream_fd, transfer_len,
+                                              &write_position,
+                                              &native_write_position)) {
+        saved_error = errno;
+        goto fail_locked;
+    }
+
+    while (total_spliced < transfer_len) {
+        uint64_t remaining = transfer_len - total_spliced;
+        size_t read_len =
+            remaining < sizeof(buf) ? (size_t)remaining : sizeof(buf);
+        ssize_t bytes_read;
+        ssize_t bytes_written;
+
+        do {
+            bytes_read =
+                pread(source_fd, buf, read_len, native_source_position);
+        } while (bytes_read < 0 && errno == EINTR);
+        if (bytes_read < 0) {
+            saved_error = errno;
+            goto fail_locked;
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+
+        do {
+            bytes_written = pwrite(stream_fd, buf, (size_t)bytes_read,
+                                   native_write_position);
+        } while (bytes_written < 0 && errno == EINTR);
+        if (bytes_written < 0) {
+            saved_error = errno;
+            goto fail_locked;
+        }
+        if (bytes_written > 0) {
+            uint64_t advanced = (uint64_t)bytes_written;
+            source_position += advanced;
+            write_position += advanced;
+            native_source_position += (off_t)bytes_written;
+            native_write_position += (off_t)bytes_written;
+            src->position = source_position;
+            stream->position = write_position;
+            total_spliced += advanced;
+        }
+        if (bytes_written != bytes_read) {
+            saved_error = EACCES;
+            goto fail_locked;
+        }
+    }
+
+    wasi_p2_file_io_unlock();
+    if (total_spliced == 0 && len > 0) {
+        ret->is_err = true;
+        set_resource_stream_error(&ret->u.err, WASI_STREAM_ERROR_KIND_CLOSED,
+                                  0);
+        return;
+    }
+    ret->u.ok = total_spliced;
+    return;
+
+fail_locked:
+    wasi_p2_file_io_unlock();
+    ret->is_err = true;
+    set_resource_stream_error(
+        &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, saved_error);
+}
+
+static void
+file_stream_to_fd_splice(wasi_output_stream_t stream, StreamResourceType *src,
+                         uint64_t len, bool blocking,
+                         wasi_result_u64_stream_error_t *ret)
+{
+    uint8_t buf[4096];
+    uint64_t total_spliced = 0;
+    int source_fd = -1;
+
+    memset(ret, 0, sizeof(*ret));
+    wasi_p2_file_io_lock();
+    if (!file_stream_validate_locked(src, false, &source_fd)) {
+        int saved_error = errno;
+        wasi_p2_file_io_unlock();
+        ret->is_err = true;
+        set_resource_stream_error(&ret->u.err,
+                                  WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                                  saved_error);
+        return;
+    }
+    wasi_p2_file_io_unlock();
+
+    while (total_spliced < len) {
+        wasi_result_u64_stream_error_t check_result = { 0 };
+        uint64_t remaining = len - total_spliced;
+        uint64_t permitted;
+        size_t read_len;
+        struct stat source_stat;
+        off_t native_source_position;
+        ssize_t bytes_read;
+        ssize_t bytes_written;
+        int saved_error = 0;
+
+        do {
+            if (blocking) {
+                wasi_pollable_context_t pollable = {
+                    .fd = stream,
+                    .own_fd = false,
+                    .type = WASI_POLLABLE_OUT,
+                    .host_context = NULL,
+                };
+                wasi_pollable_block(&pollable);
+            }
+            else {
+                struct pollfd pfd = { .fd = stream, .events = POLLOUT };
+                int poll_result;
+
+                do {
+                    poll_result = poll(&pfd, 1, 0);
+                } while (poll_result < 0 && errno == EINTR);
+                if (poll_result < 0) {
+                    ret->is_err = true;
+                    set_resource_stream_error(
+                        &ret->u.err,
+                        WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, errno);
+                    return;
+                }
+                if (poll_result == 0 || !(pfd.revents & POLLOUT)) {
+                    ret->u.ok = total_spliced;
+                    return;
+                }
+            }
+            wasi_output_stream_check_write(stream, &check_result);
+            if (check_result.is_err) {
+                ret->is_err = true;
+                ret->u.err = check_result.u.err;
+                return;
+            }
+        } while (blocking && check_result.u.ok == 0);
+        if (check_result.u.ok == 0) {
+            break;
+        }
+
+        permitted = check_result.u.ok;
+        if (permitted > remaining) {
+            permitted = remaining;
+        }
+        if (permitted > sizeof(buf)) {
+            permitted = sizeof(buf);
+        }
+        read_len = (size_t)permitted;
+
+        wasi_p2_file_io_lock();
+        if (!file_stream_validate_locked(src, false, &source_fd)) {
+            saved_error = errno;
+            goto fail_locked;
+        }
+        if (fstat(source_fd, &source_stat) < 0) {
+            saved_error = errno;
+            goto fail_locked;
+        }
+        if (source_stat.st_size < 0
+            || (uint64_t)source_stat.st_size > (uint64_t)INT64_MAX) {
+            saved_error = EOVERFLOW;
+            goto fail_locked;
+        }
+        if (src->position >= (uint64_t)source_stat.st_size) {
+            wasi_p2_file_io_unlock();
+            if (total_spliced == 0 && len > 0) {
+                ret->is_err = true;
+                set_resource_stream_error(&ret->u.err,
+                                          WASI_STREAM_ERROR_KIND_CLOSED, 0);
+            }
+            break;
+        }
+        if (read_len > (uint64_t)source_stat.st_size - src->position) {
+            read_len = (size_t)((uint64_t)source_stat.st_size - src->position);
+        }
+        if (!file_stream_native_range(src->position, read_len,
+                                      &native_source_position)) {
+            saved_error = errno;
+            goto fail_locked;
+        }
+
+        do {
+            bytes_read =
+                pread(source_fd, buf, read_len, native_source_position);
+        } while (bytes_read < 0 && errno == EINTR);
+        if (bytes_read < 0) {
+            saved_error = errno;
+            goto fail_locked;
+        }
+        if (bytes_read == 0) {
+            wasi_p2_file_io_unlock();
+            if (total_spliced == 0 && len > 0) {
+                ret->is_err = true;
+                set_resource_stream_error(&ret->u.err,
+                                          WASI_STREAM_ERROR_KIND_CLOSED, 0);
+            }
+            break;
+        }
+
+        do {
+            bytes_written = write(stream, buf, (size_t)bytes_read);
+        } while (bytes_written < 0 && errno == EINTR);
+        if (bytes_written < 0) {
+            saved_error = errno;
+            goto fail_locked;
+        }
+        if (bytes_written > 0) {
+            uint64_t advanced = (uint64_t)bytes_written;
+            src->position += advanced;
+            total_spliced += advanced;
+        }
+        if (bytes_written != bytes_read) {
+            wasi_p2_file_io_unlock();
+            ret->is_err = true;
+            set_resource_stream_error(
+                &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                EACCES);
+            return;
+        }
+        wasi_p2_file_io_unlock();
+
+        if (!blocking) {
+            break;
+        }
+        continue;
+
+    fail_locked:
+        wasi_p2_file_io_unlock();
+        ret->is_err = true;
+        set_resource_stream_error(&ret->u.err,
+                                  WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                                  saved_error);
+        return;
+    }
+
+    if (!ret->is_err) {
+        ret->u.ok = total_spliced;
+    }
+}
+
+static void
+fd_to_file_stream_splice(StreamResourceType *stream, wasi_input_stream_t src,
+                         uint64_t len, bool blocking,
+                         wasi_result_u64_stream_error_t *ret)
+{
+    uint8_t buf[4096];
+    wasi_list_u8_t empty_payload = { 0 };
+    wasi_result_void_stream_error_t write_result = { 0 };
+    uint64_t total_spliced = 0;
+
+    memset(ret, 0, sizeof(*ret));
+    file_stream_write(stream, &empty_payload, NULL, &write_result);
+    if (write_result.is_err) {
+        ret->is_err = true;
+        ret->u.err = write_result.u.err;
+        return;
+    }
+
+    while (total_spliced < len) {
+        uint64_t remaining = len - total_spliced;
+        size_t read_len =
+            remaining < sizeof(buf) ? (size_t)remaining : sizeof(buf);
+        ssize_t bytes_read;
+        uint64_t bytes_written = 0;
+
+        {
+            struct pollfd pfd = { .fd = src, .events = POLLIN };
+            int poll_result;
+            int timeout = blocking ? -1 : 0;
+
+            do {
+                poll_result = poll(&pfd, 1, timeout);
+            } while (poll_result < 0 && errno == EINTR);
+            if (poll_result < 0) {
+                ret->is_err = true;
+                set_resource_stream_error(
+                    &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                    errno);
+                return;
+            }
+            if (poll_result == 0 || !(pfd.revents & (POLLIN | POLLHUP))) {
+                if (!blocking) {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        do {
+            bytes_read = read(src, buf, read_len);
+        } while (bytes_read < 0 && errno == EINTR);
+        if (bytes_read < 0) {
+            if (!blocking && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            }
+            if (blocking && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            ret->is_err = true;
+            set_resource_stream_error(
+                &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                errno);
+            return;
+        }
+        if (bytes_read == 0) {
+            if (total_spliced == 0 && len > 0) {
+                ret->is_err = true;
+                set_resource_stream_error(&ret->u.err,
+                                          WASI_STREAM_ERROR_KIND_CLOSED, 0);
+            }
+            break;
+        }
+
+        wasi_list_u8_t payload = {
+            .buf = buf,
+            .buf_len = (uint64_t)bytes_read,
+        };
+        file_stream_write(stream, &payload, &bytes_written, &write_result);
+        total_spliced += bytes_written;
+        if (write_result.is_err) {
+            ret->is_err = true;
+            ret->u.err = write_result.u.err;
+            return;
+        }
+        if (!blocking) {
+            break;
+        }
+    }
+
+    if (!ret->is_err) {
+        ret->u.ok = total_spliced;
+    }
+}
+
+void
+wasi_p2_stream_resources_splice(StreamResourceType *stream,
+                                StreamResourceType *src, uint64_t len,
+                                bool blocking,
+                                wasi_result_u64_stream_error_t *ret)
+{
+    if (!ret) {
+        return;
+    }
+    if (!stream || !src) {
+        memset(ret, 0, sizeof(*ret));
+        ret->is_err = true;
+        set_resource_stream_error(
+            &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, EINVAL);
+        return;
+    }
+    if (stream->type == STREAM_TYPE_FILE && src->type == STREAM_TYPE_FILE) {
+        file_streams_splice(stream, src, len, blocking, ret);
+        return;
+    }
+    if (stream->type == STREAM_TYPE_FILE) {
+        if (src->fd > INT_MAX) {
+            memset(ret, 0, sizeof(*ret));
+            ret->is_err = true;
+            set_resource_stream_error(
+                &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                EINVAL);
+            return;
+        }
+        fd_to_file_stream_splice(stream, (wasi_input_stream_t)src->fd, len,
+                                 blocking, ret);
+        return;
+    }
+    if (src->type == STREAM_TYPE_FILE) {
+        if (stream->fd > INT_MAX) {
+            memset(ret, 0, sizeof(*ret));
+            ret->is_err = true;
+            set_resource_stream_error(
+                &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                EINVAL);
+            return;
+        }
+        file_stream_to_fd_splice((wasi_output_stream_t)stream->fd, src, len,
+                                 blocking, ret);
+        return;
+    }
+
+    if (blocking) {
+        wasi_output_stream_blocking_splice((wasi_output_stream_t)stream->fd,
+                                           (wasi_input_stream_t)src->fd, len,
+                                           ret);
+    }
+    else {
+        wasi_output_stream_splice((wasi_output_stream_t)stream->fd,
+                                  (wasi_input_stream_t)src->fd, len, ret);
+    }
+}
+
+void
+wasi_p2_callback_input_stream_to_resource_splice(
+    HostResource *src, StreamResourceType *stream, uint64_t len, bool blocking,
+    wasi_result_u64_stream_error_t *ret)
+{
+    wasi_list_u8_t empty_payload = { 0 };
+    wasi_result_void_stream_error_t write_result = { 0 };
+    uint64_t total_spliced = 0;
+    uint64_t bytes_written = 0;
+    uint32_t scratch_capacity = 0;
+    uint8_t *scratch = NULL;
+
+    if (!ret) {
+        return;
+    }
+    memset(ret, 0, sizeof(*ret));
+    if (!wasi_p2_is_callback_input_stream(src) || !stream
+        || stream->type != STREAM_TYPE_FILE) {
+        ret->is_err = true;
+        set_resource_stream_error(
+            &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, EINVAL);
+        return;
+    }
+    if (len > 0) {
+        scratch_capacity =
+            len < WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES
+                ? (uint32_t)len
+                : WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES;
+        scratch = wasm_runtime_malloc(scratch_capacity);
+        if (!scratch) {
+            ret->is_err = true;
+            set_resource_stream_error(
+                &ret->u.err, WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                ENOMEM);
+            return;
+        }
+    }
+
+    file_stream_write(stream, &empty_payload, NULL, &write_result);
+    if (write_result.is_err) {
+        ret->is_err = true;
+        ret->u.err = write_result.u.err;
+        goto done;
+    }
+
+    while (total_spliced < len) {
+        wasi_result_list_u8_stream_error_t read_result = { 0 };
+        uint64_t remaining = len - total_spliced;
+        uint64_t read_len = remaining < 4096 ? remaining : 4096;
+
+        if (read_len > scratch_capacity) {
+            read_len = scratch_capacity;
+        }
+        wasi_p2_callback_input_stream_read_into(src, read_len, scratch,
+                                                scratch_capacity, &read_result);
+        if (read_result.is_err) {
+            if (read_result.u.err.kind == WASI_STREAM_ERROR_KIND_CLOSED
+                && total_spliced > 0) {
+                break;
+            }
+            ret->is_err = true;
+            ret->u.err = read_result.u.err;
+            goto done;
+        }
+
+        bytes_written = 0;
+        file_stream_write(stream, &read_result.u.ok, &bytes_written,
+                          &write_result);
+        total_spliced += bytes_written;
+        if (write_result.is_err) {
+            ret->is_err = true;
+            ret->u.err = write_result.u.err;
+            goto done;
+        }
+        if (!blocking) {
+            break;
+        }
+    }
+
+    ret->u.ok = total_spliced;
+
+done:
+    wasm_runtime_free(scratch);
 }

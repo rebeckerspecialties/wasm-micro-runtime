@@ -5,6 +5,7 @@
 
 #include "wasi_p2_host_io.h"
 #include "wasi_p2_io.h"
+#include "wasi_p2_common.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -134,14 +135,15 @@ wasi_p2_is_callback_input_stream(const HostResource *resource)
 }
 
 void
-wasi_p2_callback_input_stream_read(HostResource *resource, uint64_t len,
-                                   wasi_result_list_u8_stream_error_t *ret)
+wasi_p2_callback_input_stream_read_into(HostResource *resource, uint64_t len,
+                                        uint8_t *buffer,
+                                        uint32_t buffer_capacity,
+                                        wasi_result_list_u8_stream_error_t *ret)
 {
     WasiP2CallbackInputStream *stream = NULL;
     wasm_component_wasi_input_stream_status_t status;
     uint32_t capacity = 0;
     uint32_t bytes_read = 0;
-    uint8_t *buffer = NULL;
 
     if (!ret) {
         return;
@@ -161,11 +163,13 @@ wasi_p2_callback_input_stream_read(HostResource *resource, uint64_t len,
     capacity = len < WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES
                    ? (uint32_t)len
                    : WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES;
-    buffer = wasm_runtime_malloc(capacity);
-    if (!buffer) {
+    if (capacity > buffer_capacity) {
+        capacity = buffer_capacity;
+    }
+    if (!buffer || capacity == 0) {
         ret->is_err = true;
         set_stream_error(&ret->u.err,
-                         WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, ENOMEM);
+                         WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, EINVAL);
         return;
     }
 
@@ -178,7 +182,6 @@ wasi_p2_callback_input_stream_read(HostResource *resource, uint64_t len,
         return;
     }
 
-    wasm_runtime_free(buffer);
     ret->is_err = true;
     if (status == WASM_COMPONENT_WASI_INPUT_STREAM_CLOSED && bytes_read == 0) {
         set_stream_error(&ret->u.err, WASI_STREAM_ERROR_KIND_CLOSED, 0);
@@ -192,6 +195,38 @@ wasi_p2_callback_input_stream_read(HostResource *resource, uint64_t len,
         set_stream_error(&ret->u.err,
                          WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
                          EOVERFLOW);
+    }
+}
+
+void
+wasi_p2_callback_input_stream_read(HostResource *resource, uint64_t len,
+                                   wasi_result_list_u8_stream_error_t *ret)
+{
+    uint32_t capacity;
+    uint8_t *buffer;
+
+    if (!ret) {
+        return;
+    }
+    if (len == 0) {
+        wasi_p2_callback_input_stream_read_into(resource, 0, NULL, 0, ret);
+        return;
+    }
+    capacity = len < WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES
+                   ? (uint32_t)len
+                   : WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES;
+    buffer = wasm_runtime_malloc(capacity);
+    if (!buffer) {
+        memset(ret, 0, sizeof(*ret));
+        ret->is_err = true;
+        set_stream_error(&ret->u.err,
+                         WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, ENOMEM);
+        return;
+    }
+    wasi_p2_callback_input_stream_read_into(resource, len, buffer, capacity,
+                                            ret);
+    if (ret->is_err) {
+        wasm_runtime_free(buffer);
     }
 }
 
@@ -254,6 +289,8 @@ wasi_p2_callback_input_stream_splice(HostResource *resource,
                                      wasi_result_u64_stream_error_t *ret)
 {
     uint64_t total_spliced = 0;
+    uint32_t scratch_capacity = 0;
+    uint8_t *scratch = NULL;
 
     if (!ret) {
         return;
@@ -264,6 +301,20 @@ wasi_p2_callback_input_stream_splice(HostResource *resource,
         set_stream_error(&ret->u.err,
                          WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED, EINVAL);
         return;
+    }
+    if (len > 0) {
+        scratch_capacity =
+            len < WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES
+                ? (uint32_t)len
+                : WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES;
+        scratch = wasm_runtime_malloc(scratch_capacity);
+        if (!scratch) {
+            ret->is_err = true;
+            set_stream_error(&ret->u.err,
+                             WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED,
+                             ENOMEM);
+            return;
+        }
     }
 
     while (total_spliced < len) {
@@ -285,7 +336,7 @@ wasi_p2_callback_input_stream_splice(HostResource *resource,
                 wasi_output_stream_check_write(output_stream, &check_result);
                 if (check_result.is_err) {
                     *ret = check_result;
-                    return;
+                    goto done;
                 }
             } while (check_result.u.ok == 0);
         }
@@ -293,7 +344,7 @@ wasi_p2_callback_input_stream_splice(HostResource *resource,
             wasi_output_stream_check_write(output_stream, &check_result);
             if (check_result.is_err) {
                 *ret = check_result;
-                return;
+                goto done;
             }
             if (check_result.u.ok == 0) {
                 break;
@@ -303,7 +354,11 @@ wasi_p2_callback_input_stream_splice(HostResource *resource,
         if (read_len > check_result.u.ok) {
             read_len = check_result.u.ok;
         }
-        wasi_p2_callback_input_stream_read(resource, read_len, &read_result);
+        if (read_len > scratch_capacity) {
+            read_len = scratch_capacity;
+        }
+        wasi_p2_callback_input_stream_read_into(resource, read_len, scratch,
+                                                scratch_capacity, &read_result);
         if (read_result.is_err) {
             if (read_result.u.err.kind == WASI_STREAM_ERROR_KIND_CLOSED
                 && total_spliced != 0) {
@@ -311,19 +366,17 @@ wasi_p2_callback_input_stream_splice(HostResource *resource,
             }
             ret->is_err = true;
             ret->u.err = read_result.u.err;
-            return;
+            goto done;
         }
 
         wasi_output_stream_write(output_stream, &read_result.u.ok,
                                  &write_result);
         if (write_result.is_err) {
-            wasm_runtime_free(read_result.u.ok.buf);
             ret->is_err = true;
             ret->u.err = write_result.u.err;
-            return;
+            goto done;
         }
         total_spliced += read_result.u.ok.buf_len;
-        wasm_runtime_free(read_result.u.ok.buf);
 
         if (!blocking) {
             break;
@@ -331,6 +384,9 @@ wasi_p2_callback_input_stream_splice(HostResource *resource,
     }
 
     ret->u.ok = total_spliced;
+
+done:
+    wasm_runtime_free(scratch);
 }
 
 static bool
@@ -494,6 +550,7 @@ wasm_component_wasi_pollable_new(
     HostResource *resource = NULL;
     WasiP2CallbackPollable *pollable = NULL;
     wasm_component_wasi_pollable_signal_t signal = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
     uint32_t representation = 0;
 
     if (out_signal) {
@@ -512,8 +569,14 @@ wasm_component_wasi_pollable_new(
         return false;
     }
 
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 2, &fd_lease)) {
+        callbacks->drop(attachment);
+        return false;
+    }
+
     signal = pollable_signal_create();
     if (!signal) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         callbacks->drop(attachment);
         return false;
     }
@@ -522,6 +585,7 @@ wasm_component_wasi_pollable_new(
     if (!resource) {
         pollable_signal_deactivate(signal);
         wasm_component_wasi_pollable_signal_release(signal);
+        wasi_p2_native_fd_quota_release(&fd_lease);
         callbacks->drop(attachment);
         return false;
     }
@@ -532,6 +596,7 @@ wasm_component_wasi_pollable_new(
     pollable->signal = signal;
     SET_HOST_CALLBACK_POLLABLE(&pollable->pollable, signal->read_fd, pollable);
     host_resource_set_dtor(resource, pollable_drop);
+    wasi_p2_native_fd_quota_transfer_to_host_resource(resource, &fd_lease);
 
     representation = host_resource_table_add(table, resource);
     if (representation == 0) {

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  */
 
-#include "wasi_p2_filesystem.h"
+#include "wasi_p2_filesystem_quota.h"
 
 #include <stdio.h>
 #include <time.h>
@@ -22,6 +22,7 @@
 #endif
 
 #include "wasi_p2_common.h"
+#include "wasi_p2_io.h"
 
 #if defined(__APPLE__)
 /* Darwin/BSD names the nanosecond-resolution stat timestamp fields
@@ -53,6 +54,7 @@
  */
 typedef struct wasi_beneath_path_ref_t {
     int parent_fd;
+    WasiP2NativeFdQuotaLease parent_fd_lease;
     char *storage;
     const char *leaf;
     int parent_depth;
@@ -136,16 +138,18 @@ wasi_beneath_path_ref_destroy(wasi_beneath_path_ref_t *ref)
     if (ref->parent_fd >= 0) {
         close(ref->parent_fd);
     }
+    wasi_p2_native_fd_quota_release(&ref->parent_fd_lease);
     wasm_runtime_free(ref->storage);
     memset(ref, 0, sizeof(*ref));
     ref->parent_fd = -1;
 }
 
 static int
-wasi_beneath_path_ref_init(wasi_descriptor_t root_fd, const char *path,
-                           wasi_beneath_path_ref_t *ref)
+wasi_beneath_path_ref_init(wasm_exec_env_t exec_env, wasi_descriptor_t root_fd,
+                           const char *path, wasi_beneath_path_ref_t *ref)
 {
     int *directory_fds = NULL;
+    WasiP2NativeFdQuotaLease *directory_fd_leases = NULL;
     size_t directory_fd_count = 0;
     size_t path_len;
     char *cursor;
@@ -180,9 +184,24 @@ wasi_beneath_path_ref_init(wasi_descriptor_t root_fd, const char *path,
         goto fail;
     }
 
+    directory_fd_leases = wasm_runtime_malloc(
+        (uint32_t)((path_len + 1) * sizeof(WasiP2NativeFdQuotaLease)));
+    if (!directory_fd_leases) {
+        error = ENOMEM;
+        goto fail;
+    }
+    memset(directory_fd_leases, 0,
+           (path_len + 1) * sizeof(WasiP2NativeFdQuotaLease));
+
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1,
+                                         &directory_fd_leases[0])) {
+        error = EDQUOT;
+        goto fail;
+    }
     directory_fds[0] = wasi_open_beneath_directory(root_fd, ".");
     if (directory_fds[0] < 0) {
         error = wasi_sandbox_error(errno);
+        wasi_p2_native_fd_quota_release(&directory_fd_leases[0]);
         goto fail;
     }
     directory_fd_count = 1;
@@ -220,7 +239,10 @@ wasi_beneath_path_ref_init(wasi_descriptor_t root_fd, const char *path,
 
         if (is_last) {
             if (strcmp(segment, "..") == 0) {
-                close(directory_fds[--directory_fd_count]);
+                directory_fd_count--;
+                close(directory_fds[directory_fd_count]);
+                wasi_p2_native_fd_quota_release(
+                    &directory_fd_leases[directory_fd_count]);
                 segment[0] = '.';
                 segment[1] = '\0';
             }
@@ -233,15 +255,25 @@ wasi_beneath_path_ref_init(wasi_descriptor_t root_fd, const char *path,
             continue;
         }
         if (strcmp(segment, "..") == 0) {
-            close(directory_fds[--directory_fd_count]);
+            directory_fd_count--;
+            close(directory_fds[directory_fd_count]);
+            wasi_p2_native_fd_quota_release(
+                &directory_fd_leases[directory_fd_count]);
             cursor = next_segment;
             continue;
         }
 
+        if (!wasi_p2_native_fd_quota_reserve(
+                exec_env, 1, &directory_fd_leases[directory_fd_count])) {
+            error = EDQUOT;
+            goto fail;
+        }
         int child_fd = wasi_open_beneath_directory(
             directory_fds[directory_fd_count - 1], segment);
         if (child_fd < 0) {
             error = wasi_sandbox_error(errno);
+            wasi_p2_native_fd_quota_release(
+                &directory_fd_leases[directory_fd_count]);
             goto fail;
         }
         directory_fds[directory_fd_count++] = child_fd;
@@ -254,18 +286,29 @@ wasi_beneath_path_ref_init(wasi_descriptor_t root_fd, const char *path,
     }
 
     ref->parent_fd = directory_fds[--directory_fd_count];
+    ref->parent_fd_lease = directory_fd_leases[directory_fd_count];
+    memset(&directory_fd_leases[directory_fd_count], 0,
+           sizeof(directory_fd_leases[directory_fd_count]));
     ref->parent_depth = (int)directory_fd_count;
     while (directory_fd_count > 0) {
-        close(directory_fds[--directory_fd_count]);
+        directory_fd_count--;
+        close(directory_fds[directory_fd_count]);
+        wasi_p2_native_fd_quota_release(
+            &directory_fd_leases[directory_fd_count]);
     }
     wasm_runtime_free(directory_fds);
+    wasm_runtime_free(directory_fd_leases);
     return WASI_ERROR_CODE_SUCCESS;
 
 fail:
     while (directory_fd_count > 0) {
-        close(directory_fds[--directory_fd_count]);
+        directory_fd_count--;
+        close(directory_fds[directory_fd_count]);
+        wasi_p2_native_fd_quota_release(
+            &directory_fd_leases[directory_fd_count]);
     }
     wasm_runtime_free(directory_fds);
+    wasm_runtime_free(directory_fd_leases);
     wasi_beneath_path_ref_destroy(ref);
     return error;
 }
@@ -325,21 +368,19 @@ wasi_filesystem_seek_via_stream(wasi_descriptor_t fd, wasi_filesize_t offset,
         return;
     }
 
-    // Duplicate the descriptor to get a new one with an independent seek
-    // position. The new descriptor shares the same underlying file description.
-    int new_fd = dup(fd);
-    if (new_fd < 0) {
-        *err = errno;
+    if (offset > INT64_MAX || lseek(fd, 0, SEEK_CUR) < 0) {
+        *err = offset > INT64_MAX ? EOVERFLOW : errno;
         *ret = -1;
         return;
     }
 
-    // Seek the *new* descriptor to the specified absolute offset.
-    if (lseek(new_fd, offset, SEEK_SET) < 0) {
+    /* The StreamResourceType tracks its own logical position and all file
+       stream I/O uses pread/pwrite.  The duplicate owns the file lifetime but
+       never mutates the descriptor's shared kernel cursor. */
+    int new_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (new_fd < 0) {
         *err = errno;
         *ret = -1;
-        // Important: clean up the duplicated descriptor on failure.
-        close(new_fd);
         return;
     }
 
@@ -431,18 +472,10 @@ wasi_filesystem_append_via_stream(wasi_descriptor_t fd,
         return;
     }
 
-    // Duplicate the descriptor to create an independent stream handle.
-    int new_fd = dup(fd);
+    // Duplicate only for independent lifetime; append behavior is tracked in
+    // StreamResourceType and applied per write without changing shared flags.
+    int new_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (new_fd < 0) {
-        *err = errno;
-        *ret = -1;
-        return;
-    }
-
-    // Set the O_APPEND flag on the *new* descriptor. All subsequent writes
-    // to this stream will automatically go to the end of the file.
-    if (fcntl(new_fd, F_SETFL, file_flags | O_APPEND) < 0) {
-        close(new_fd); // Clean up the new descriptor on failure.
         *err = errno;
         *ret = -1;
         return;
@@ -573,9 +606,10 @@ wasi_filesystem_stat(wasi_descriptor_t fd, wasi_descriptor_stat_t *ret,
  * result.
  * @param[out] err Pointer to store the resulting WASI error code.
  */
-void
-wasi_filesystem_stat_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
-                        const char *path, wasi_descriptor_stat_t *ret, int *err)
+static void
+wasi_filesystem_stat_at_impl(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+                             wasi_path_flags_t path_flags, const char *path,
+                             wasi_descriptor_stat_t *ret, int *err)
 {
     wasi_beneath_path_ref_t path_ref;
     if (!err || !ret || !path) {
@@ -585,7 +619,7 @@ wasi_filesystem_stat_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     }
     struct stat st;
 
-    *err = wasi_beneath_path_ref_init(fd, path, &path_ref);
+    *err = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
     if (*err != WASI_ERROR_CODE_SUCCESS) {
         return;
     }
@@ -604,6 +638,23 @@ wasi_filesystem_stat_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     // format.
     stat_to_wasi(&st, ret);
     *err = 0;
+}
+
+void
+wasi_filesystem_stat_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
+                        const char *path, wasi_descriptor_stat_t *ret, int *err)
+{
+    wasi_filesystem_stat_at_impl(NULL, fd, path_flags, path, ret, err);
+}
+
+void
+wasi_filesystem_stat_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                      wasi_descriptor_t fd,
+                                      wasi_path_flags_t path_flags,
+                                      const char *path,
+                                      wasi_descriptor_stat_t *ret, int *err)
+{
+    wasi_filesystem_stat_at_impl(exec_env, fd, path_flags, path, ret, err);
 }
 
 /**
@@ -832,20 +883,29 @@ wasi_filesystem_read(wasi_descriptor_t fd, wasi_filesize_t length,
 
     ret->buf = NULL;
     ret->buf_len = 0;
+    *end_of_stream = false;
+
+    /* wasm_runtime_malloc takes uint32_t, while pread returns ssize_t and
+       accepts a signed file offset. Reject every lossy conversion before
+       allocating or entering the kernel. */
+    if (length > UINT32_MAX || length > (uint64_t)SSIZE_MAX
+        || offset > (uint64_t)INT64_MAX) {
+        *err = EOVERFLOW;
+        return;
+    }
 
     if (length == 0) {
-        *end_of_stream = false;
         *err = 0;
         return;
     }
 
-    uint8_t *buf = wasm_runtime_malloc(length);
+    uint8_t *buf = wasm_runtime_malloc((uint32_t)length);
     if (!buf) {
         *err = ENOMEM;
         return;
     }
 
-    ssize_t s = pread(fd, buf, length, offset);
+    ssize_t s = pread(fd, buf, (size_t)length, (off_t)offset);
     if (s < 0) {
         wasm_runtime_free(buf);
         *err = errno;
@@ -855,7 +915,7 @@ wasi_filesystem_read(wasi_descriptor_t fd, wasi_filesize_t length,
     if ((uint64_t)s < length) {
         *end_of_stream = true;
         if (s > 0) {
-            uint8_t *new_buf = wasm_runtime_realloc(buf, s);
+            uint8_t *new_buf = wasm_runtime_realloc(buf, (uint32_t)s);
             if (!new_buf) {
                 wasm_runtime_free(buf);
                 *err = ENOMEM;
@@ -903,12 +963,22 @@ wasi_filesystem_write(wasi_descriptor_t fd, const uint8_t *buf,
         return;
     }
 
-    // Use pwrite to write to a specific offset without changing the
-    // file descriptor's own cursor.
-    ssize_t s = pwrite(fd, buf, buf_len, offset);
+    *ret = 0;
+    if (buf_len > (uint64_t)SSIZE_MAX || offset > (uint64_t)INT64_MAX) {
+        *err = EOVERFLOW;
+        return;
+    }
+
+    /* Serialize positional descriptor writes with logical file streams and
+       truncation. In particular, an append stream must observe either the
+       file state before this write or after it, never an interleaving between
+       its EOF lookup and pwrite. */
+    wasi_p2_file_io_lock();
+    ssize_t s = pwrite(fd, buf, (size_t)buf_len, (off_t)offset);
+    int saved_error = s < 0 ? errno : 0;
+    wasi_p2_file_io_unlock();
     if (s < 0) {
-        *err = errno;
-        *ret = 0;
+        *err = saved_error;
         return;
     }
 
@@ -937,10 +1007,12 @@ wasi_filesystem_read_directory(wasi_descriptor_t fd,
         return;
     }
 
-    // Duplicate the file descriptor to create an independent handle for the new
-    // directory stream. This prevents iteration on the new stream from
-    // interfering with the original descriptor's state.
-    int new_fd = dup(fd);
+    /* dup()/F_DUPFD share one open-file description and therefore one kernel
+       directory offset. Open "." relative to the capability instead, yielding
+       a fresh OFD that cannot escape the supplied directory. This new_fd is
+       deliberately the single ownership-transfer seam for a future FD lease:
+       once opened, either fdopendir owns it or this function closes it. */
+    int new_fd = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (new_fd < 0) {
         *err = errno;
         *ret = NULL;
@@ -951,8 +1023,9 @@ wasi_filesystem_read_directory(wasi_descriptor_t fd,
     // POSIX object used for reading directory entries.
     DIR *dir = fdopendir(new_fd);
     if (!dir) {
-        close(new_fd); // Clean up the duplicated descriptor on failure.
-        *err = errno;
+        int saved_error = errno;
+        close(new_fd); // Clean up the fresh descriptor on failure.
+        *err = saved_error;
         *ret = NULL;
         return;
     }
@@ -996,11 +1069,12 @@ wasi_filesystem_sync(wasi_descriptor_t fd)
  * @param data_modification_timestamp The new data modification timestamp.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_set_times_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
-                             const char *path,
-                             wasi_new_timestamp_t data_access_timestamp,
-                             wasi_new_timestamp_t data_modification_timestamp)
+static int
+wasi_filesystem_set_times_at_impl(
+    wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+    wasi_path_flags_t path_flags, const char *path,
+    wasi_new_timestamp_t data_access_timestamp,
+    wasi_new_timestamp_t data_modification_timestamp)
 {
     wasi_beneath_path_ref_t path_ref;
     struct stat st;
@@ -1015,7 +1089,7 @@ wasi_filesystem_set_times_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     wasi_to_timespec(data_access_timestamp, &times[0]);
     wasi_to_timespec(data_modification_timestamp, &times[1]);
 
-    error = wasi_beneath_path_ref_init(fd, path, &path_ref);
+    error = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
     if (error != WASI_ERROR_CODE_SUCCESS) {
         return error;
     }
@@ -1042,6 +1116,29 @@ wasi_filesystem_set_times_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     return WASI_ERROR_CODE_SUCCESS;
 }
 
+int
+wasi_filesystem_set_times_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
+                             const char *path,
+                             wasi_new_timestamp_t data_access_timestamp,
+                             wasi_new_timestamp_t data_modification_timestamp)
+{
+    return wasi_filesystem_set_times_at_impl(NULL, fd, path_flags, path,
+                                             data_access_timestamp,
+                                             data_modification_timestamp);
+}
+
+int
+wasi_filesystem_set_times_at_with_fd_quota(
+    wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+    wasi_path_flags_t path_flags, const char *path,
+    wasi_new_timestamp_t data_access_timestamp,
+    wasi_new_timestamp_t data_modification_timestamp)
+{
+    return wasi_filesystem_set_times_at_impl(exec_env, fd, path_flags, path,
+                                             data_access_timestamp,
+                                             data_modification_timestamp);
+}
+
 /**
  * @brief Create a hard link.
  * @details Implements the `link-at` function on the `descriptor` resource
@@ -1055,10 +1152,11 @@ wasi_filesystem_set_times_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
  * `new_fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_link_at(wasi_descriptor_t old_fd,
-                        wasi_path_flags_t old_path_flags, const char *old_path,
-                        wasi_descriptor_t new_fd, const char *new_path)
+static int
+wasi_filesystem_link_at_impl(wasm_exec_env_t exec_env, wasi_descriptor_t old_fd,
+                             wasi_path_flags_t old_path_flags,
+                             const char *old_path, wasi_descriptor_t new_fd,
+                             const char *new_path)
 {
     wasi_beneath_path_ref_t old_ref, new_ref;
     struct stat old_stat;
@@ -1067,11 +1165,11 @@ wasi_filesystem_link_at(wasi_descriptor_t old_fd,
     if (!old_path || !new_path) {
         return EINVAL;
     }
-    error = wasi_beneath_path_ref_init(old_fd, old_path, &old_ref);
+    error = wasi_beneath_path_ref_init(exec_env, old_fd, old_path, &old_ref);
     if (error != WASI_ERROR_CODE_SUCCESS) {
         return error;
     }
-    error = wasi_beneath_path_ref_init(new_fd, new_path, &new_ref);
+    error = wasi_beneath_path_ref_init(exec_env, new_fd, new_path, &new_ref);
     if (error != WASI_ERROR_CODE_SUCCESS) {
         wasi_beneath_path_ref_destroy(&old_ref);
         return error;
@@ -1110,6 +1208,27 @@ done:
     return error;
 }
 
+int
+wasi_filesystem_link_at(wasi_descriptor_t old_fd,
+                        wasi_path_flags_t old_path_flags, const char *old_path,
+                        wasi_descriptor_t new_fd, const char *new_path)
+{
+    return wasi_filesystem_link_at_impl(NULL, old_fd, old_path_flags, old_path,
+                                        new_fd, new_path);
+}
+
+int
+wasi_filesystem_link_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                      wasi_descriptor_t old_fd,
+                                      wasi_path_flags_t old_path_flags,
+                                      const char *old_path,
+                                      wasi_descriptor_t new_fd,
+                                      const char *new_path)
+{
+    return wasi_filesystem_link_at_impl(exec_env, old_fd, old_path_flags,
+                                        old_path, new_fd, new_path);
+}
+
 /**
  * @brief Open a file or directory.
  * @details Implements the `open-at` function on the `descriptor` resource
@@ -1124,18 +1243,23 @@ done:
  * @param[out] ret Pointer to store the new file descriptor.
  * @param[out] err Pointer to store the resulting WASI error code.
  */
-void
-wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
-                        const char *path, wasi_open_flags_t open_flags,
-                        wasi_descriptor_flags_t flags, mode_t mode,
-                        wasi_descriptor_t *ret, int *err)
+static void
+wasi_filesystem_open_at_impl(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+                             wasi_path_flags_t path_flags, const char *path,
+                             wasi_open_flags_t open_flags,
+                             wasi_descriptor_flags_t flags, mode_t mode,
+                             wasi_descriptor_t *ret,
+                             WasiP2NativeFdQuotaLease *out_fd_lease, int *err)
 {
     wasi_beneath_path_ref_t path_ref;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
 
     if (ret)
         *ret = -1;
+    if (out_fd_lease)
+        memset(out_fd_lease, 0, sizeof(*out_fd_lease));
 
-    if (!path || !ret || !err) {
+    if (!path || !ret || !err || (exec_env && !out_fd_lease)) {
         if (err)
             *err = EINVAL;
         if (ret)
@@ -1145,8 +1269,13 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
 
     *ret = -1;
 
-    *err = wasi_beneath_path_ref_init(fd, path, &path_ref);
+    *err = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
     if (*err != WASI_ERROR_CODE_SUCCESS) {
+        return;
+    }
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        *err = EDQUOT;
+        wasi_beneath_path_ref_destroy(&path_ref);
         return;
     }
 
@@ -1208,37 +1337,82 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
 #if defined(__APPLE__)
     /* The held parent was reached component-by-component without following
      * symlinks.  O_NOFOLLOW_ANY protects the remaining final component. */
+    if (internal_flags & O_TRUNC) {
+        wasi_p2_file_io_lock();
+    }
     int r = openat(path_ref.parent_fd, path_ref.leaf,
                    internal_flags | O_NOFOLLOW_ANY,
                    (internal_flags & O_CREAT) ? mode : 0);
+    int saved_error = r < 0 ? errno : 0;
+    if (internal_flags & O_TRUNC) {
+        wasi_p2_file_io_unlock();
+    }
     if (r < 0) {
         /* Preserve ELOOP for the final-link error required by open-at while
          * still normalizing a beneath escape to the WASI capability error. */
-        *err = errno == EXDEV ? EPERM : errno;
+        *err = saved_error == EXDEV ? EPERM : saved_error;
         *ret = -1;
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasi_beneath_path_ref_destroy(&path_ref);
         return;
     }
     *err = 0;
     *ret = r;
+    if (out_fd_lease) {
+        *out_fd_lease = fd_lease;
+        memset(&fd_lease, 0, sizeof(fd_lease));
+    }
     wasi_beneath_path_ref_destroy(&path_ref);
 #else
     struct open_how how = { 0 };
     how.flags = internal_flags;
     how.mode = (how.flags & (O_CREAT)) ? mode : 0;
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+    if (internal_flags & O_TRUNC) {
+        wasi_p2_file_io_lock();
+    }
     int r = syscall(SYS_openat2, path_ref.parent_fd, path_ref.leaf, &how,
                     sizeof(how));
+    int saved_error = r < 0 ? errno : 0;
+    if (internal_flags & O_TRUNC) {
+        wasi_p2_file_io_unlock();
+    }
     if (r < 0) {
-        *err = wasi_sandbox_error(errno);
+        *err = wasi_sandbox_error(saved_error);
         *ret = -1;
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasi_beneath_path_ref_destroy(&path_ref);
         return;
     }
     *err = 0;
     *ret = r;
+    if (out_fd_lease) {
+        *out_fd_lease = fd_lease;
+        memset(&fd_lease, 0, sizeof(fd_lease));
+    }
     wasi_beneath_path_ref_destroy(&path_ref);
 #endif
+}
+
+void
+wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
+                        const char *path, wasi_open_flags_t open_flags,
+                        wasi_descriptor_flags_t flags, mode_t mode,
+                        wasi_descriptor_t *ret, int *err)
+{
+    wasi_filesystem_open_at_impl(NULL, fd, path_flags, path, open_flags, flags,
+                                 mode, ret, NULL, err);
+}
+
+void
+wasi_filesystem_open_at_with_fd_quota(
+    wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+    wasi_path_flags_t path_flags, const char *path,
+    wasi_open_flags_t open_flags, wasi_descriptor_flags_t flags, mode_t mode,
+    wasi_descriptor_t *ret, WasiP2NativeFdQuotaLease *out_fd_lease, int *err)
+{
+    wasi_filesystem_open_at_impl(exec_env, fd, path_flags, path, open_flags,
+                                 flags, mode, ret, out_fd_lease, err);
 }
 
 /**
@@ -1252,9 +1426,9 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
  *               The caller is responsible for freeing this buffer.
  * @param[out] err Pointer to store the resulting WASI error code.
  */
-void
-wasi_filesystem_readlink_at(wasi_descriptor_t fd, const char *path, char **ret,
-                            int *err)
+static void
+wasi_filesystem_readlink_at_impl(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+                                 const char *path, char **ret, int *err)
 {
     wasi_beneath_path_ref_t path_ref;
 
@@ -1264,7 +1438,7 @@ wasi_filesystem_readlink_at(wasi_descriptor_t fd, const char *path, char **ret,
         return;
     }
     *ret = NULL;
-    *err = wasi_beneath_path_ref_init(fd, path, &path_ref);
+    *err = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
     if (*err != WASI_ERROR_CODE_SUCCESS) {
         return;
     }
@@ -1318,6 +1492,22 @@ wasi_filesystem_readlink_at(wasi_descriptor_t fd, const char *path, char **ret,
     *err = 0;
     *ret = buf;
     wasi_beneath_path_ref_destroy(&path_ref);
+}
+
+void
+wasi_filesystem_readlink_at(wasi_descriptor_t fd, const char *path, char **ret,
+                            int *err)
+{
+    wasi_filesystem_readlink_at_impl(NULL, fd, path, ret, err);
+}
+
+void
+wasi_filesystem_readlink_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                          wasi_descriptor_t fd,
+                                          const char *path, char **ret,
+                                          int *err)
+{
+    wasi_filesystem_readlink_at_impl(exec_env, fd, path, ret, err);
 }
 
 /**
@@ -1450,10 +1640,12 @@ wasi_filesystem_metadata_hash(wasi_descriptor_t fd,
  * result.
  * @param[out] err Pointer to store the resulting WASI error code.
  */
-void
-wasi_filesystem_metadata_hash_at(wasi_descriptor_t fd,
-                                 wasi_path_flags_t path_flags, const char *path,
-                                 wasi_metadata_hash_value_t *ret, int *err)
+static void
+wasi_filesystem_metadata_hash_at_impl(wasm_exec_env_t exec_env,
+                                      wasi_descriptor_t fd,
+                                      wasi_path_flags_t path_flags,
+                                      const char *path,
+                                      wasi_metadata_hash_value_t *ret, int *err)
 {
     wasi_beneath_path_ref_t path_ref;
 
@@ -1464,7 +1656,7 @@ wasi_filesystem_metadata_hash_at(wasi_descriptor_t fd,
     }
     struct stat st;
 
-    *err = wasi_beneath_path_ref_init(fd, path, &path_ref);
+    *err = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
     if (*err != WASI_ERROR_CODE_SUCCESS) {
         return;
     }
@@ -1482,6 +1674,26 @@ wasi_filesystem_metadata_hash_at(wasi_descriptor_t fd,
     // 128-bit WASI metadata hash.
     stat_to_metadata_hash(&st, ret);
     *err = 0;
+}
+
+void
+wasi_filesystem_metadata_hash_at(wasi_descriptor_t fd,
+                                 wasi_path_flags_t path_flags, const char *path,
+                                 wasi_metadata_hash_value_t *ret, int *err)
+{
+    wasi_filesystem_metadata_hash_at_impl(NULL, fd, path_flags, path, ret, err);
+}
+
+void
+wasi_filesystem_metadata_hash_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                               wasi_descriptor_t fd,
+                                               wasi_path_flags_t path_flags,
+                                               const char *path,
+                                               wasi_metadata_hash_value_t *ret,
+                                               int *err)
+{
+    wasi_filesystem_metadata_hash_at_impl(exec_env, fd, path_flags, path, ret,
+                                          err);
 }
 
 /**
@@ -1694,10 +1906,19 @@ wasi_filesystem_get_flags(wasi_descriptor_t fd, wasi_descriptor_flags_t *ret,
 int
 wasi_filesystem_set_size(wasi_descriptor_t fd, wasi_filesize_t size)
 {
-    // Call the underlying POSIX ftruncate function to set the file size.
-    if (ftruncate(fd, size) < 0) {
+    if (size > (uint64_t)INT64_MAX) {
+        return EOVERFLOW;
+    }
+
+    /* Keep ftruncate atomic with respect to append-stream EOF selection and
+       positional descriptor/stream writes. */
+    wasi_p2_file_io_lock();
+    int truncate_result = ftruncate(fd, (off_t)size);
+    int saved_error = truncate_result < 0 ? errno : 0;
+    wasi_p2_file_io_unlock();
+    if (truncate_result < 0) {
         // If it fails, convert the OS-specific errno to a WASI error code.
-        return errno;
+        return saved_error;
     }
     return WASI_ERROR_CODE_SUCCESS;
 }
@@ -1712,8 +1933,9 @@ wasi_filesystem_set_size(wasi_descriptor_t fd, wasi_filesize_t size)
  * `fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_create_directory_at(wasi_descriptor_t fd, const char *path)
+static int
+wasi_filesystem_create_directory_at_impl(wasm_exec_env_t exec_env,
+                                         wasi_descriptor_t fd, const char *path)
 {
     wasi_beneath_path_ref_t path_ref;
     int error;
@@ -1722,7 +1944,7 @@ wasi_filesystem_create_directory_at(wasi_descriptor_t fd, const char *path)
         return EINVAL;
     }
 
-    error = wasi_beneath_path_ref_init(fd, path, &path_ref);
+    error = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
     if (error != WASI_ERROR_CODE_SUCCESS) {
         return error;
     }
@@ -1743,6 +1965,20 @@ done:
     return error;
 }
 
+int
+wasi_filesystem_create_directory_at(wasi_descriptor_t fd, const char *path)
+{
+    return wasi_filesystem_create_directory_at_impl(NULL, fd, path);
+}
+
+int
+wasi_filesystem_create_directory_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                                  wasi_descriptor_t fd,
+                                                  const char *path)
+{
+    return wasi_filesystem_create_directory_at_impl(exec_env, fd, path);
+}
+
 /**
  * @brief Remove a directory at a path relative to a descriptor.
  * @details Implements the `remove-directory-at` function on the `descriptor`
@@ -1752,8 +1988,9 @@ done:
  * @param path The path of the directory to remove, relative to `fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_remove_directory_at(wasi_descriptor_t fd, const char *path)
+static int
+wasi_filesystem_remove_directory_at_impl(wasm_exec_env_t exec_env,
+                                         wasi_descriptor_t fd, const char *path)
 {
     wasi_beneath_path_ref_t path_ref;
     int error;
@@ -1762,7 +1999,7 @@ wasi_filesystem_remove_directory_at(wasi_descriptor_t fd, const char *path)
         return EINVAL;
     }
 
-    error = wasi_beneath_path_ref_init(fd, path, &path_ref);
+    error = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
     if (error != WASI_ERROR_CODE_SUCCESS) {
         return error;
     }
@@ -1782,6 +2019,20 @@ done:
     return error;
 }
 
+int
+wasi_filesystem_remove_directory_at(wasi_descriptor_t fd, const char *path)
+{
+    return wasi_filesystem_remove_directory_at_impl(NULL, fd, path);
+}
+
+int
+wasi_filesystem_remove_directory_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                                  wasi_descriptor_t fd,
+                                                  const char *path)
+{
+    return wasi_filesystem_remove_directory_at_impl(exec_env, fd, path);
+}
+
 /**
  * @brief Remove a file at a path relative to a descriptor.
  * @details Implements the `unlink-file-at` function on the `descriptor`
@@ -1791,8 +2042,9 @@ done:
  * @param path The path of the file to remove, relative to `fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_unlink_file_at(wasi_descriptor_t fd, const char *path)
+static int
+wasi_filesystem_unlink_file_at_impl(wasm_exec_env_t exec_env,
+                                    wasi_descriptor_t fd, const char *path)
 {
     wasi_beneath_path_ref_t path_ref;
     int error;
@@ -1801,7 +2053,7 @@ wasi_filesystem_unlink_file_at(wasi_descriptor_t fd, const char *path)
         return EINVAL;
     }
 
-    error = wasi_beneath_path_ref_init(fd, path, &path_ref);
+    error = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
     if (error != WASI_ERROR_CODE_SUCCESS) {
         return error;
     }
@@ -1822,6 +2074,20 @@ done:
     return error;
 }
 
+int
+wasi_filesystem_unlink_file_at(wasi_descriptor_t fd, const char *path)
+{
+    return wasi_filesystem_unlink_file_at_impl(NULL, fd, path);
+}
+
+int
+wasi_filesystem_unlink_file_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                             wasi_descriptor_t fd,
+                                             const char *path)
+{
+    return wasi_filesystem_unlink_file_at_impl(exec_env, fd, path);
+}
+
 /**
  * @brief Rename or move a file or directory.
  * @details Implements the `rename-at` function on the `descriptor` resource
@@ -1833,9 +2099,10 @@ done:
  * @param new_path The new path for the object, relative to `new_fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_rename_at(wasi_descriptor_t old_fd, const char *old_path,
-                          wasi_descriptor_t new_fd, const char *new_path)
+static int
+wasi_filesystem_rename_at_impl(wasm_exec_env_t exec_env,
+                               wasi_descriptor_t old_fd, const char *old_path,
+                               wasi_descriptor_t new_fd, const char *new_path)
 {
     wasi_beneath_path_ref_t old_ref, new_ref;
     int error;
@@ -1844,11 +2111,11 @@ wasi_filesystem_rename_at(wasi_descriptor_t old_fd, const char *old_path,
         return EINVAL;
     }
 
-    error = wasi_beneath_path_ref_init(old_fd, old_path, &old_ref);
+    error = wasi_beneath_path_ref_init(exec_env, old_fd, old_path, &old_ref);
     if (error != WASI_ERROR_CODE_SUCCESS) {
         return error;
     }
-    error = wasi_beneath_path_ref_init(new_fd, new_path, &new_ref);
+    error = wasi_beneath_path_ref_init(exec_env, new_fd, new_path, &new_ref);
     if (error != WASI_ERROR_CODE_SUCCESS) {
         wasi_beneath_path_ref_destroy(&old_ref);
         return error;
@@ -1874,6 +2141,25 @@ done:
     return error;
 }
 
+int
+wasi_filesystem_rename_at(wasi_descriptor_t old_fd, const char *old_path,
+                          wasi_descriptor_t new_fd, const char *new_path)
+{
+    return wasi_filesystem_rename_at_impl(NULL, old_fd, old_path, new_fd,
+                                          new_path);
+}
+
+int
+wasi_filesystem_rename_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                        wasi_descriptor_t old_fd,
+                                        const char *old_path,
+                                        wasi_descriptor_t new_fd,
+                                        const char *new_path)
+{
+    return wasi_filesystem_rename_at_impl(exec_env, old_fd, old_path, new_fd,
+                                          new_path);
+}
+
 /**
  * @brief Create a symbolic link.
  * @details Implements the `symlink-at` function on the `descriptor` resource
@@ -1886,9 +2172,9 @@ done:
  * relative to `fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_symlink_at(wasi_descriptor_t fd, const char *old_path,
-                           const char *new_path)
+static int
+wasi_filesystem_symlink_at_impl(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+                                const char *old_path, const char *new_path)
 {
     wasi_beneath_path_ref_t new_ref;
     int error;
@@ -1897,7 +2183,7 @@ wasi_filesystem_symlink_at(wasi_descriptor_t fd, const char *old_path,
         return EINVAL;
     }
 
-    error = wasi_beneath_path_ref_init(fd, new_path, &new_ref);
+    error = wasi_beneath_path_ref_init(exec_env, fd, new_path, &new_ref);
     if (error != WASI_ERROR_CODE_SUCCESS) {
         return error;
     }
@@ -1923,4 +2209,20 @@ wasi_filesystem_symlink_at(wasi_descriptor_t fd, const char *old_path,
 done:
     wasi_beneath_path_ref_destroy(&new_ref);
     return error;
+}
+
+int
+wasi_filesystem_symlink_at(wasi_descriptor_t fd, const char *old_path,
+                           const char *new_path)
+{
+    return wasi_filesystem_symlink_at_impl(NULL, fd, old_path, new_path);
+}
+
+int
+wasi_filesystem_symlink_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                         wasi_descriptor_t fd,
+                                         const char *old_path,
+                                         const char *new_path)
+{
+    return wasi_filesystem_symlink_at_impl(exec_env, fd, old_path, new_path);
 }

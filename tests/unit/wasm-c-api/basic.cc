@@ -8,6 +8,7 @@
 #include "bh_platform.h"
 #include "wasm_c_api.h"
 #include "wasm_c_api_internal.h"
+#include "wasm_runtime_common.h"
 
 #ifndef own
 #define own
@@ -56,6 +57,128 @@ TEST_F(CApiTests, wasm_store_t)
     store1 = wasm_store_new(engine);
     EXPECT_NE(nullptr, store1);
     wasm_store_delete(store1);
+}
+
+static void
+count_foreign_finalizer(void *value)
+{
+    int *count = reinterpret_cast<int *>(value);
+    (*count)++;
+}
+
+TEST_F(CApiTests, wasm_foreign_lifetime)
+{
+    wasm_store_t *store = wasm_store_new(engine);
+    ASSERT_NE(nullptr, store);
+
+    int finalized = 0;
+    wasm_foreign_t *foreign = wasm_foreign_new(store);
+    ASSERT_NE(nullptr, foreign);
+    EXPECT_EQ(1, foreign->ref_cnt);
+    EXPECT_EQ(0u, foreign->foreign_idx_rt);
+    wasm_foreign_set_host_info_with_finalizer(foreign, &finalized,
+                                              count_foreign_finalizer);
+
+    wasm_ref_t *ref = wasm_foreign_as_ref(foreign);
+    ASSERT_NE(nullptr, ref);
+    EXPECT_EQ(2, foreign->ref_cnt);
+
+    wasm_foreign_delete(foreign);
+    EXPECT_EQ(0, finalized);
+    EXPECT_EQ(1, foreign->ref_cnt);
+
+    wasm_ref_delete(ref);
+    EXPECT_EQ(1, finalized);
+
+    /* The dead registry slot is reused, and store teardown releases a live
+       host handle exactly once. */
+    foreign = wasm_foreign_new(store);
+    ASSERT_NE(nullptr, foreign);
+    EXPECT_EQ(0u, foreign->foreign_idx_rt);
+    wasm_foreign_set_host_info_with_finalizer(foreign, &finalized,
+                                              count_foreign_finalizer);
+    wasm_store_delete(store);
+    EXPECT_EQ(2, finalized);
+}
+
+TEST_F(CApiTests, wasm_externref_table_owns_private_reference)
+{
+    static wasm_byte_t module_bytes[] = {
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        /* (table 1 externref) */
+        0x04, 0x04, 0x01, 0x6f, 0x00, 0x01,
+        /* (global (mut externref) (ref.null extern)) */
+        0x06, 0x06, 0x01, 0x6f, 0x01, (wasm_byte_t)0xd0, 0x6f, 0x0b,
+        /* table/global exports */
+        0x07, 0x12, 0x02, 0x05, 0x74, 0x61, 0x62, 0x6c, 0x65, 0x01, 0x00, 0x06,
+        0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x03, 0x00
+    };
+    wasm_store_t *store = wasm_store_new(engine);
+    ASSERT_NE(nullptr, store);
+    wasm_byte_vec_t binary = WASM_ARRAY_VEC(module_bytes);
+    wasm_module_t *module = wasm_module_new(store, &binary);
+    ASSERT_NE(nullptr, module);
+    wasm_extern_vec_t no_imports = WASM_EMPTY_VEC;
+    wasm_instance_t *instance =
+        wasm_instance_new(store, module, &no_imports, nullptr);
+    ASSERT_NE(nullptr, instance);
+    wasm_extern_vec_t exports = WASM_EMPTY_VEC;
+    wasm_instance_exports(instance, &exports);
+    ASSERT_EQ(2u, exports.num_elems);
+    wasm_table_t *table = wasm_extern_as_table(exports.data[0]);
+    wasm_global_t *global = wasm_extern_as_global(exports.data[1]);
+    ASSERT_NE(nullptr, table);
+    ASSERT_NE(nullptr, global);
+
+    int finalized = 0;
+    wasm_foreign_t *foreign = wasm_foreign_new(store);
+    ASSERT_NE(nullptr, foreign);
+    wasm_foreign_set_host_info_with_finalizer(foreign, &finalized,
+                                              count_foreign_finalizer);
+    wasm_ref_t *caller_ref = wasm_foreign_as_ref(foreign);
+    ASSERT_NE(nullptr, caller_ref);
+    ASSERT_TRUE(wasm_table_set(table, 0, caller_ref));
+
+    /* wasm_table_set borrows its argument.  Deleting every caller handle must
+       not invalidate the table's private map reference. */
+    wasm_ref_delete(caller_ref);
+    wasm_foreign_delete(foreign);
+    EXPECT_EQ(0, finalized);
+
+    wasm_ref_t *from_table = wasm_table_get(table, 0);
+    ASSERT_NE(nullptr, from_table);
+    wasm_ref_delete(from_table);
+    EXPECT_EQ(0, finalized);
+
+    ASSERT_TRUE(wasm_table_set(table, 0, nullptr));
+    wasm_externref_reclaim(instance->inst_comm_rt);
+    EXPECT_EQ(1, finalized);
+    EXPECT_EQ(nullptr, wasm_table_get(table, 0));
+
+    foreign = wasm_foreign_new(store);
+    ASSERT_NE(nullptr, foreign);
+    wasm_foreign_set_host_info_with_finalizer(foreign, &finalized,
+                                              count_foreign_finalizer);
+    caller_ref = wasm_foreign_as_ref(foreign);
+    ASSERT_NE(nullptr, caller_ref);
+    wasm_val_t value = WASM_REF_VAL(caller_ref);
+    wasm_global_set(global, &value);
+    wasm_ref_delete(caller_ref);
+    wasm_foreign_delete(foreign);
+    EXPECT_EQ(1, finalized);
+
+    wasm_val_t from_global = WASM_INIT_VAL;
+    wasm_global_get(global, &from_global);
+    ASSERT_EQ(WASM_EXTERNREF, from_global.kind);
+    ASSERT_NE(nullptr, from_global.of.ref);
+    wasm_ref_delete(from_global.of.ref);
+    value = WASM_REF_VAL(nullptr);
+    wasm_global_set(global, &value);
+    wasm_externref_reclaim(instance->inst_comm_rt);
+    EXPECT_EQ(2, finalized);
+
+    wasm_extern_vec_delete(&exports);
+    wasm_store_delete(store);
 }
 
 TEST_F(CApiTests, wasm_byte_vec_t)

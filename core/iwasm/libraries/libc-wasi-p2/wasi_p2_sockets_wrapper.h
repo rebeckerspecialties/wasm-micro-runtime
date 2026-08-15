@@ -16,6 +16,7 @@ typedef struct wasi_socket_context_t {
     uint32_t fd;
     wasi_ip_address_family_t family;
     uint64_t tcp_listen_backlog;
+    bool tcp_is_listening;
 } wasi_socket_context_t;
 
 /* wasi:sockets/instance-network */

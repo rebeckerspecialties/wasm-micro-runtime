@@ -8,6 +8,9 @@
 #include <iostream>
 #include <cmath>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 namespace {
 bool reject_runtime_allocations = false;
@@ -256,6 +259,100 @@ TEST_F(ComponentPreparedCallAllocationTest,
     EXPECT_EQ(runtime_allocation_attempts, 0U);
     wasm_component_destroy_prepared_call(prepared);
     prepared = nullptr;
+}
+
+TEST_F(ComponentPreparedCallAllocationTest,
+       OutstandingPreparedCallAtomicallyRejectsDeinstantiate)
+{
+    ASSERT_TRUE(helper.read_wasm_file("add.wasm"));
+    ASSERT_TRUE(helper.load_component());
+    ASSERT_TRUE(helper.instantiate_component());
+
+    ASSERT_GT(helper.component_inst->defined_instances_count, 0u);
+    WASMComponentInstance *nested = helper.component_inst->defined_instances[0];
+    ASSERT_NE(nested, nullptr);
+    ASSERT_EQ(nested->lifecycle_root, helper.component_inst);
+    ASSERT_TRUE(wasm_component_instance_begin_operation(nested));
+    EXPECT_EQ(helper.component_inst->lifecycle_active_operations, 1u);
+    wasm_component_deinstantiate(helper.component_inst);
+    EXPECT_FALSE(helper.component_inst->deinstantiating);
+    wasm_component_instance_end_operation(nested);
+    EXPECT_EQ(helper.component_inst->lifecycle_active_operations, 0u);
+
+    prepared = wasm_component_prepare_export_call(helper.component_inst, "add",
+                                                  error_buf, sizeof(error_buf));
+    ASSERT_NE(prepared, nullptr) << error_buf;
+    ASSERT_EQ(helper.component_inst->outstanding_prepared_calls, 1u);
+
+    std::thread teardown_attempt(
+        [this] { wasm_component_deinstantiate(helper.component_inst); });
+    teardown_attempt.join();
+
+    const char *exception =
+        wasm_component_runtime_get_exception(helper.component_inst);
+    ASSERT_NE(exception, nullptr);
+    EXPECT_NE(strstr(exception, "outstanding prepared calls"), nullptr);
+
+    wasm_val_t args[2] = {};
+    wasm_val_t result = {};
+    args[0].kind = WASM_I32;
+    args[0].of.i32 = 8;
+    args[1].kind = WASM_I32;
+    args[1].of.i32 = 5;
+    ASSERT_TRUE(wasm_component_call_prepared(prepared, 1, &result, 2, args));
+    EXPECT_EQ(result.of.i32, 13);
+    ASSERT_TRUE(wasm_component_prepared_call_post_return(prepared));
+
+    wasm_component_destroy_prepared_call(prepared);
+    prepared = nullptr;
+    EXPECT_EQ(helper.component_inst->outstanding_prepared_calls, 0u);
+}
+
+TEST_F(ComponentExecutionTest, RootOperationsAreRecursiveAndSerialized)
+{
+    ASSERT_TRUE(helper->read_wasm_file("add.wasm"));
+    ASSERT_TRUE(helper->load_component());
+    ASSERT_TRUE(helper->instantiate_component());
+    ASSERT_GT(helper->component_inst->defined_instances_count, 0u);
+
+    WASMComponentInstance *root = helper->component_inst;
+    WASMComponentInstance *nested = root->defined_instances[0];
+    ASSERT_NE(nested, nullptr);
+    ASSERT_EQ(nested->lifecycle_root, root);
+
+    /* Same-thread host callbacks may reenter a root operation. */
+    ASSERT_TRUE(wasm_component_instance_begin_operation(root));
+    ASSERT_TRUE(wasm_component_instance_begin_operation(nested));
+    EXPECT_EQ(root->lifecycle_active_operations, 2u);
+    wasm_component_instance_end_operation(nested);
+    EXPECT_EQ(root->lifecycle_active_operations, 1u);
+
+    std::atomic<bool> second_entered{ false };
+    std::thread second([&] {
+        bool entered = wasm_component_instance_begin_operation(nested);
+        second_entered.store(entered, std::memory_order_release);
+        if (entered) {
+            wasm_component_instance_end_operation(nested);
+        }
+    });
+
+    /* The lifecycle-gate user count reaches two before the second thread
+     * waits on the operation lock, making the blocked state deterministic. */
+    constexpr uint32_t gate_users_mask = 0x7FFFFFFFu;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while ((BH_ATOMIC_32_LOAD(root->lifecycle_gate_state) & gate_users_mask) < 2
+           && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_GE(BH_ATOMIC_32_LOAD(root->lifecycle_gate_state) & gate_users_mask,
+              2u);
+    EXPECT_FALSE(second_entered.load(std::memory_order_acquire));
+    EXPECT_EQ(root->lifecycle_active_operations, 1u);
+
+    wasm_component_instance_end_operation(root);
+    second.join();
+    EXPECT_TRUE(second_entered.load(std::memory_order_acquire));
+    EXPECT_EQ(root->lifecycle_active_operations, 0u);
 }
 
 TEST_F(ComponentExecutionTest, NestedHostResourceUsesCallingComponentTable)

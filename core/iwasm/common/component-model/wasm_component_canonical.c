@@ -12,6 +12,390 @@
 #include "stdlib.h"
 #include "bh_assert.h"
 #include "wasm_component_task.h"
+#include "wasm_exec_env.h"
+
+#define CANONICAL_RESOURCE_TRANSFER_MAX_DEPTH 16
+
+typedef struct CanonicalResourceTransferState {
+    LiftLowerContext *cx;
+    WASMComponentTableTransaction table_transaction;
+    const void *unwind_target;
+    WASMComponentTableTransactionMode mode;
+    uint64_t cookie;
+    uint32_t nesting;
+    bool failed;
+} CanonicalResourceTransferState;
+
+typedef struct CanonicalResourceTransferContext {
+    CanonicalResourceTransferState
+        states[CANONICAL_RESOURCE_TRANSFER_MAX_DEPTH];
+    uint64_t next_cookie;
+    uint32_t depth;
+} CanonicalResourceTransferContext;
+
+#if defined(os_thread_local_attribute)
+static os_thread_local_attribute CanonicalResourceTransferContext
+    current_resource_transfer_context;
+#elif defined(_MSC_VER)
+static __declspec(thread)
+    CanonicalResourceTransferContext current_resource_transfer_context;
+#elif defined(__GNUC__) || defined(__clang__)
+static __thread CanonicalResourceTransferContext
+    current_resource_transfer_context;
+#else
+static _Thread_local CanonicalResourceTransferContext
+    current_resource_transfer_context;
+#endif
+
+static const void *
+canonical_resource_transfer_unwind_target(void)
+{
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    WASMExecEnv *exec_env = wasm_runtime_get_exec_env_tls();
+
+    return exec_env ? exec_env->jmpbuf_stack_top : NULL;
+#else
+    return NULL;
+#endif
+}
+
+static bool
+canonical_resource_transfer_state_finish(
+    CanonicalResourceTransferContext *context, bool commit)
+{
+    CanonicalResourceTransferState *state;
+    bool success;
+
+    if (!context || context->depth == 0)
+        return false;
+    state = &context->states[context->depth - 1];
+    success =
+        commit
+            ? wasm_component_table_transaction_commit(&state->table_transaction)
+            : wasm_component_table_transaction_rollback(
+                &state->table_transaction);
+    memset(state, 0, sizeof(*state));
+    context->depth--;
+    return success;
+}
+
+bool
+canonical_resource_transfer_scope_enter(CanonicalResourceTransferScope *scope,
+                                        LiftLowerContext *cx,
+                                        WASMComponentTableTransactionMode mode)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+    CanonicalResourceTransferState *state;
+
+    if (!scope || !cx || !cx->inst || !cx->inst->table)
+        return false;
+    memset(scope, 0, sizeof(*scope));
+
+    if (context->depth > 0) {
+        state = &context->states[context->depth - 1];
+        if (state->table_transaction.active && state->cx == cx
+            && state->mode == mode
+            && state->table_transaction.table == cx->inst->table) {
+            if (state->failed || state->nesting == UINT32_MAX)
+                return false;
+            state->nesting++;
+            scope->cookie = state->cookie;
+            scope->depth = context->depth - 1;
+            scope->nesting = state->nesting;
+            scope->active = true;
+            return true;
+        }
+    }
+
+    if (context->depth >= CANONICAL_RESOURCE_TRANSFER_MAX_DEPTH)
+        return false;
+    state = &context->states[context->depth];
+    memset(state, 0, sizeof(*state));
+    state->cx = cx;
+    state->mode = mode;
+    state->unwind_target = canonical_resource_transfer_unwind_target();
+    state->nesting = 1;
+    context->next_cookie++;
+    if (context->next_cookie == 0)
+        context->next_cookie++;
+    state->cookie = context->next_cookie;
+    if (!wasm_component_table_transaction_begin(&state->table_transaction,
+                                                cx->inst->table, mode)) {
+        memset(state, 0, sizeof(*state));
+        return false;
+    }
+
+    scope->cookie = state->cookie;
+    scope->depth = context->depth;
+    scope->nesting = 1;
+    scope->outer = true;
+    scope->active = true;
+    context->depth++;
+    return true;
+}
+
+bool
+canonical_resource_transfer_scope_leave(CanonicalResourceTransferScope *scope,
+                                        bool success)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+    CanonicalResourceTransferState *state;
+    bool transaction_succeeded;
+    bool transaction_failed;
+
+    if (!scope || !scope->active || context->depth == 0
+        || scope->depth != context->depth - 1) {
+        if (scope)
+            memset(scope, 0, sizeof(*scope));
+        return false;
+    }
+    state = &context->states[context->depth - 1];
+    if (state->cookie != scope->cookie || state->nesting != scope->nesting) {
+        state->failed = true;
+        memset(scope, 0, sizeof(*scope));
+        return false;
+    }
+    if (!success)
+        state->failed = true;
+
+    if (!scope->outer) {
+        state->nesting--;
+        success = success && !state->failed;
+        memset(scope, 0, sizeof(*scope));
+        return success;
+    }
+
+    if (state->nesting != 1) {
+        state->failed = true;
+        success = false;
+    }
+    transaction_failed = state->failed;
+    transaction_succeeded = canonical_resource_transfer_state_finish(
+        context, success && !transaction_failed);
+    success = success && !transaction_failed && transaction_succeeded;
+    memset(scope, 0, sizeof(*scope));
+    return success;
+}
+
+bool
+canonical_resource_transfer_scope_can_commit(
+    const CanonicalResourceTransferScope *scope)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+    CanonicalResourceTransferState *state;
+
+    if (!scope || !scope->active || !scope->outer
+        || scope->depth >= context->depth)
+        return false;
+    state = &context->states[scope->depth];
+    return state->cookie == scope->cookie && state->nesting == 1
+           && !state->failed
+           && wasm_component_table_transaction_can_commit(
+               &state->table_transaction);
+}
+
+static CanonicalResourceTransferState *
+canonical_resource_transfer_savepoint_state(
+    const CanonicalResourceTransferSavepoint *savepoint)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+    CanonicalResourceTransferState *state;
+
+    if (!savepoint || !savepoint->active || context->depth == 0
+        || savepoint->depth != context->depth - 1) {
+        return NULL;
+    }
+    state = &context->states[savepoint->depth];
+    if (state->cookie != savepoint->cookie || state->failed
+        || state->mode != WASM_COMPONENT_TABLE_TRANSACTION_LOWER
+        || savepoint->table_savepoint.transaction
+               != &state->table_transaction) {
+        return NULL;
+    }
+    return state;
+}
+
+bool
+canonical_resource_transfer_savepoint_begin(
+    CanonicalResourceTransferSavepoint *savepoint, LiftLowerContext *cx)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+    CanonicalResourceTransferState *state;
+
+    if (!savepoint || !cx || context->depth == 0) {
+        return false;
+    }
+    memset(savepoint, 0, sizeof(*savepoint));
+    state = &context->states[context->depth - 1];
+    if (state->failed || state->cx != cx
+        || state->mode != WASM_COMPONENT_TABLE_TRANSACTION_LOWER
+        || state->table_transaction.table != cx->inst->table
+        || !wasm_component_table_transaction_savepoint_begin(
+            &state->table_transaction, &savepoint->table_savepoint)) {
+        return false;
+    }
+    savepoint->cookie = state->cookie;
+    savepoint->depth = context->depth - 1;
+    savepoint->active = true;
+    return true;
+}
+
+bool
+canonical_resource_transfer_savepoint_can_commit(
+    const CanonicalResourceTransferSavepoint *savepoint)
+{
+    return canonical_resource_transfer_savepoint_state(savepoint) != NULL
+           && wasm_component_table_transaction_savepoint_can_commit(
+               &savepoint->table_savepoint);
+}
+
+bool
+canonical_resource_transfer_savepoint_commit(
+    CanonicalResourceTransferSavepoint *savepoint)
+{
+    CanonicalResourceTransferState *state =
+        canonical_resource_transfer_savepoint_state(savepoint);
+
+    if (!state
+        || !wasm_component_table_transaction_savepoint_commit(
+            &savepoint->table_savepoint)) {
+        if (state) {
+            state->failed = true;
+        }
+        return false;
+    }
+    memset(savepoint, 0, sizeof(*savepoint));
+    return true;
+}
+
+bool
+canonical_resource_transfer_savepoint_rollback(
+    CanonicalResourceTransferSavepoint *savepoint)
+{
+    CanonicalResourceTransferState *state =
+        canonical_resource_transfer_savepoint_state(savepoint);
+
+    if (!state
+        || !wasm_component_table_transaction_savepoint_rollback(
+            &savepoint->table_savepoint)) {
+        if (state) {
+            state->failed = true;
+        }
+        return false;
+    }
+    memset(savepoint, 0, sizeof(*savepoint));
+    return true;
+}
+
+bool
+canonical_resource_transfer_scope_rebind_single_owned_rep(
+    const CanonicalResourceTransferScope *scope, uint32_t expected_rep,
+    uint32_t replacement_rep)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+    CanonicalResourceTransferState *state;
+
+    if (!scope || !scope->active || !scope->outer
+        || scope->depth >= context->depth) {
+        return false;
+    }
+    state = &context->states[scope->depth];
+    return state->cookie == scope->cookie && state->nesting == 1
+           && !state->failed
+           && wasm_component_table_transaction_rebind_single_owned_rep(
+               &state->table_transaction, expected_rep, replacement_rep);
+}
+
+bool
+canonical_resource_transfer_scope_discard(CanonicalResourceTransferScope *scope)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+    CanonicalResourceTransferState *state;
+    bool success;
+
+    if (!scope || !scope->active || !scope->outer || context->depth == 0
+        || scope->depth != context->depth - 1)
+        return false;
+    state = &context->states[context->depth - 1];
+    if (state->cookie != scope->cookie || state->nesting != 1
+        || state->mode != WASM_COMPONENT_TABLE_TRANSACTION_LIFT) {
+        state->failed = true;
+        return false;
+    }
+
+    success = wasm_component_table_transaction_discard_lift(
+        &state->table_transaction);
+    memset(state, 0, sizeof(*state));
+    context->depth--;
+    memset(scope, 0, sizeof(*scope));
+    return success;
+}
+
+bool
+canonical_resource_transfer_reserve_lift(LiftLowerContext *cx, uint32_t index)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+    CanonicalResourceTransferState *state;
+
+    if (!cx || context->depth == 0)
+        return false;
+    state = &context->states[context->depth - 1];
+    return !state->failed && state->cx == cx
+           && state->mode == WASM_COMPONENT_TABLE_TRANSACTION_LIFT
+           && state->table_transaction.table == cx->inst->table
+           && wasm_component_table_transaction_reserve_lift(
+               &state->table_transaction, index);
+}
+
+bool
+canonical_resource_transfer_record_lower(LiftLowerContext *cx, uint32_t index)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+    CanonicalResourceTransferState *state;
+
+    if (!cx || context->depth == 0)
+        return false;
+    state = &context->states[context->depth - 1];
+    return !state->failed && state->cx == cx
+           && state->mode == WASM_COMPONENT_TABLE_TRANSACTION_LOWER
+           && state->table_transaction.table == cx->inst->table
+           && wasm_component_table_transaction_record_lower(
+               &state->table_transaction, index);
+}
+
+void
+canonical_resource_transfer_unwind_to(const void *unwind_target)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+
+    if (!unwind_target)
+        return;
+    while (context->depth > 0
+           && context->states[context->depth - 1].unwind_target
+                  == unwind_target) {
+        (void)canonical_resource_transfer_state_finish(context, false);
+    }
+}
+
+void
+canonical_resource_transfer_unwind_current(void)
+{
+    CanonicalResourceTransferContext *context =
+        &current_resource_transfer_context;
+
+    while (context->depth > 0)
+        (void)canonical_resource_transfer_state_finish(context, false);
+}
 
 static const int DETERMINISTIC_PROFILE = 0;
 static const uint32_t CANONICAL_FLOAT32_NAN = 0x7fc00000u;
@@ -26,6 +410,15 @@ set_component_exception(LiftLowerContext *cx, const char *msg)
         snprintf(cx->inst->cur_exception, sizeof(cx->inst->cur_exception),
                  "Exception: %s", msg);
     }
+}
+
+static bool
+loaded_wit_value_or_oom(LiftLowerContext *cx, wit_value_t *out)
+{
+    if (out && *out)
+        return true;
+    set_component_exception(cx, "out of memory for canonical ABI value");
+    return false;
 }
 
 static uint32_t
@@ -415,7 +808,7 @@ load_string_from_range(LiftLowerContext *cx, uint32_t begin,
         wit_string_ctor(decoded_str, decoded_len, tagged_code_units, encoding);
     wasm_runtime_free(decoded_str);
 
-    return true;
+    return loaded_wit_value_or_oom(cx, out);
 }
 
 static bool
@@ -446,7 +839,7 @@ lift_error_context(LiftLowerContext *cx, uint32_t errctx_val, wit_value_t *out)
     // For now, just store the i32 opaque handle
     *out = wit_errctx_ctor(errctx);
 
-    return true;
+    return loaded_wit_value_or_oom(cx, out);
 }
 
 static bool
@@ -462,7 +855,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
                 return false;
             uint8_t val = (uint8_t)loaded_val;
             *out = wit_bool_ctor(val != 0); // 0 = false, non-zero = true
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_U8:
@@ -470,7 +863,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!load_int(cx, ptr, 1, false, &loaded_val))
                 return false;
             *out = wit_u8_ctor((uint8_t)loaded_val);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_U16:
@@ -478,7 +871,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!load_int(cx, ptr, 2, false, &loaded_val))
                 return false;
             *out = wit_u16_ctor((uint16_t)loaded_val);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_U32:
@@ -486,7 +879,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!load_int(cx, ptr, 4, false, &loaded_val))
                 return false;
             *out = wit_u32_ctor((uint32_t)loaded_val);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_U64:
@@ -494,7 +887,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!load_int(cx, ptr, 8, false, &loaded_val))
                 return false;
             *out = wit_u64_ctor(loaded_val);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_S8:
@@ -502,7 +895,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!load_int(cx, ptr, 1, true, &loaded_val))
                 return false;
             *out = wit_s8_ctor((int8_t)loaded_val);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_S16:
@@ -510,7 +903,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!load_int(cx, ptr, 2, true, &loaded_val))
                 return false;
             *out = wit_s16_ctor((int16_t)loaded_val);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_S32:
@@ -518,7 +911,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!load_int(cx, ptr, 4, true, &loaded_val))
                 return false;
             *out = wit_s32_ctor((int32_t)loaded_val);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_S64:
@@ -526,7 +919,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!load_int(cx, ptr, 8, true, &loaded_val))
                 return false;
             *out = wit_s64_ctor((int64_t)loaded_val);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_F32:
@@ -534,7 +927,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!load_int(cx, ptr, 4, false, &loaded_val))
                 return false;
             *out = wit_f32_ctor(decode_i32_as_float((uint32_t)loaded_val));
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_F64:
@@ -542,7 +935,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!load_int(cx, ptr, 8, false, &loaded_val))
                 return false;
             *out = wit_f64_ctor(decode_i64_as_float(loaded_val));
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_CHAR:
@@ -553,7 +946,7 @@ load_primitive_value(LiftLowerContext *cx, uint32_t ptr,
             if (!convert_i32_to_char(cx, (uint32_t)loaded_val, &codepoint))
                 return false;
             *out = wit_char_ctor(codepoint);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         case WASM_COMP_PRIMVAL_STRING:
@@ -581,8 +974,14 @@ load_list_from_valid_range(LiftLowerContext *cx, uint32_t ptr, uint32_t length,
                            WASMComponentTypeInstance *type, wit_value_t *out)
 {
     // Allocate array for elements
+    if (length > UINT32_MAX / sizeof(wit_value_t)) {
+        set_component_exception(cx, "list element array is too large");
+        return false;
+    }
     wit_value_t *elements =
-        (wit_value_t *)wasm_runtime_malloc(length * sizeof(wit_value_t));
+        length > 0
+            ? (wit_value_t *)wasm_runtime_malloc(length * sizeof(wit_value_t))
+            : NULL;
     if (!elements && length > 0) {
         set_component_exception(cx, "out of memory for list elements");
         return false;
@@ -591,20 +990,29 @@ load_list_from_valid_range(LiftLowerContext *cx, uint32_t ptr, uint32_t length,
     uint32_t elem_sz = get_elem_size(type);
 
     // Load each element
-    for (uint32_t i = 0; i < length; i++) {
+    uint32_t i;
+    for (i = 0; i < length; i++) {
+        elements[i] = NULL;
         if (!load(cx, ptr + (i * elem_sz), type, &elements[i])) {
+            while (i > 0)
+                free_wit_value(elements[--i]);
             wasm_runtime_free((void *)elements);
             return false;
         }
     }
 
     *out = wit_list_ctor(elements, length);
-    return true;
+    if (!*out) {
+        for (i = 0; i < length; i++)
+            free_wit_value(elements[i]);
+        wasm_runtime_free(elements);
+    }
+    return loaded_wit_value_or_oom(cx, out);
 }
 
-bool
-load_list_from_range(LiftLowerContext *cx, uint32_t ptr, uint32_t length,
-                     WASMComponentTypeInstance *type, wit_value_t *out)
+static bool
+load_list_from_range_impl(LiftLowerContext *cx, uint32_t ptr, uint32_t length,
+                          WASMComponentTypeInstance *type, wit_value_t *out)
 {
     uint32_t elem_alignment = get_alignment(type);
     uint32_t elem_sz = get_elem_size(type);
@@ -617,6 +1025,31 @@ load_list_from_range(LiftLowerContext *cx, uint32_t ptr, uint32_t length,
     trap_if((uint64_t)ptr + (uint64_t)length * elem_sz > mem->memory_data_size);
 
     return load_list_from_valid_range(cx, ptr, length, type, out);
+}
+
+bool
+load_list_from_range(LiftLowerContext *cx, uint32_t ptr, uint32_t length,
+                     WASMComponentTypeInstance *type, wit_value_t *out)
+{
+    CanonicalResourceTransferScope scope;
+    bool success;
+
+    if (!out)
+        return false;
+    *out = NULL;
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LIFT)) {
+        set_component_exception(cx, "failed to begin canonical list lift");
+        return false;
+    }
+
+    success = load_list_from_range_impl(cx, ptr, length, type, out);
+    success = canonical_resource_transfer_scope_leave(&scope, success);
+    if (!success && *out) {
+        free_wit_value(*out);
+        *out = NULL;
+    }
+    return success;
 }
 
 static bool
@@ -649,9 +1082,10 @@ load_record(LiftLowerContext *cx, uint32_t ptr,
 {
     // Allocate array for elements
     ComponentWITRecordField *elements =
-        (ComponentWITRecordField *)wasm_runtime_malloc(
-            type->count * sizeof(ComponentWITRecordField));
-    if (!elements) {
+        type->count > 0 ? (ComponentWITRecordField *)wasm_runtime_calloc(
+            type->count, sizeof(ComponentWITRecordField))
+                        : NULL;
+    if (!elements && type->count > 0) {
         set_component_exception(cx, "out of memory for record elements");
         return false;
     }
@@ -673,13 +1107,29 @@ load_record(LiftLowerContext *cx, uint32_t ptr,
 
         init_record_field(&elements[field], type->fields[field].label->name,
                           type->fields[field].label->name_len, temp);
+        if (!elements[field].key) {
+            free_wit_value(temp);
+            for (uint32_t index = 0; index < field; index++) {
+                free_wit_value(elements[index].value);
+                wasm_runtime_free(elements[index].key);
+            }
+            wasm_runtime_free(elements);
+            set_component_exception(cx, "out of memory for record field name");
+            return false;
+        }
 
         ptr += get_elem_size(type->fields[field].type);
     }
 
     *out = wit_record_ctor(elements, type->count);
-
-    return true;
+    if (!*out) {
+        for (uint32_t index = 0; index < type->count; index++) {
+            free_wit_value(elements[index].value);
+            wasm_runtime_free(elements[index].key);
+        }
+        wasm_runtime_free(elements);
+    }
+    return loaded_wit_value_or_oom(cx, out);
 }
 
 static bool
@@ -703,7 +1153,7 @@ load_variant(LiftLowerContext *cx, uint32_t ptr,
     ptr = align_to(ptr, compute_max_case_alignment(type));
     if (c.value_type == NULL) {
         *out = wit_variant_ctor(c.label->name, c.label->name_len, NULL);
-        return true;
+        return loaded_wit_value_or_oom(cx, out);
     }
 
     wit_value_t temp = NULL;
@@ -712,7 +1162,9 @@ load_variant(LiftLowerContext *cx, uint32_t ptr,
     }
 
     *out = wit_variant_ctor(c.label->name, c.label->name_len, temp);
-    return true;
+    if (!*out)
+        free_wit_value(temp);
+    return loaded_wit_value_or_oom(cx, out);
 }
 
 bool
@@ -721,22 +1173,39 @@ unpack_flags_from_int(LiftLowerContext *cx, uint64_t i,
 {
     // Allocate array for elements
     ComponentWITRecordField *elements =
-        (ComponentWITRecordField *)wasm_runtime_malloc(
-            labels->count * sizeof(ComponentWITRecordField));
+        (ComponentWITRecordField *)wasm_runtime_calloc(
+            labels->count, sizeof(ComponentWITRecordField));
     if (!elements) {
         set_component_exception(cx, "out of memory for flags elements");
         return false;
     }
 
     for (uint32_t index = 0; index < labels->count; index++) {
+        wit_value_t flag = wit_bool_ctor(i & 1);
+        if (!flag)
+            goto fail;
         init_record_field(&elements[index], labels->flags[index].name,
-                          labels->flags[index].name_len, wit_bool_ctor(i & 1));
+                          labels->flags[index].name_len, flag);
+        if (!elements[index].key) {
+            free_wit_value(flag);
+            goto fail;
+        }
         i >>= 1;
     }
 
     *out = wit_flag_ctor(elements, labels->count);
-
+    if (!*out)
+        goto fail;
     return true;
+
+fail:
+    for (uint32_t index = 0; index < labels->count; index++) {
+        wasm_runtime_free(elements[index].key);
+        free_wit_value(elements[index].value);
+    }
+    wasm_runtime_free(elements);
+    set_component_exception(cx, "out of memory for flags value");
+    return false;
 }
 
 static bool
@@ -780,7 +1249,12 @@ load_tuple(LiftLowerContext *cx, uint32_t ptr, WASMComponentTupleInstance *type,
     }
 
     *out = wit_tuple_ctor(elems, type->count);
-    return true;
+    if (!*out) {
+        for (uint32_t index = 0; index < type->count; index++)
+            free_wit_value(elems[index]);
+        wasm_runtime_free(elems);
+    }
+    return loaded_wit_value_or_oom(cx, out);
 }
 
 static bool
@@ -798,7 +1272,7 @@ load_enum(LiftLowerContext *cx, uint32_t ptr, const WASMComponentEnumType *type,
     trap_if(case_index >= type->count);
 
     *out = wit_enum_ctor(case_index);
-    return true;
+    return loaded_wit_value_or_oom(cx, out);
 }
 
 static bool
@@ -829,13 +1303,13 @@ load_option(LiftLowerContext *cx, uint32_t ptr,
     if (case_index == 0) {
         // Case "none" - no payload
         *out = wit_option_ctor(NULL);
-        return true;
+        return loaded_wit_value_or_oom(cx, out);
     }
     else {
         // Case "some" - has payload
         if (type->element_type == NULL) {
             *out = wit_option_ctor(NULL);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         wit_value_t payload = NULL;
@@ -844,7 +1318,9 @@ load_option(LiftLowerContext *cx, uint32_t ptr,
         }
 
         *out = wit_option_ctor(payload);
-        return true;
+        if (!*out)
+            free_wit_value(payload);
+        return loaded_wit_value_or_oom(cx, out);
     }
 }
 
@@ -883,7 +1359,7 @@ load_result(LiftLowerContext *cx, uint32_t ptr,
         // Case "ok"
         if (type->result_type == NULL) {
             *out = wit_result_ctor(false, NULL);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         wit_value_t payload = NULL;
@@ -892,13 +1368,15 @@ load_result(LiftLowerContext *cx, uint32_t ptr,
         }
 
         *out = wit_result_ctor(false, payload);
-        return true;
+        if (!*out)
+            free_wit_value(payload);
+        return loaded_wit_value_or_oom(cx, out);
     }
     else {
         // Case "error"
         if (type->error_type == NULL) {
             *out = wit_result_ctor(true, NULL);
-            return true;
+            return loaded_wit_value_or_oom(cx, out);
         }
 
         wit_value_t payload = NULL;
@@ -907,13 +1385,15 @@ load_result(LiftLowerContext *cx, uint32_t ptr,
         }
 
         *out = wit_result_ctor(true, payload);
-        return true;
+        if (!*out)
+            free_wit_value(payload);
+        return loaded_wit_value_or_oom(cx, out);
     }
 }
 
-bool
-lift_own(LiftLowerContext *cx, uint32_t index,
-         WASMComponentResourceHandleInstance *type, wit_value_t *out)
+static bool
+lift_own_impl(LiftLowerContext *cx, uint32_t index,
+              WASMComponentResourceHandleInstance *type, wit_value_t *out)
 {
     // 1. Look up handle in table
     const WASMResourceHandle *handle =
@@ -928,19 +1408,58 @@ lift_own(LiftLowerContext *cx, uint32_t index,
     // 3. Get the rep
     uint32_t rep = handle->rep;
 
-    // 4. Remove from table (ownership transfers out)
-    trap_if(!wasm_component_table_remove(cx->inst->table, index));
+    /* Allocate the host-side value before removing the owned handle.  If the
+       quota is exhausted, the table must retain ownership of the rep. */
+    *out = wit_resource_ctor(rep);
+    if (!loaded_wit_value_or_oom(cx, out))
+        return false;
+
+    // 4. Reserve the exact handle until the complete lifted value succeeds.
+    if (!canonical_resource_transfer_reserve_lift(cx, index)) {
+        free_wit_value(*out);
+        *out = NULL;
+        set_component_exception(cx, "failed to reserve owned resource handle");
+        return false;
+    }
 
     // 5. Return rep
-    *out = wit_resource_ctor(rep);
     return true;
+}
+
+bool
+lift_own(LiftLowerContext *cx, uint32_t index,
+         WASMComponentResourceHandleInstance *type, wit_value_t *out)
+{
+    CanonicalResourceTransferScope scope;
+    bool success;
+
+    if (!out)
+        return false;
+    *out = NULL;
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LIFT)) {
+        set_component_exception(cx, "failed to begin owned resource lift");
+        return false;
+    }
+
+    success = lift_own_impl(cx, index, type, out);
+    success = canonical_resource_transfer_scope_leave(&scope, success);
+    if (!success && *out) {
+        free_wit_value(*out);
+        *out = NULL;
+    }
+    return success;
 }
 
 bool
 lift_borrow(LiftLowerContext *cx, uint32_t index,
             const WASMComponentResourceHandleInstance *type, wit_value_t *out)
 {
-    bh_assert(cx->borrow_scope_type == BORROW_SCOPE_SUBTASK);
+    if (!cx || cx->borrow_scope_type != BORROW_SCOPE_SUBTASK
+        || !cx->borrow_scope.subtask) {
+        set_component_exception(cx, "invalid borrow lifting scope");
+        return false;
+    }
 
     // 1. Look up handle in table
     WASMResourceHandle *handle = (WASMResourceHandle *)wasm_component_table_get(
@@ -950,21 +1469,29 @@ lift_borrow(LiftLowerContext *cx, uint32_t index,
     // 2. For sync-only: no need to validate own vs borrow. Both are valid - we
     // just extract the rep
 
-    // 3. If borrowing from an own handle, track the lend
-    if (!subtask_add_lender(cx->borrow_scope.subtask, handle))
+    // 3. Allocate the host value before changing lender bookkeeping.
+    *out = wit_resource_ctor(handle->rep);
+    if (!loaded_wit_value_or_oom(cx, out))
         return false;
 
-    // 4. Save rep
-    *out = wit_resource_ctor(handle->rep);
+    // 4. Track the lend only after every fallible value allocation succeeds.
+    if (!subtask_add_lender(cx->borrow_scope.subtask, handle)) {
+        free_wit_value(*out);
+        *out = NULL;
+        set_component_exception(cx, "failed to track borrowed resource");
+        return false;
+    }
+
     return true;
 }
 
-bool
-load(LiftLowerContext *cx, uint32_t ptr, WASMComponentTypeInstance *type,
-     wit_value_t *out)
+static bool
+load_impl(LiftLowerContext *cx, uint32_t ptr, WASMComponentTypeInstance *type,
+          wit_value_t *out)
 {
-    if (!type)
+    if (!type || !out)
         return false;
+    *out = NULL;
     trap_if(ptr != align_to(ptr, type->alignment));
     trap_if((uint64_t)ptr + type->elem_size
             > get_mem_from_cx(cx)->memory_data_size);
@@ -1051,6 +1578,31 @@ load(LiftLowerContext *cx, uint32_t ptr, WASMComponentTypeInstance *type,
     }
 
     return false;
+}
+
+bool
+load(LiftLowerContext *cx, uint32_t ptr, WASMComponentTypeInstance *type,
+     wit_value_t *out)
+{
+    CanonicalResourceTransferScope scope;
+    bool success;
+
+    if (!out)
+        return false;
+    *out = NULL;
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LIFT)) {
+        set_component_exception(cx, "failed to begin canonical value lift");
+        return false;
+    }
+
+    success = load_impl(cx, ptr, type, out);
+    success = canonical_resource_transfer_scope_leave(&scope, success);
+    if (!success && *out) {
+        free_wit_value(*out);
+        *out = NULL;
+    }
+    return success;
 }
 
 // Store
@@ -1552,9 +2104,9 @@ store_string(LiftLowerContext *cx, uint32_t ptr, wit_value_t str)
     return true;
 }
 
-bool
-lower_error_context(LiftLowerContext *cx, wit_value_t value,
-                    uint32_t *out_index)
+static bool
+lower_error_context_impl(LiftLowerContext *cx, wit_value_t value,
+                         uint32_t *out_index)
 {
     uint32_t out = 0;
     void *errctx_ptr = (void *)(uintptr_t)value->value.resource_value
@@ -1563,9 +2115,32 @@ lower_error_context(LiftLowerContext *cx, wit_value_t value,
                                   WASM_TABLE_ELEM_ERROR_CONTEXT, &out)) {
         return false;
     }
+    if (!canonical_resource_transfer_record_lower(cx, out)) {
+        (void)wasm_component_table_remove(cx->inst->table, out);
+        set_component_exception(cx, "failed to record error-context lowering");
+        return false;
+    }
 
     *out_index = out;
     return true;
+}
+
+bool
+lower_error_context(LiftLowerContext *cx, wit_value_t value,
+                    uint32_t *out_index)
+{
+    CanonicalResourceTransferScope scope;
+    bool success;
+
+    if (!out_index)
+        return false;
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+        set_component_exception(cx, "failed to begin error-context lowering");
+        return false;
+    }
+    success = lower_error_context_impl(cx, value, out_index);
+    return canonical_resource_transfer_scope_leave(&scope, success);
 }
 
 static bool
@@ -1682,15 +2257,21 @@ store_list_into_valid_range(LiftLowerContext *cx, uint32_t ptr, uint32_t length,
     return true;
 }
 
-bool
-store_list_into_range(LiftLowerContext *cx, uint32_t length,
-                      WASMComponentTypeInstance *type, uint32_t *begin_out,
-                      uint32_t *length_out, wit_value_t value)
+static bool
+store_list_into_range_impl(LiftLowerContext *cx, uint32_t length,
+                           WASMComponentTypeInstance *type, uint32_t *begin_out,
+                           uint32_t *length_out, wit_value_t value)
 {
     uint64_t byte_length =
         (uint64_t)value->value.list_value.size * type->elem_size;
     trap_if(byte_length >= (1ULL << 32));
     const WASMMemoryInstance *mem = get_mem_from_cx(cx);
+
+    if (length == 0) {
+        *begin_out = 0;
+        *length_out = 0;
+        return true;
+    }
 
     // Call realloc
     uint32 ptr = (uint32)wasm_runtime_call_realloc(
@@ -1709,6 +2290,24 @@ store_list_into_range(LiftLowerContext *cx, uint32_t length,
     *begin_out = ptr;
     *length_out = length;
     return true;
+}
+
+bool
+store_list_into_range(LiftLowerContext *cx, uint32_t length,
+                      WASMComponentTypeInstance *type, uint32_t *begin_out,
+                      uint32_t *length_out, wit_value_t value)
+{
+    CanonicalResourceTransferScope scope;
+    bool success;
+
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+        set_component_exception(cx, "failed to begin canonical list lowering");
+        return false;
+    }
+    success = store_list_into_range_impl(cx, length, type, begin_out,
+                                         length_out, value);
+    return canonical_resource_transfer_scope_leave(&scope, success);
 }
 
 static bool
@@ -1836,9 +2435,9 @@ store_flags(LiftLowerContext *cx, uint32_t ptr,
     return store_int(cx, ptr, flag_size, i);
 }
 
-bool
-lower_own(LiftLowerContext *cx, WASMComponentResourceHandleInstance *type,
-          wit_value_t value, uint32_t *out_index)
+static bool
+lower_own_impl(LiftLowerContext *cx, WASMComponentResourceHandleInstance *type,
+               wit_value_t value, uint32_t *out_index)
 {
     if (!value
         || (value->type != COMPONENT_VAL_TYPE_RESOURCE_SYNC
@@ -1866,22 +2465,49 @@ lower_own(LiftLowerContext *cx, WASMComponentResourceHandleInstance *type,
         set_component_exception(cx, "failed to add resource handle to table");
         return false;
     }
+    if (!canonical_resource_transfer_record_lower(cx, index)) {
+        (void)wasm_component_table_remove(cx->inst->table, index);
+        set_component_exception(cx, "failed to record owned resource lowering");
+        return false;
+    }
 
     *out_index = index;
     return true;
 }
 
 bool
-lower_borrow(LiftLowerContext *cx, WASMComponentResourceHandleInstance *type,
-             wit_value_t value, uint32_t *out_index)
+lower_own(LiftLowerContext *cx, WASMComponentResourceHandleInstance *type,
+          wit_value_t value, uint32_t *out_index)
 {
-    bh_assert(cx->borrow_scope_type == BORROW_SCOPE_TASK);
+    CanonicalResourceTransferScope scope;
+    bool success;
 
+    if (!out_index)
+        return false;
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+        set_component_exception(cx, "failed to begin owned resource lowering");
+        return false;
+    }
+    success = lower_own_impl(cx, type, value, out_index);
+    return canonical_resource_transfer_scope_leave(&scope, success);
+}
+
+static bool
+lower_borrow_impl(LiftLowerContext *cx,
+                  WASMComponentResourceHandleInstance *type, wit_value_t value,
+                  uint32_t *out_index)
+{
     if (!value
         || (value->type != COMPONENT_VAL_TYPE_RESOURCE_SYNC
             && value->type != COMPONENT_VAL_TYPE_RESOURCE_ASYNC)) {
         set_component_exception(cx,
                                 "expected resource value for borrow handle");
+        return false;
+    }
+    if (cx->borrow_scope_type != BORROW_SCOPE_TASK || !cx->borrow_scope.task
+        || cx->borrow_scope.task->num_borrows == UINT32_MAX) {
+        set_component_exception(cx, "invalid borrow lowering scope");
         return false;
     }
 
@@ -1911,12 +2537,37 @@ lower_borrow(LiftLowerContext *cx, WASMComponentResourceHandleInstance *type,
         set_component_exception(cx, "failed to add resource handle to table");
         return false;
     }
+    if (!canonical_resource_transfer_record_lower(cx, index)) {
+        (void)wasm_component_table_remove(cx->inst->table, index);
+        set_component_exception(cx,
+                                "failed to record borrowed resource lowering");
+        return false;
+    }
 
     handle->borrow_scope = cx->borrow_scope.task;
     cx->borrow_scope.task->num_borrows++;
 
     *out_index = index;
     return true;
+}
+
+bool
+lower_borrow(LiftLowerContext *cx, WASMComponentResourceHandleInstance *type,
+             wit_value_t value, uint32_t *out_index)
+{
+    CanonicalResourceTransferScope scope;
+    bool success;
+
+    if (!out_index)
+        return false;
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+        set_component_exception(cx,
+                                "failed to begin borrowed resource lowering");
+        return false;
+    }
+    success = lower_borrow_impl(cx, type, value, out_index);
+    return canonical_resource_transfer_scope_leave(&scope, success);
 }
 
 static bool
@@ -2026,12 +2677,16 @@ store_result(LiftLowerContext *cx, uint32_t ptr,
     return true;
 }
 
-bool
-store(LiftLowerContext *cx, uint32_t ptr, WASMComponentTypeInstance *type,
-      wit_value_t value)
+static bool
+store_impl(LiftLowerContext *cx, uint32_t ptr, WASMComponentTypeInstance *type,
+           wit_value_t value)
 {
-    if (!type)
+    if (!cx || !type || !value) {
+        if (cx) {
+            set_component_exception(cx, "cannot store a null canonical value");
+        }
         return false;
+    }
     trap_if(ptr != align_to(ptr, type->alignment));
     trap_if((uint64_t)ptr + type->elem_size
             > get_mem_from_cx(cx)->memory_data_size);
@@ -2120,6 +2775,22 @@ store(LiftLowerContext *cx, uint32_t ptr, WASMComponentTypeInstance *type,
     }
 
     return false;
+}
+
+bool
+store(LiftLowerContext *cx, uint32_t ptr, WASMComponentTypeInstance *type,
+      wit_value_t value)
+{
+    CanonicalResourceTransferScope scope;
+    bool success;
+
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+        set_component_exception(cx, "failed to begin canonical value lowering");
+        return false;
+    }
+    success = store_impl(cx, ptr, type, value);
+    return canonical_resource_transfer_scope_leave(&scope, success);
 }
 
 CanonicalOptions *

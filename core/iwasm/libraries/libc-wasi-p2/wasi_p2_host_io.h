@@ -21,6 +21,14 @@ void
 wasi_p2_callback_input_stream_read(HostResource *resource, uint64_t len,
                                    wasi_result_list_u8_stream_error_t *ret);
 
+/* Read into caller-owned scratch storage. The returned list aliases `buffer`
+ * and must not be freed. This is used by multi-step operations that reserve
+ * all fallible storage before invoking the first host callback. */
+void
+wasi_p2_callback_input_stream_read_into(
+    HostResource *resource, uint64_t len, uint8_t *buffer,
+    uint32_t buffer_capacity, wasi_result_list_u8_stream_error_t *ret);
+
 void
 wasi_p2_callback_input_stream_skip(HostResource *resource, uint64_t len,
                                    wasi_result_u64_stream_error_t *ret);

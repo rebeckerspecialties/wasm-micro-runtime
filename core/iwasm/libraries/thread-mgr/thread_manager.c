@@ -5,6 +5,10 @@
 
 #include "thread_manager.h"
 #include "../common/wasm_c_api_internal.h"
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+#include "../common/component-model/wasm_component_canonical.h"
+#include "../common/component-model/wasm_component_host_resource.h"
+#endif
 
 #if WASM_ENABLE_INTERP != 0
 #include "../interpreter/wasm_runtime.h"
@@ -38,7 +42,7 @@ static uint32 cluster_max_thread_num = CLUSTER_MAX_THREAD_NUM;
 void
 wasm_cluster_set_max_thread_num(uint32 num)
 {
-    if (num > 0)
+    if (num > 0 && num <= CLUSTER_MAX_THREAD_NUM)
         cluster_max_thread_num = num;
 }
 
@@ -486,8 +490,9 @@ wasm_clusters_search_exec_env(WASMModuleInstanceCommon *module_inst)
 WASMExecEnv *
 wasm_cluster_spawn_exec_env(WASMExecEnv *exec_env)
 {
-    WASMCluster *cluster = wasm_exec_env_get_cluster(exec_env);
-    wasm_module_inst_t module_inst = get_module_inst(exec_env);
+    WASMAllocationQuotaScope scope;
+    WASMCluster *cluster;
+    wasm_module_inst_t module_inst;
     wasm_module_t module;
     wasm_module_inst_t new_module_inst;
     WASMExecEnv *new_exec_env;
@@ -496,7 +501,17 @@ wasm_cluster_spawn_exec_env(WASMExecEnv *exec_env)
     uint32 stack_size = 8192;
     struct InstantiationArgs2 args;
 
-    if (!module_inst || !(module = wasm_exec_env_get_module(exec_env))) {
+    if (!exec_env
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             exec_env)) {
+        return NULL;
+    }
+    cluster = wasm_exec_env_get_cluster(exec_env);
+    module_inst = get_module_inst(exec_env);
+    if (!module_inst || !(module = wasm_exec_env_get_module(exec_env))
+        || !wasm_allocation_quota_allocations_share_owner(exec_env, module_inst)
+        || !wasm_allocation_quota_allocations_share_owner(exec_env, module)) {
+        wasm_allocation_quota_scope_leave(&scope);
         return NULL;
     }
 
@@ -506,6 +521,7 @@ wasm_cluster_spawn_exec_env(WASMExecEnv *exec_env)
         &args, wasm_runtime_get_custom_data(module_inst));
     if (!(new_module_inst = wasm_runtime_instantiate_internal(
               module, module_inst, exec_env, &args, NULL, 0))) {
+        wasm_allocation_quota_scope_leave(&scope);
         return NULL;
     }
 
@@ -563,8 +579,13 @@ wasm_cluster_spawn_exec_env(WASMExecEnv *exec_env)
         goto fail3;
     }
 
-    os_mutex_unlock(&cluster->lock);
+    if (!wasm_allocation_quota_allocations_share_owner(exec_env,
+                                                       new_exec_env)) {
+        goto fail3;
+    }
 
+    os_mutex_unlock(&cluster->lock);
+    wasm_allocation_quota_scope_leave(&scope);
     return new_exec_env;
 
 fail3:
@@ -576,16 +597,34 @@ fail2:
 fail1:
     wasm_runtime_deinstantiate_internal(new_module_inst, true);
 
+    wasm_allocation_quota_scope_leave(&scope);
     return NULL;
 }
 
 void
 wasm_cluster_destroy_spawned_exec_env(WASMExecEnv *exec_env)
 {
-    WASMCluster *cluster = wasm_exec_env_get_cluster(exec_env);
-    wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
-    bh_assert(cluster != NULL);
+    WASMAllocationQuotaScope scope;
+    WASMCluster *cluster;
+    wasm_module_inst_t module_inst;
     WASMExecEnv *exec_env_tls = NULL;
+
+    if (!exec_env
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             exec_env)) {
+        LOG_ERROR("Spawned exec env destruction rejected by allocation owner");
+        return;
+    }
+    cluster = wasm_exec_env_get_cluster(exec_env);
+    module_inst = wasm_runtime_get_module_inst(exec_env);
+    if (!module_inst
+        || !wasm_allocation_quota_allocations_share_owner(exec_env,
+                                                          module_inst)) {
+        LOG_ERROR("Spawned exec env and module instance owners differ");
+        wasm_allocation_quota_scope_leave(&scope);
+        return;
+    }
+    bh_assert(cluster != NULL);
 
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     /* Note: free_aux_stack can execute the module's "free" function
@@ -615,12 +654,15 @@ wasm_cluster_destroy_spawned_exec_env(WASMExecEnv *exec_env)
     wasm_runtime_deinstantiate_internal(module_inst, true);
 
     os_mutex_unlock(&cluster->lock);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 /* start routine of thread manager */
 static void *
 thread_manager_start_routine(void *arg)
 {
+    WASMAllocationQuotaThreadLease lease;
+    WASMAllocationQuotaReservation native_stack_reservation = { 0 };
     void *ret;
     WASMExecEnv *exec_env = (WASMExecEnv *)arg;
     WASMCluster *cluster = wasm_exec_env_get_cluster(exec_env);
@@ -630,11 +672,26 @@ thread_manager_start_routine(void *arg)
     bh_assert(cluster != NULL);
     bh_assert(module_inst != NULL);
 
+    exec_env->thread_owner_lease_failed =
+        !wasm_allocation_quota_thread_lease_enter_for_allocation(&lease,
+                                                                 exec_env);
+    if (!exec_env->thread_owner_lease_failed
+        && !wasm_allocation_quota_allocations_share_owner(exec_env,
+                                                          module_inst)) {
+        wasm_allocation_quota_thread_lease_leave(&lease);
+        exec_env->thread_owner_lease_failed = true;
+    }
+
     os_mutex_lock(&exec_env->wait_lock);
     exec_env->handle = os_self_thread();
     /* Notify the parent thread to continue running */
     os_cond_signal(&exec_env->wait_cond);
     os_mutex_unlock(&exec_env->wait_lock);
+
+    if (exec_env->thread_owner_lease_failed) {
+        LOG_ERROR("Managed thread rejected by allocation owner");
+        return NULL;
+    }
 
     ret = exec_env->thread_start_routine(exec_env);
 
@@ -679,6 +736,7 @@ thread_manager_start_routine(void *arg)
 
     /* Remove exec_env */
     wasm_cluster_del_exec_env_internal(cluster, exec_env, false);
+    wasm_exec_env_take_native_thread_stack(exec_env, &native_stack_reservation);
     /* Destroy exec_env */
     wasm_exec_env_destroy_internal(exec_env);
     /* Routine exit, destroy instance */
@@ -688,6 +746,11 @@ thread_manager_start_routine(void *arg)
 
     os_mutex_unlock(&cluster_list_lock);
 
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    os_thread_signal_destroy();
+#endif
+    wasm_allocation_quota_reservation_release(&native_stack_reservation);
+    wasm_allocation_quota_thread_lease_leave(&lease);
     os_thread_exit(ret);
     return ret;
 }
@@ -699,9 +762,20 @@ wasm_cluster_create_thread(WASMExecEnv *exec_env,
                            uint32 aux_stack_size,
                            void *(*thread_routine)(void *), void *arg)
 {
+    WASMAllocationQuotaScope scope;
     WASMCluster *cluster;
     WASMExecEnv *new_exec_env;
     korp_tid tid;
+
+    if (!exec_env || !module_inst
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             exec_env)) {
+        return -1;
+    }
+    if (!wasm_allocation_quota_allocations_share_owner(exec_env, module_inst)) {
+        wasm_allocation_quota_scope_leave(&scope);
+        return -1;
+    }
 
     cluster = wasm_exec_env_get_cluster(exec_env);
     bh_assert(cluster);
@@ -742,6 +816,11 @@ wasm_cluster_create_thread(WASMExecEnv *exec_env,
     new_exec_env->thread_start_routine = thread_routine;
     new_exec_env->thread_arg = arg;
 
+    if (!wasm_exec_env_reserve_native_thread_stack(
+            new_exec_env, APP_THREAD_STACK_SIZE_DEFAULT)) {
+        goto fail3;
+    }
+
     os_mutex_lock(&new_exec_env->wait_lock);
 
     if (0
@@ -757,17 +836,25 @@ wasm_cluster_create_thread(WASMExecEnv *exec_env,
     os_cond_wait(&new_exec_env->wait_cond, &new_exec_env->wait_lock);
     os_mutex_unlock(&new_exec_env->wait_lock);
 
+    if (new_exec_env->thread_owner_lease_failed) {
+        (void)os_thread_join(tid, NULL);
+        goto fail3;
+    }
+
     os_mutex_unlock(&cluster->lock);
 
+    wasm_allocation_quota_scope_leave(&scope);
     return 0;
 
 fail3:
+    wasm_exec_env_release_native_thread_stack(new_exec_env);
     wasm_cluster_del_exec_env_internal(cluster, new_exec_env, false);
 fail2:
     wasm_exec_env_destroy_internal(new_exec_env);
 fail1:
     os_mutex_unlock(&cluster->lock);
 
+    wasm_allocation_quota_scope_leave(&scope);
     return -1;
 }
 
@@ -813,6 +900,12 @@ wasm_cluster_dup_c_api_imports(WASMModuleInstanceCommon *module_inst_dst,
 
         bh_memcpy_s(*new_c_api_func_imports, size_in_bytes, c_api_func_imports,
                     size_in_bytes);
+        if (!wasm_c_api_func_imports_retain(*new_c_api_func_imports,
+                                            import_func_count)) {
+            wasm_runtime_free(*new_c_api_func_imports);
+            *new_c_api_func_imports = NULL;
+            return false;
+        }
     }
     return true;
 }
@@ -1021,8 +1114,18 @@ wasm_cluster_detach_thread(WASMExecEnv *exec_env)
 void
 wasm_cluster_exit_thread(WASMExecEnv *exec_env, void *retval)
 {
+    WASMAllocationQuotaReservation native_stack_reservation = { 0 };
+    void *runtime_thread_arg;
     WASMCluster *cluster;
     WASMModuleInstanceCommon *module_inst;
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    /* This function never returns through the guest/native call frames which
+       own HostResource borrow tokens.  Drop their persistent TLS pins before
+       either longjmp or native thread exit abandons those frames. */
+    canonical_resource_transfer_unwind_current();
+    host_resource_pin_scope_unwind_current();
+#endif
 
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     if (exec_env->jmpbuf_stack_top) {
@@ -1033,6 +1136,8 @@ wasm_cluster_exit_thread(WASMExecEnv *exec_env, void *retval)
                                     WASM_SUSPEND_FLAG_EXIT);
 
 #ifndef BH_PLATFORM_WINDOWS
+        /* pthread_exit abandons callback frames above this longjmp target. */
+        wasm_allocation_quota_thread_scope_unwind_current();
         /* Pop all jmpbuf_node except the last one */
         while (exec_env->jmpbuf_stack_top->prev) {
             wasm_exec_env_pop_jmpbuf(exec_env);
@@ -1045,6 +1150,7 @@ wasm_cluster_exit_thread(WASMExecEnv *exec_env, void *retval)
 
     cluster = wasm_exec_env_get_cluster(exec_env);
     bh_assert(cluster);
+    runtime_thread_arg = exec_env->runtime_thread_arg;
 #if WASM_ENABLE_DEBUG_INTERP != 0
     wasm_cluster_clear_thread_signal(exec_env);
     wasm_cluster_thread_exited(exec_env);
@@ -1062,7 +1168,8 @@ wasm_cluster_exit_thread(WASMExecEnv *exec_env, void *retval)
     os_mutex_lock(&cluster->lock);
 
     /* Detach the native thread here to ensure the resources are freed */
-    if (exec_env->wait_count == 0 && !exec_env->thread_is_detached) {
+    if (!runtime_thread_arg && exec_env->wait_count == 0
+        && !exec_env->thread_is_detached) {
         /* Only detach current thread when there is no other thread
            joining it, otherwise let the system resources for the
            thread be released after joining */
@@ -1072,18 +1179,26 @@ wasm_cluster_exit_thread(WASMExecEnv *exec_env, void *retval)
     }
 
     module_inst = exec_env->module_inst;
+    exec_env->runtime_thread_arg = NULL;
 
     /* Remove exec_env */
     wasm_cluster_del_exec_env_internal(cluster, exec_env, false);
+    wasm_exec_env_take_native_thread_stack(exec_env, &native_stack_reservation);
     /* Destroy exec_env */
     wasm_exec_env_destroy_internal(exec_env);
     /* Routine exit, destroy instance */
     wasm_runtime_deinstantiate_internal(module_inst, true);
+    wasm_runtime_free(runtime_thread_arg);
 
     os_mutex_unlock(&cluster->lock);
 
     os_mutex_unlock(&cluster_list_lock);
 
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    os_thread_signal_destroy();
+#endif
+    wasm_allocation_quota_reservation_release(&native_stack_reservation);
+    wasm_allocation_quota_thread_lease_leave_current();
     os_thread_exit(retval);
 }
 

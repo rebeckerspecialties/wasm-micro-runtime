@@ -15,6 +15,7 @@
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 #include "../common/component-model/wasm_component.h"
 #include "../common/component-model/wasm_component_flat.h"
+#include "../common/component-model/wasm_component_host_resource.h"
 #include "../common/component-model/wasm_component_runtime.h"
 #endif
 #if WASM_ENABLE_GC != 0
@@ -4123,6 +4124,12 @@ wasm_deinstantiate(WASMModuleInstance *module_inst, bool is_sub_inst)
         (WASMModuleInstanceCommon *)module_inst);
 #endif
 
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
+    /* Mark teardown and run cleanup callbacks while instance storage is still
+       intact. Reentrant externref registration is rejected until quiescent. */
+    wasm_externref_cleanup((WASMModuleInstanceCommon *)module_inst);
+#endif
+
     if (module_inst->memory_count > 0)
         memories_deinstantiate(module_inst, module_inst->memories,
                                module_inst->memory_count);
@@ -4151,10 +4158,6 @@ wasm_deinstantiate(WASMModuleInstance *module_inst, bool is_sub_inst)
     export_memories_deinstantiate(module_inst->export_memories);
 #endif
 
-#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
-    wasm_externref_cleanup((WASMModuleInstanceCommon *)module_inst);
-#endif
-
 #if WASM_ENABLE_GC != 0
     if (!is_sub_inst) {
         if (module_inst->e->common.gc_heap_handle)
@@ -4172,8 +4175,13 @@ wasm_deinstantiate(WASMModuleInstance *module_inst, bool is_sub_inst)
     }
 #endif
 
-    if (module_inst->c_api_func_imports)
+    if (module_inst->c_api_func_imports) {
+        wasm_c_api_func_imports_release(
+            module_inst->c_api_func_imports,
+            module_inst->module->import_function_count);
         wasm_runtime_free(module_inst->c_api_func_imports);
+        module_inst->c_api_func_imports = NULL;
+    }
 #if WASM_ENABLE_COMPONENT_MODEL == 0
     if (!is_sub_inst) {
         wasm_native_call_context_dtors((WASMModuleInstanceCommon *)module_inst);
@@ -4343,6 +4351,10 @@ call_wasm_with_hw_bound_check(WASMModuleInstance *module_inst,
      * exception which is not caught by hardware (e.g. uninitialized elements),
      * then the stack-frame is already freed inside wasm_interp_call_wasm */
     if (!ret) {
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        canonical_resource_transfer_unwind_to(&jmpbuf_node);
+        host_resource_pin_scope_unwind_to(&jmpbuf_node);
+#endif
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
         if (wasm_interp_create_call_stack(exec_env)) {
             wasm_interp_dump_call_stack(exec_env, true, NULL, 0);

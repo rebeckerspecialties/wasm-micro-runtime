@@ -10,6 +10,10 @@
 #include "../common/wasm_runtime_common.h"
 #include "../common/wasm_memory.h"
 #include "../interpreter/wasm_runtime.h"
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+#include "../common/component-model/wasm_component_canonical.h"
+#include "../common/component-model/wasm_component_host_resource.h"
+#endif
 #if WASM_ENABLE_SHARED_MEMORY != 0
 #include "../common/wasm_shared_memory.h"
 #endif
@@ -2397,6 +2401,12 @@ aot_deinstantiate(AOTModuleInstance *module_inst, bool is_sub_inst)
         wasm_exec_env_destroy((WASMExecEnv *)module_inst->exec_env_singleton);
     }
 
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
+    /* Match interpreter teardown: callbacks run before instance storage is
+       released, with reentrant externref registration gated until quiescent. */
+    wasm_externref_cleanup((WASMModuleInstanceCommon *)module_inst);
+#endif
+
 #if WASM_ENABLE_THREAD_MGR != 0
     os_mutex_destroy(&extra->common.exception_lock);
 #endif
@@ -2454,8 +2464,13 @@ aot_deinstantiate(AOTModuleInstance *module_inst, bool is_sub_inst)
     if (module_inst->func_type_indexes)
         wasm_runtime_free(module_inst->func_type_indexes);
 
-    if (module_inst->c_api_func_imports)
+    if (module_inst->c_api_func_imports) {
+        wasm_c_api_func_imports_release(
+            module_inst->c_api_func_imports,
+            ((AOTModule *)module_inst->module)->import_func_count);
         wasm_runtime_free(module_inst->c_api_func_imports);
+        module_inst->c_api_func_imports = NULL;
+    }
 
 #if WASM_ENABLE_GC != 0
     if (!is_sub_inst) {
@@ -2580,6 +2595,13 @@ invoke_native_with_hw_bound_check(WASMExecEnv *exec_env, void *func_ptr,
         /* Exception has been set in signal handler before calling longjmp */
         ret = false;
     }
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    if (!ret) {
+        canonical_resource_transfer_unwind_to(&jmpbuf_node);
+        host_resource_pin_scope_unwind_to(&jmpbuf_node);
+    }
+#endif
 
     jmpbuf_node_pop = wasm_exec_env_pop_jmpbuf(exec_env);
     bh_assert(&jmpbuf_node == jmpbuf_node_pop);

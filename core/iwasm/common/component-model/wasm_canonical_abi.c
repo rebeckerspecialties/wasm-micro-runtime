@@ -79,11 +79,10 @@ free_wit_value(wit_value_t value)
             }
             break;
         case COMPONENT_VAL_TYPE_VARIANT:
-            if (value->value.variant_value.value != NULL) {
-                if (value->value.variant_value.discriminator != NULL)
-                    wasm_runtime_free(value->value.variant_value.discriminator);
+            if (value->value.variant_value.discriminator != NULL)
+                wasm_runtime_free(value->value.variant_value.discriminator);
+            if (value->value.variant_value.value != NULL)
                 free_wit_value(value->value.variant_value.value);
-            }
             break;
         case COMPONENT_VAL_TYPE_FLAGS:
             if (value->value.flag_value.fields != NULL) {
@@ -416,7 +415,7 @@ wit_value_t
 wit_string_ctor(char *string, uint32_t size_bytes, uint32_t tagged_code_units,
                 StringEncoding hint_encoding)
 {
-    if (size_bytes > 0 && string == NULL) {
+    if ((size_bytes > 0 && string == NULL) || size_bytes == UINT32_MAX) {
         return NULL;
     }
 
@@ -427,6 +426,10 @@ wit_string_ctor(char *string, uint32_t size_bytes, uint32_t tagged_code_units,
 
     new_string->value.string_value.chars =
         (char *)wasm_runtime_malloc(size_bytes + 1);
+    if (!new_string->value.string_value.chars) {
+        wasm_runtime_free(new_string);
+        return NULL;
+    }
     bh_memcpy_s(new_string->value.string_value.chars, size_bytes + 1, string,
                 size_bytes);
     new_string->value.string_value.chars[size_bytes] = '\0';
@@ -526,15 +529,26 @@ wit_value_t
 wit_variant_ctor(char *discriminator, uint32_t discriminator_size,
                  wit_value_t value)
 {
+    if (discriminator_size > 0 && !discriminator) {
+        return NULL;
+    }
+
     wit_value_t new_variant = wit_value_alloc();
     if (new_variant == NULL) {
         return NULL;
     }
 
-    new_variant->value.variant_value.discriminator =
-        (char *)wasm_runtime_malloc(discriminator_size);
-    bh_memcpy_s(new_variant->value.variant_value.discriminator,
-                discriminator_size, discriminator, discriminator_size);
+    new_variant->value.variant_value.discriminator = NULL;
+    if (discriminator_size > 0) {
+        new_variant->value.variant_value.discriminator =
+            (char *)wasm_runtime_malloc(discriminator_size);
+        if (!new_variant->value.variant_value.discriminator) {
+            wasm_runtime_free(new_variant);
+            return NULL;
+        }
+        bh_memcpy_s(new_variant->value.variant_value.discriminator,
+                    discriminator_size, discriminator, discriminator_size);
+    }
     new_variant->type = COMPONENT_VAL_TYPE_VARIANT;
     new_variant->value.variant_value.discriminator_size = discriminator_size;
     new_variant->value.variant_value.value = value;

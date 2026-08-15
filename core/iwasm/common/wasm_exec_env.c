@@ -35,13 +35,20 @@ WASMExecEnv *
 wasm_exec_env_create_internal(struct WASMModuleInstanceCommon *module_inst,
                               uint32 stack_size)
 {
+    WASMAllocationQuotaScope scope;
     uint64 total_size =
         offsetof(WASMExecEnv, wasm_stack_u.bottom) + (uint64)stack_size;
-    WASMExecEnv *exec_env;
+    WASMExecEnv *exec_env = NULL;
+
+    if (!module_inst
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             module_inst)) {
+        return NULL;
+    }
 
     if (total_size >= UINT32_MAX
         || !(exec_env = wasm_runtime_malloc((uint32)total_size)))
-        return NULL;
+        goto done;
 
     memset(exec_env, 0, (uint32)total_size);
 
@@ -65,10 +72,17 @@ wasm_exec_env_create_internal(struct WASMModuleInstanceCommon *module_inst,
 #endif
 
 #ifdef OS_ENABLE_HW_BOUND_CHECK
+    if (!wasm_allocation_quota_reservation_acquire_for_allocation(
+            &exec_env->guard_page_reservation, exec_env, os_getpagesize(), 1)) {
+        goto fail5;
+    }
     if (!(exec_env->exce_check_guard_page =
               os_mmap(NULL, os_getpagesize(), MMAP_PROT_NONE, MMAP_MAP_NONE,
-                      os_get_invalid_handle())))
+                      os_get_invalid_handle()))) {
+        wasm_allocation_quota_reservation_release(
+            &exec_env->guard_page_reservation);
         goto fail5;
+    }
 #endif
 
     exec_env->module_inst = module_inst;
@@ -94,7 +108,7 @@ wasm_exec_env_create_internal(struct WASMModuleInstanceCommon *module_inst,
     exec_env->instructions_to_execute = -1;
 #endif
 
-    return exec_env;
+    goto done;
 
 #ifdef OS_ENABLE_HW_BOUND_CHECK
 fail5:
@@ -116,18 +130,40 @@ fail2:
 fail1:
 #endif
     wasm_runtime_free(exec_env);
-    return NULL;
+    exec_env = NULL;
+
+done:
+    wasm_allocation_quota_scope_leave(&scope);
+    return exec_env;
 }
 
 void
 wasm_exec_env_destroy_internal(WASMExecEnv *exec_env)
 {
+    WASMAllocationQuotaScope scope;
+
+    if (!exec_env
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             exec_env)) {
+        LOG_ERROR("Exec env destruction rejected by allocation owner");
+        return;
+    }
+    if (!exec_env->module_inst
+        || !wasm_allocation_quota_allocations_share_owner(
+            exec_env, exec_env->module_inst)) {
+        LOG_ERROR("Exec env and module instance allocation owners differ");
+        wasm_allocation_quota_scope_leave(&scope);
+        return;
+    }
+
 #if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_LIBC_WASI_P2 != 0 \
     && WASM_ENABLE_THREAD_MGR != 0
     wasi_p2_interrupt_wait_destroy(exec_env);
 #endif
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     os_munmap(exec_env->exce_check_guard_page, os_getpagesize());
+    wasm_allocation_quota_reservation_release(
+        &exec_env->guard_page_reservation);
 #endif
 #if WASM_ENABLE_THREAD_MGR != 0
     os_mutex_destroy(&exec_env->wait_lock);
@@ -139,24 +175,39 @@ wasm_exec_env_destroy_internal(WASMExecEnv *exec_env)
 #if WASM_ENABLE_AOT != 0
     wasm_runtime_free(exec_env->argv_buf);
 #endif
+    /* Failure paths which never started a thread may still own this charge. */
+    wasm_exec_env_release_native_thread_stack(exec_env);
     wasm_runtime_free(exec_env);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 WASMExecEnv *
 wasm_exec_env_create(struct WASMModuleInstanceCommon *module_inst,
                      uint32 stack_size)
 {
+    WASMAllocationQuotaScope scope;
 #if WASM_ENABLE_THREAD_MGR != 0
     WASMCluster *cluster;
 #endif
-    WASMExecEnv *exec_env =
-        wasm_exec_env_create_internal(module_inst, stack_size);
+    WASMExecEnv *exec_env = NULL;
 #if WASM_ENABLE_GC != 0
     void *gc_heap_handle = NULL;
 #endif
 
-    if (!exec_env)
+    if (!module_inst
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             module_inst)) {
         return NULL;
+    }
+
+    exec_env = wasm_exec_env_create_internal(module_inst, stack_size);
+    if (!exec_env)
+        goto done;
+    if (!wasm_allocation_quota_allocations_share_owner(module_inst, exec_env)) {
+        wasm_exec_env_destroy_internal(exec_env);
+        exec_env = NULL;
+        goto done;
+    }
 
 #if WASM_ENABLE_INTERP != 0
     /* Set the aux_stack_boundary and aux_stack_bottom */
@@ -191,7 +242,8 @@ wasm_exec_env_create(struct WASMModuleInstanceCommon *module_inst,
     /* Create a new cluster for this exec_env */
     if (!(cluster = wasm_cluster_create(exec_env))) {
         wasm_exec_env_destroy_internal(exec_env);
-        return NULL;
+        exec_env = NULL;
+        goto done;
     }
 #if WASM_ENABLE_GC != 0
     mem_allocator_enable_gc_reclaim(gc_heap_handle, cluster);
@@ -202,12 +254,30 @@ wasm_exec_env_create(struct WASMModuleInstanceCommon *module_inst,
 #endif
 #endif /* end of WASM_ENABLE_THREAD_MGR */
 
+done:
+    wasm_allocation_quota_scope_leave(&scope);
     return exec_env;
 }
 
 void
 wasm_exec_env_destroy(WASMExecEnv *exec_env)
 {
+    WASMAllocationQuotaScope scope;
+
+    if (!exec_env
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             exec_env)) {
+        LOG_ERROR("Exec env destruction rejected by allocation owner");
+        return;
+    }
+    if (!exec_env->module_inst
+        || !wasm_allocation_quota_allocations_share_owner(
+            exec_env, exec_env->module_inst)) {
+        LOG_ERROR("Exec env and module instance allocation owners differ");
+        wasm_allocation_quota_scope_leave(&scope);
+        return;
+    }
+
 #if WASM_ENABLE_THREAD_MGR != 0
     /* Wait for all sub-threads */
     WASMCluster *cluster = wasm_exec_env_get_cluster(exec_env);
@@ -226,6 +296,66 @@ wasm_exec_env_destroy(WASMExecEnv *exec_env)
 #endif /* end of WASM_ENABLE_THREAD_MGR */
 
     wasm_exec_env_destroy_internal(exec_env);
+    wasm_allocation_quota_scope_leave(&scope);
+}
+
+bool
+wasm_exec_env_reserve_native_thread_stack(WASMExecEnv *exec_env,
+                                          uint32 stack_size)
+{
+    if (!exec_env || stack_size == 0
+        || exec_env->native_thread_stack_reservation.active) {
+        return false;
+    }
+
+    return wasm_allocation_quota_reservation_acquire_for_allocation(
+        &exec_env->native_thread_stack_reservation, exec_env,
+        wasm_exec_env_native_thread_stack_reservation_size(stack_size),
+        wasm_exec_env_native_thread_stack_reservation_count());
+}
+
+uint64
+wasm_exec_env_native_thread_stack_reservation_size(uint32 stack_size)
+{
+    uint64 size = stack_size;
+
+    /* POSIX HW-bound threads map this alternate signal stack in
+       os_thread_signal_init() before entering the runtime start routine. */
+#if defined(OS_ENABLE_HW_BOUND_CHECK) \
+    && WASM_DISABLE_STACK_HW_BOUND_CHECK == 0 && !defined(BH_PLATFORM_WINDOWS)
+    size += OS_THREAD_SIGNAL_ALT_STACK_SIZE;
+#endif
+    return size;
+}
+
+uint32
+wasm_exec_env_native_thread_stack_reservation_count(void)
+{
+#if defined(OS_ENABLE_HW_BOUND_CHECK) \
+    && WASM_DISABLE_STACK_HW_BOUND_CHECK == 0 && !defined(BH_PLATFORM_WINDOWS)
+    return 2;
+#else
+    return 1;
+#endif
+}
+
+void
+wasm_exec_env_release_native_thread_stack(WASMExecEnv *exec_env)
+{
+    if (exec_env) {
+        wasm_allocation_quota_reservation_release(
+            &exec_env->native_thread_stack_reservation);
+    }
+}
+
+void
+wasm_exec_env_take_native_thread_stack(
+    WASMExecEnv *exec_env, WASMAllocationQuotaReservation *reservation)
+{
+    if (exec_env && reservation) {
+        wasm_allocation_quota_reservation_move(
+            reservation, &exec_env->native_thread_stack_reservation);
+    }
 }
 
 WASMModuleInstanceCommon *

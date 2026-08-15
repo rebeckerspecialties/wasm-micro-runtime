@@ -36,6 +36,13 @@ set(unit_test_sources
 
 add_executable(runtime_common_test ${unit_test_sources})
 
+# Enable deterministic failure injection for the POSIX thread-start
+# handshake regression. The seam is compiled out of product builds.
+if(NOT WAMR_BUILD_PLATFORM STREQUAL "windows")
+  target_compile_definitions(runtime_common_test
+    PRIVATE WAMR_POSIX_THREAD_START_TEST=1)
+endif()
+
 target_link_libraries(runtime_common_test ${LLVM_AVAILABLE_LIBS} gtest_main)
 
 # Ensure that aot compiled is completed before linear_memory_test_aot is built

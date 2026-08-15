@@ -560,6 +560,98 @@ TEST_F(ComponentInstantiationTest, TestResolveAlias)
   wasm_component_deinstantiate(comp_instance);
 }
 
+TEST_F(ComponentInstantiationTest,
+       InlineComponentInstanceIncrementsIndexSpaceCount)
+{
+    WASMComponentIndexCount index_count = {};
+    WASMComponentInstSection section = {};
+    WASMComponentInst inline_instance = {};
+    char local_error[128] = {};
+
+    index_count.instances = 1;
+    index_count.defined_instances = 1;
+    WASMComponentInstance *parent = wasm_component_instance_allocate(
+        &index_count, local_error, sizeof(local_error));
+    ASSERT_NE(parent, nullptr) << local_error;
+
+    inline_instance.instance_expression_tag =
+        WASM_COMP_INSTANCE_EXPRESSION_WITHOUT_ARGS;
+    inline_instance.expression.without_args.inline_expr_len = 0;
+    inline_instance.expression.without_args.inline_expr = nullptr;
+    section.count = 1;
+    section.instances = &inline_instance;
+
+    ASSERT_TRUE(wasm_resolve_instance(&section, parent, local_error,
+                                      sizeof(local_error)))
+        << local_error;
+    ASSERT_EQ(parent->component_instances_count, 1u);
+    ASSERT_EQ(parent->defined_instances_count, 1u);
+    EXPECT_EQ(parent->component_instances[0], parent->defined_instances[0]);
+
+    wasm_component_deinstantiate(parent);
+}
+
+TEST_F(ComponentInstantiationTest,
+       InlineComponentInstanceReservesAndValidatesCoreModuleExports)
+{
+    WASMComponentIndexCount index_count = {};
+    WASMComponentInstSection section = {};
+    WASMComponentInst inline_instance = {};
+    WASMComponentInlineExport inline_export = {};
+    WASMComponentCoreName export_name = {};
+    WASMComponentSort sort = {};
+    WASMComponentSortIdx sort_idx = {};
+    char export_name_chars[] = "m";
+    char local_error[128] = {};
+
+    index_count.core_modules = 1;
+    index_count.instances = 1;
+    index_count.defined_instances = 1;
+    WASMComponentInstance *parent = wasm_component_instance_allocate(
+        &index_count, local_error, sizeof(local_error));
+    ASSERT_NE(parent, nullptr) << local_error;
+    parent->core_modules[0] = &test_core_module;
+    parent->core_modules_count = 1;
+
+    export_name.name_len = 1;
+    export_name.name = export_name_chars;
+    sort.sort = WASM_COMP_SORT_CORE_SORT;
+    sort.core_sort = WASM_COMP_CORE_SORT_MODULE;
+    sort_idx.sort = &sort;
+    sort_idx.idx = 0;
+    inline_export.name = &export_name;
+    inline_export.sort_idx = &sort_idx;
+    inline_instance.instance_expression_tag =
+        WASM_COMP_INSTANCE_EXPRESSION_WITHOUT_ARGS;
+    inline_instance.expression.without_args.inline_expr_len = 1;
+    inline_instance.expression.without_args.inline_expr = &inline_export;
+    section.count = 1;
+    section.instances = &inline_instance;
+
+    ASSERT_TRUE(wasm_resolve_instance(&section, parent, local_error,
+                                      sizeof(local_error)))
+        << local_error;
+    ASSERT_EQ(parent->component_instances_count, 1u);
+    ASSERT_EQ(parent->defined_instances_count, 1u);
+    ASSERT_NE(parent->component_instances[0], nullptr);
+    EXPECT_EQ(parent->component_instances[0]->core_modules_count, 1u);
+    EXPECT_EQ(parent->component_instances[0]->core_modules[0],
+              &test_core_module);
+    ASSERT_EQ(parent->component_instances[0]->exports_count, 1u);
+    EXPECT_EQ(parent->component_instances[0]->exports[0].exp.core_module,
+              &test_core_module);
+
+    sort_idx.idx = 1;
+    memset(local_error, 0, sizeof(local_error));
+    EXPECT_FALSE(wasm_resolve_instance(&section, parent, local_error,
+                                       sizeof(local_error)));
+    EXPECT_NE(strstr(local_error, "not yet defined"), nullptr) << local_error;
+    EXPECT_EQ(parent->component_instances_count, 1u);
+    EXPECT_EQ(parent->defined_instances_count, 1u);
+
+    wasm_component_deinstantiate(parent);
+}
+
 TEST_F(ComponentInstantiationTest, TestResolveCoreInstance) 
 {
   uint32 idx;

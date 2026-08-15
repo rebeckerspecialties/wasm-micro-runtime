@@ -20,8 +20,87 @@ typedef struct {
     void *arg;
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     os_signal_handler signal_handler;
+    pthread_mutex_t start_lock;
+    pthread_cond_t start_cond;
+    bool start_ready;
+    bool start_ok;
+    bool parent_released;
 #endif
 } thread_wrapper_arg;
+
+#if defined(OS_ENABLE_HW_BOUND_CHECK) && defined(WAMR_POSIX_THREAD_START_TEST) \
+    && WASM_DISABLE_STACK_HW_BOUND_CHECK == 0
+/* Test-only state used to exercise the exact sigaltstack() failure path
+   without depending on process limits or allocator behavior. */
+static pthread_mutex_t thread_start_test_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool thread_start_test_fail_alt_stack_init;
+static uint32 thread_start_test_wrapper_allocations;
+static uint32 thread_start_test_wrapper_frees;
+
+void
+os_posix_thread_test_arm_alt_stack_init_failure(void);
+void
+os_posix_thread_test_get_wrapper_counts(uint32 *allocations, uint32 *frees);
+
+void
+os_posix_thread_test_arm_alt_stack_init_failure(void)
+{
+    pthread_mutex_lock(&thread_start_test_lock);
+    thread_start_test_fail_alt_stack_init = true;
+    thread_start_test_wrapper_allocations = 0;
+    thread_start_test_wrapper_frees = 0;
+    pthread_mutex_unlock(&thread_start_test_lock);
+}
+
+void
+os_posix_thread_test_get_wrapper_counts(uint32 *allocations, uint32 *frees)
+{
+    pthread_mutex_lock(&thread_start_test_lock);
+    if (allocations)
+        *allocations = thread_start_test_wrapper_allocations;
+    if (frees)
+        *frees = thread_start_test_wrapper_frees;
+    pthread_mutex_unlock(&thread_start_test_lock);
+}
+
+static bool
+thread_start_test_consume_alt_stack_init_failure(void)
+{
+    bool fail;
+
+    pthread_mutex_lock(&thread_start_test_lock);
+    fail = thread_start_test_fail_alt_stack_init;
+    thread_start_test_fail_alt_stack_init = false;
+    pthread_mutex_unlock(&thread_start_test_lock);
+    return fail;
+}
+
+static void
+thread_start_test_record_wrapper_allocation(void)
+{
+    pthread_mutex_lock(&thread_start_test_lock);
+    thread_start_test_wrapper_allocations++;
+    pthread_mutex_unlock(&thread_start_test_lock);
+}
+
+static void
+thread_start_test_record_wrapper_free(void)
+{
+    pthread_mutex_lock(&thread_start_test_lock);
+    thread_start_test_wrapper_frees++;
+    pthread_mutex_unlock(&thread_start_test_lock);
+}
+#endif
+
+static void
+thread_wrapper_arg_destroy(thread_wrapper_arg *targ)
+{
+#if defined(OS_ENABLE_HW_BOUND_CHECK) && defined(WAMR_POSIX_THREAD_START_TEST) \
+    && WASM_DISABLE_STACK_HW_BOUND_CHECK == 0
+    thread_start_test_record_wrapper_free();
+#endif
+    BH_FREE(targ);
+}
 
 #ifdef OS_ENABLE_HW_BOUND_CHECK
 /* The signal handler passed to os_thread_signal_init() */
@@ -36,15 +115,35 @@ os_thread_wrapper(void *arg)
     void *thread_arg = targ->arg;
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     os_signal_handler handler = targ->signal_handler;
+    bool start_ok;
 #endif
 
 #if 0
     os_printf("THREAD CREATED %jx\n", (uintmax_t)(uintptr_t)pthread_self());
 #endif
-    BH_FREE(targ);
 #ifdef OS_ENABLE_HW_BOUND_CHECK
-    if (os_thread_signal_init(handler) != 0)
+    start_ok = os_thread_signal_init(handler) == 0;
+
+    /* Do not enter the runtime until os_thread_create_with_prio() has
+       observed whether the per-thread signal environment was installed.
+       In particular, a managed-thread parent must not begin waiting for the
+       runtime start routine when alternate-stack setup has already failed. */
+    pthread_mutex_lock(&targ->start_lock);
+    targ->start_ok = start_ok;
+    targ->start_ready = true;
+    pthread_cond_signal(&targ->start_cond);
+    while (!targ->parent_released)
+        pthread_cond_wait(&targ->start_cond, &targ->start_lock);
+    pthread_mutex_unlock(&targ->start_lock);
+
+    pthread_cond_destroy(&targ->start_cond);
+    pthread_mutex_destroy(&targ->start_lock);
+    thread_wrapper_arg_destroy(targ);
+
+    if (!start_ok)
         return NULL;
+#else
+    thread_wrapper_arg_destroy(targ);
 #endif
 #ifdef OS_ENABLE_WAKEUP_BLOCKING_OP
     os_end_blocking_op();
@@ -69,6 +168,9 @@ os_thread_create_with_prio(korp_tid *tid, thread_start_routine_t start,
 {
     pthread_attr_t tattr;
     thread_wrapper_arg *targ;
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    bool start_ok;
+#endif
 
     assert(stack_size > 0);
     assert(tid);
@@ -89,20 +191,58 @@ os_thread_create_with_prio(korp_tid *tid, thread_start_routine_t start,
         pthread_attr_destroy(&tattr);
         return BHT_ERROR;
     }
+#if defined(OS_ENABLE_HW_BOUND_CHECK) && defined(WAMR_POSIX_THREAD_START_TEST) \
+    && WASM_DISABLE_STACK_HW_BOUND_CHECK == 0
+    thread_start_test_record_wrapper_allocation();
+#endif
 
     targ->start = start;
     targ->arg = arg;
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     targ->signal_handler = signal_handler;
+    targ->start_ready = false;
+    targ->start_ok = false;
+    targ->parent_released = false;
+    if (pthread_mutex_init(&targ->start_lock, NULL) != 0) {
+        pthread_attr_destroy(&tattr);
+        thread_wrapper_arg_destroy(targ);
+        return BHT_ERROR;
+    }
+    if (pthread_cond_init(&targ->start_cond, NULL) != 0) {
+        pthread_mutex_destroy(&targ->start_lock);
+        pthread_attr_destroy(&tattr);
+        thread_wrapper_arg_destroy(targ);
+        return BHT_ERROR;
+    }
 #endif
 
     if (pthread_create(tid, &tattr, os_thread_wrapper, targ) != 0) {
         pthread_attr_destroy(&tattr);
-        BH_FREE(targ);
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+        pthread_cond_destroy(&targ->start_cond);
+        pthread_mutex_destroy(&targ->start_lock);
+#endif
+        thread_wrapper_arg_destroy(targ);
         return BHT_ERROR;
     }
 
     pthread_attr_destroy(&tattr);
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    pthread_mutex_lock(&targ->start_lock);
+    while (!targ->start_ready)
+        pthread_cond_wait(&targ->start_cond, &targ->start_lock);
+    start_ok = targ->start_ok;
+    targ->parent_released = true;
+    pthread_cond_signal(&targ->start_cond);
+    pthread_mutex_unlock(&targ->start_lock);
+
+    if (!start_ok) {
+        /* The wrapper owns and frees targ after the handshake. Joining here
+           also reaps the joinable native thread before reporting failure. */
+        (void)pthread_join(*tid, NULL);
+        return BHT_ERROR;
+    }
+#endif
     return BHT_OK;
 }
 
@@ -215,7 +355,9 @@ os_cond_wait(korp_cond *cond, korp_mutex *mutex)
 korp_sem *
 os_sem_open(const char *name, int oflags, int mode, int val)
 {
-    return sem_open(name, oflags, mode, val);
+    sem_t *sem = sem_open(name, oflags, mode, val);
+
+    return sem == SEM_FAILED ? NULL : sem;
 }
 
 int
@@ -492,7 +634,7 @@ os_thread_jit_write_protect_np(bool enabled)
 
 #ifdef OS_ENABLE_HW_BOUND_CHECK
 
-#define SIG_ALT_STACK_SIZE (32 * 1024)
+#define SIG_ALT_STACK_SIZE OS_THREAD_SIGNAL_ALT_STACK_SIZE
 
 /**
  * Whether thread signal environment is initialized:
@@ -687,6 +829,12 @@ os_thread_signal_init(os_signal_handler handler)
     sigalt_stack_info.ss_flags = 0;
     memset(&prev_sigalt_stack, 0, sizeof(stack_t));
     /* Set signal alternate stack and save the previous one */
+#if defined(WAMR_POSIX_THREAD_START_TEST)
+    if (thread_start_test_consume_alt_stack_init_failure()) {
+        os_printf("Failed to init signal alternate stack\n");
+        goto fail2;
+    }
+#endif
     if (sigaltstack(&sigalt_stack_info, &prev_sigalt_stack) != 0) {
         os_printf("Failed to init signal alternate stack\n");
         goto fail2;

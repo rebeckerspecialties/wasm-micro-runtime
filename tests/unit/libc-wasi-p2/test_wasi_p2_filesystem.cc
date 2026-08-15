@@ -14,11 +14,16 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <map>
+#include <thread>
 
 extern "C" {
 #include "wasi_p2_filesystem.h"
 #include "wasi_p2_common.h"
+#include "wasi_p2_io.h"
+#include "component-model/wasm_component_host_resource.h"
 }
 
 class WasiP2FilesystemTest : public testing::Test {
@@ -882,6 +887,177 @@ TEST_F(WasiP2FilesystemTest, Filesystem_ReadDirectory) {
 
     directory_entry_stream_dtor(&stream);
     close(dir_fd);
+}
+
+TEST_F(WasiP2FilesystemTest, Filesystem_ReadDirectoryStreamsAreIndependent)
+{
+    int dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_NE(dir_fd, -1);
+    int first_fd =
+        openat(dir_fd, "first", O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+    int second_fd =
+        openat(dir_fd, "second", O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+    ASSERT_NE(first_fd, -1);
+    ASSERT_NE(second_fd, -1);
+    close(first_fd);
+    close(second_fd);
+
+    wasi_directory_entry_stream_t first_stream = nullptr;
+    wasi_directory_entry_stream_t second_stream = nullptr;
+    int err = 0;
+    wasi_filesystem_read_directory(dir_fd, &first_stream, &err);
+    ASSERT_EQ(err, WASI_ERROR_CODE_SUCCESS);
+    ASSERT_NE(first_stream, nullptr);
+    wasi_filesystem_read_directory(dir_fd, &second_stream, &err);
+    ASSERT_EQ(err, WASI_ERROR_CODE_SUCCESS);
+    ASSERT_NE(second_stream, nullptr);
+    EXPECT_NE(dirfd(first_stream), dirfd(second_stream));
+    EXPECT_NE(fcntl(dirfd(first_stream), F_GETFD) & FD_CLOEXEC, 0);
+    EXPECT_NE(fcntl(dirfd(second_stream), F_GETFD) & FD_CLOEXEC, 0);
+
+    auto drain = [](wasi_directory_entry_stream_t stream,
+                    std::vector<std::string> *names) {
+        int stream_error = 0;
+        for (;;) {
+            wasi_directory_entry_t entry = {};
+            bool is_some = false;
+            wasi_filesystem_read_directory_entry(stream, &entry, &is_some,
+                                                 &stream_error);
+            if (stream_error != WASI_ERROR_CODE_SUCCESS || !is_some) {
+                return stream_error;
+            }
+            names->emplace_back(entry.name);
+            wasm_runtime_free(entry.name);
+        }
+    };
+
+    std::vector<std::string> first_names;
+    std::vector<std::string> second_names;
+    ASSERT_EQ(drain(first_stream, &first_names), WASI_ERROR_CODE_SUCCESS);
+    ASSERT_EQ(drain(second_stream, &second_names), WASI_ERROR_CODE_SUCCESS);
+    std::sort(first_names.begin(), first_names.end());
+    std::sort(second_names.begin(), second_names.end());
+    EXPECT_EQ(first_names, (std::vector<std::string>{ "first", "second" }));
+    EXPECT_EQ(second_names, first_names);
+
+    directory_entry_stream_dtor(&first_stream);
+    directory_entry_stream_dtor(&second_stream);
+    close(dir_fd);
+}
+
+TEST_F(WasiP2FilesystemTest, Filesystem_DescriptorMutationsUseFileIoLock)
+{
+    int dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_NE(dir_fd, -1);
+    int fd = openat(dir_fd, "locked", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    ASSERT_NE(fd, -1);
+    ASSERT_EQ(pwrite(fd, "initial", 7, 0), 7);
+
+    auto expect_blocked = [](auto operation) {
+        std::atomic<bool> entered = false;
+        std::atomic<bool> completed = false;
+        wasi_p2_file_io_lock();
+        std::thread worker([&] {
+            entered.store(true, std::memory_order_release);
+            operation();
+            completed.store(true, std::memory_order_release);
+        });
+        while (!entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        bool was_blocked = !completed.load(std::memory_order_acquire);
+        wasi_p2_file_io_unlock();
+        worker.join();
+        EXPECT_TRUE(was_blocked);
+        EXPECT_TRUE(completed.load(std::memory_order_acquire));
+    };
+
+    wasi_filesize_t written = 0;
+    int write_error = -1;
+    expect_blocked([&] {
+        wasi_filesystem_write(fd, reinterpret_cast<const uint8_t *>("W"), 1, 0,
+                              &written, &write_error);
+    });
+    EXPECT_EQ(write_error, WASI_ERROR_CODE_SUCCESS);
+    EXPECT_EQ(written, 1u);
+
+    int size_error = -1;
+    expect_blocked([&] { size_error = wasi_filesystem_set_size(fd, 3); });
+    EXPECT_EQ(size_error, WASI_ERROR_CODE_SUCCESS);
+
+    wasi_descriptor_t truncated_fd = -1;
+    int open_error = -1;
+    expect_blocked([&] {
+        wasi_filesystem_open_at(dir_fd, 0, "locked", WASI_OPEN_FLAGS_TRUNCATE,
+                                WASI_DESCRIPTOR_FLAGS_READ
+                                    | WASI_DESCRIPTOR_FLAGS_WRITE,
+                                0600, &truncated_fd, &open_error);
+    });
+    EXPECT_EQ(open_error, WASI_ERROR_CODE_SUCCESS);
+    ASSERT_GE(truncated_fd, 0);
+    struct stat st = {};
+    ASSERT_EQ(fstat(truncated_fd, &st), 0);
+    EXPECT_EQ(st.st_size, 0);
+
+    close(truncated_fd);
+    close(fd);
+    close(dir_fd);
+}
+
+TEST_F(WasiP2FilesystemTest, Filesystem_AppendAndTruncateDoNotInterleave)
+{
+    int fd = open(test_file, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    ASSERT_NE(fd, -1);
+    uint8_t appended = 'X';
+    wasi_list_u8_t payload = { .buf = &appended, .buf_len = 1 };
+
+    for (uint32_t iteration = 0; iteration < 512; iteration++) {
+        ASSERT_EQ(ftruncate(fd, 0), 0);
+        uint8_t initial[64] = {};
+        ASSERT_EQ(pwrite(fd, initial, sizeof(initial), 0),
+                  static_cast<ssize_t>(sizeof(initial)));
+
+        StreamResourceType append_stream = {};
+        append_stream.type = STREAM_TYPE_FILE;
+        append_stream.fd = static_cast<uint32_t>(fd);
+        append_stream.position_valid = true;
+        append_stream.append = true;
+        wasi_result_void_stream_error_t append_result = {};
+        int truncate_error = -1;
+        std::atomic<bool> start = false;
+        std::thread append_thread([&] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            wasi_p2_stream_resource_write(&append_stream, &payload, false,
+                                          false, &append_result);
+        });
+        std::thread truncate_thread([&] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            truncate_error = wasi_filesystem_set_size(fd, 0);
+        });
+        start.store(true, std::memory_order_release);
+        append_thread.join();
+        truncate_thread.join();
+
+        ASSERT_FALSE(append_result.is_err) << "iteration " << iteration;
+        ASSERT_EQ(truncate_error, WASI_ERROR_CODE_SUCCESS);
+        struct stat st = {};
+        ASSERT_EQ(fstat(fd, &st), 0);
+        ASSERT_TRUE(st.st_size == 0 || st.st_size == 1)
+            << "append EOF selection interleaved with truncate at iteration "
+            << iteration;
+        if (st.st_size == 1) {
+            uint8_t actual = 0;
+            ASSERT_EQ(pread(fd, &actual, 1, 0), 1);
+            EXPECT_EQ(actual, appended);
+        }
+    }
+
+    close(fd);
 }
 
 // Test creating and removing a hard link.

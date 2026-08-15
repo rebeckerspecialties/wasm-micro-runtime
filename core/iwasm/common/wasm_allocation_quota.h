@@ -19,8 +19,39 @@ typedef struct WASMAllocationQuotaToken WASMAllocationQuotaToken;
 typedef struct WASMAllocationQuotaScope {
     WASMAllocationQuotaToken *token;
     WASMAllocationQuotaToken *previous;
+    struct WASMAllocationQuotaScope *previous_scope;
     bool active;
 } WASMAllocationQuotaScope;
+
+/*
+ * A synchronous scope which borrows the retain held by a live runtime root.
+ * This is intentionally distinct from WASMAllocationQuotaScope: guest thread
+ * exit may bypass a call frame, so call scopes must not own a token retain.
+ */
+typedef struct WASMAllocationQuotaBorrowedScope {
+    WASMAllocationQuotaToken *token;
+    WASMAllocationQuotaToken *previous;
+    bool active;
+} WASMAllocationQuotaBorrowedScope;
+
+/* A manually accounted host allocation which is not made by the allocator. */
+typedef struct WASMAllocationQuotaReservation {
+    WASMAllocationQuotaToken *token;
+    uint64_t bytes;
+    uint32_t allocations;
+    bool active;
+} WASMAllocationQuotaReservation;
+
+/*
+ * An idempotent owner lease for a spawned native thread.  Direct guest thread
+ * exit paths can release the current lease even when their entry frame will
+ * never resume.
+ */
+typedef struct WASMAllocationQuotaThreadLease {
+    WASMAllocationQuotaToken *token;
+    WASMAllocationQuotaToken *previous;
+    bool active;
+} WASMAllocationQuotaThreadLease;
 
 #define WASM_ALLOCATION_HEADER_MAGIC UINT64_C(0x57414D52514F5441)
 
@@ -95,6 +126,43 @@ wasm_allocation_quota_scope_enter_for_load(WASMAllocationQuotaScope *scope,
 bool
 wasm_allocation_quota_scope_enter_for_allocation(
     WASMAllocationQuotaScope *scope, const void *allocation);
+
+bool
+wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+    WASMAllocationQuotaBorrowedScope *scope, const void *allocation);
+
+void
+wasm_allocation_quota_borrowed_scope_leave(
+    WASMAllocationQuotaBorrowedScope *scope);
+
+bool
+wasm_allocation_quota_reservation_acquire_for_allocation(
+    WASMAllocationQuotaReservation *reservation, const void *allocation,
+    uint64_t bytes, uint32_t allocations);
+
+void
+wasm_allocation_quota_reservation_release(
+    WASMAllocationQuotaReservation *reservation);
+
+void
+wasm_allocation_quota_reservation_move(
+    WASMAllocationQuotaReservation *destination,
+    WASMAllocationQuotaReservation *source);
+
+bool
+wasm_allocation_quota_thread_lease_enter_for_allocation(
+    WASMAllocationQuotaThreadLease *lease, const void *allocation);
+
+void
+wasm_allocation_quota_thread_lease_leave(WASMAllocationQuotaThreadLease *lease);
+
+/* Release retained scopes before a guest nonlocal exit abandons C frames. */
+void
+wasm_allocation_quota_thread_scope_unwind_current(void);
+
+/* Release the active lease on a non-returning guest thread-exit path. */
+void
+wasm_allocation_quota_thread_lease_leave_current(void);
 
 bool
 wasm_allocation_quota_allocations_share_owner(const void *first,
