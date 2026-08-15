@@ -291,6 +291,19 @@ typedef struct InstantiationArgs {
 
 struct InstantiationArgs2;
 
+/**
+ * Optional aggregate linear-memory page quota callbacks.
+ *
+ * The reserve callback runs before newly owned WebAssembly memory pages are
+ * committed, including initial pages and memory.grow. The release callback
+ * runs when a failed reservation is rolled back or committed pages retire.
+ * Callbacks shared by several instances must be thread-safe.
+ */
+typedef bool (*wasm_memory_page_quota_reserve_callback_t)(void *attachment,
+                                                          uint32_t pages);
+typedef void (*wasm_memory_page_quota_release_callback_t)(void *attachment,
+                                                          uint32_t pages);
+
 #ifndef WASM_VALKIND_T_DEFINED
 #define WASM_VALKIND_T_DEFINED
 typedef uint8_t wasm_valkind_t;
@@ -779,6 +792,20 @@ wasm_runtime_instantiation_args_set_host_managed_heap_size(
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_max_memory_pages(
     struct InstantiationArgs2 *p, uint32_t v);
+
+/**
+ * Set an aggregate committed-page quota for this instantiation.
+ *
+ * Passing two NULL callbacks disables aggregate quota accounting. Supplying
+ * only one callback makes instantiation fail before allocating an instance.
+ * The attachment must remain valid for the lifetime of a resulting module
+ * instance.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_instantiation_args_set_memory_page_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_memory_page_quota_reserve_callback_t reserve_callback,
+    wasm_memory_page_quota_release_callback_t release_callback);
 
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_custom_data(struct InstantiationArgs2 *p,
