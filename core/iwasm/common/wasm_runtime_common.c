@@ -9,6 +9,7 @@
 #include "bh_log.h"
 #include "wasm_native.h"
 #include "wasm_runtime_common.h"
+#include "wasm_allocation_quota.h"
 #include "wasm_memory.h"
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 #include "component-model/wasm_component_runtime.h"
@@ -1211,6 +1212,13 @@ wasm_runtime_register_module_internal(const char *module_name,
 {
     WASMRegisteredModule *node = NULL;
 
+    if (!wasm_allocation_quota_allocation_matches_current(module)) {
+        set_error_buf(error_buf, error_buf_size,
+                      "Register module failed: allocation quota owner scope "
+                      "mismatch");
+        return false;
+    }
+
     node = wasm_runtime_find_module_registered_by_reference(module);
     if (node) {                  /* module has been registered */
         if (node->module_name) { /* module has name */
@@ -1277,6 +1285,9 @@ bool
 wasm_runtime_register_module(const char *module_name, WASMModuleCommon *module,
                              char *error_buf, uint32 error_buf_size)
 {
+    WASMAllocationQuotaScope scope;
+    bool registered;
+
     if (!error_buf || !error_buf_size) {
         LOG_ERROR("error buffer is required");
         return false;
@@ -1298,15 +1309,32 @@ wasm_runtime_register_module(const char *module_name, WASMModuleCommon *module,
         return false;
     }
 
-    return wasm_runtime_register_module_internal(module_name, module, NULL, 0,
-                                                 error_buf, error_buf_size);
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, module)) {
+        set_error_buf(error_buf, error_buf_size,
+                      "Register module failed: allocation quota owner scope "
+                      "could not be established");
+        return false;
+    }
+    registered = wasm_runtime_register_module_internal(
+        module_name, module, NULL, 0, error_buf, error_buf_size);
+    wasm_allocation_quota_scope_leave(&scope);
+    return registered;
 }
 
 bool
 wasm_runtime_unregister_module(WASMModuleCommon *module)
 {
     WASMRegisteredModule *registered_module = NULL;
+    WASMAllocationQuotaScope scope;
     bool unregistered = true;
+
+    if (!module)
+        return true;
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, module)) {
+        LOG_ERROR("failed to establish allocation quota owner while "
+                  "unregistering a module");
+        return false;
+    }
 
     os_mutex_lock(&registered_module_list_lock);
     registered_module = bh_list_first_elem(registered_module_list);
@@ -1330,6 +1358,7 @@ wasm_runtime_unregister_module(WASMModuleCommon *module)
         }
     }
     os_mutex_unlock(&registered_module_list_lock);
+    wasm_allocation_quota_scope_leave(&scope);
     return unregistered;
 }
 
@@ -1364,6 +1393,15 @@ wasm_runtime_destroy_registered_module_list()
     reg_module = bh_list_first_elem(registered_module_list);
     while (reg_module) {
         WASMRegisteredModule *next_reg_module = bh_list_elem_next(reg_module);
+        WASMAllocationQuotaScope scope;
+
+        if (!wasm_allocation_quota_scope_enter_for_allocation(
+                &scope, reg_module->module)) {
+            LOG_ERROR("failed to establish allocation quota owner while "
+                      "destroying a registered module");
+            reg_module = next_reg_module;
+            continue;
+        }
 
         bh_list_remove(registered_module_list, reg_module);
 
@@ -1391,6 +1429,7 @@ wasm_runtime_destroy_registered_module_list()
             wasm_runtime_free((void *)reg_module->module_name);
         }
         wasm_runtime_free(reg_module);
+        wasm_allocation_quota_scope_leave(&scope);
         reg_module = next_reg_module;
     }
     os_mutex_unlock(&registered_module_list_lock);
@@ -1561,6 +1600,104 @@ register_module_with_null_name(WASMModuleCommon *module_common, char *error_buf,
 #endif
 }
 
+void
+wasm_runtime_load_args2_init(LoadArgs2 *args)
+{
+    if (!args)
+        return;
+
+    memset(args, 0, WASM_LOAD_ARGS2_SIZE_V1);
+    args->struct_size = WASM_LOAD_ARGS2_SIZE_V1;
+    args->abi_version = WASM_LOAD_ARGS2_ABI_VERSION_1;
+}
+
+void
+wasm_runtime_load_args2_set_allocation_quota(
+    LoadArgs2 *args, void *attachment,
+    wasm_allocation_quota_reserve_callback_t reserve_callback,
+    wasm_allocation_quota_release_callback_t release_callback,
+    wasm_allocation_quota_attachment_retain_callback_t retain_callback,
+    wasm_allocation_quota_attachment_release_callback_t
+        attachment_release_callback)
+{
+    if (!args) {
+        return;
+    }
+
+    args->allocation_quota_attachment = attachment;
+    args->allocation_quota_reserve = reserve_callback;
+    args->allocation_quota_release = release_callback;
+    args->allocation_quota_attachment_retain = retain_callback;
+    args->allocation_quota_attachment_release = attachment_release_callback;
+}
+
+bool
+wasm_runtime_load_args2_quota_enabled(const LoadArgs2 *args)
+{
+    return args && args->allocation_quota_attachment
+           && args->allocation_quota_reserve && args->allocation_quota_release
+           && args->allocation_quota_attachment_retain
+           && args->allocation_quota_attachment_release;
+}
+
+bool
+wasm_runtime_load_args2_normalize(const LoadArgs2 *args, LoadArgs *legacy_args,
+                                  char *error_buf, uint32 error_buf_size)
+{
+    bool any_quota_field;
+    bool all_quota_fields;
+
+    if (!args || !legacy_args) {
+        set_error_buf(error_buf, error_buf_size,
+                      "WASM module load failed: null versioned load "
+                      "arguments");
+        return false;
+    }
+    if (args->struct_size < WASM_LOAD_ARGS2_SIZE_V1) {
+        set_error_buf(error_buf, error_buf_size,
+                      "WASM module load failed: undersized versioned load "
+                      "arguments");
+        return false;
+    }
+    if (args->abi_version != WASM_LOAD_ARGS2_ABI_VERSION_1) {
+        set_error_buf(error_buf, error_buf_size,
+                      "WASM module load failed: unsupported load arguments "
+                      "ABI version");
+        return false;
+    }
+    if (args->clone_wasm_binary > 1 || args->wasm_binary_freeable > 1
+        || args->no_resolve > 1 || args->is_component > 1 || args->reserved[0]
+        || args->reserved[1] || args->reserved[2] || args->reserved[3]) {
+        set_error_buf(error_buf, error_buf_size,
+                      "WASM module load failed: invalid versioned load "
+                      "flags");
+        return false;
+    }
+
+    any_quota_field = args->allocation_quota_attachment
+                      || args->allocation_quota_reserve
+                      || args->allocation_quota_release
+                      || args->allocation_quota_attachment_retain
+                      || args->allocation_quota_attachment_release;
+    all_quota_fields = wasm_runtime_load_args2_quota_enabled(args);
+    if (any_quota_field && !all_quota_fields) {
+        set_error_buf(error_buf, error_buf_size,
+                      "WASM module load failed: incomplete allocation quota "
+                      "callbacks");
+        return false;
+    }
+
+    memset(legacy_args, 0, sizeof(*legacy_args));
+    legacy_args->name = args->name;
+    legacy_args->clone_wasm_binary = args->clone_wasm_binary != 0;
+    legacy_args->wasm_binary_freeable = args->wasm_binary_freeable != 0;
+    legacy_args->no_resolve = args->no_resolve != 0;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    legacy_args->is_component = args->is_component != 0;
+#endif
+    return true;
+}
+
 WASMModuleCommon *
 wasm_runtime_load_ex(uint8 *buf, uint32 size, const LoadArgs *args,
                      char *error_buf, uint32 error_buf_size)
@@ -1631,20 +1768,57 @@ wasm_runtime_load_ex(uint8 *buf, uint32 size, const LoadArgs *args,
                                           error_buf_size);
 }
 
+WASMModuleCommon *
+wasm_runtime_load_ex2(uint8 *buf, uint32 size, const LoadArgs2 *args,
+                      char *error_buf, uint32 error_buf_size)
+{
+    LoadArgs legacy_args;
+    WASMAllocationQuotaScope scope;
+    WASMModuleCommon *module;
+
+    if (!wasm_runtime_load_args2_normalize(args, &legacy_args, error_buf,
+                                           error_buf_size)) {
+        return NULL;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_load(&scope, args)) {
+        set_error_buf(error_buf, error_buf_size,
+                      "WASM module load failed: allocation quota owner could "
+                      "not be established");
+        return NULL;
+    }
+
+    module = wasm_runtime_load_ex(buf, size, &legacy_args, error_buf,
+                                  error_buf_size);
+    wasm_allocation_quota_scope_leave(&scope);
+    return module;
+}
+
 bool
 wasm_runtime_resolve_symbols(WASMModuleCommon *module)
 {
+    WASMAllocationQuotaScope scope;
+    bool resolved = false;
+
+    if (!module
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, module)) {
+        return false;
+    }
 #if WASM_ENABLE_INTERP != 0
     if (module->module_type == Wasm_Module_Bytecode) {
-        return wasm_resolve_symbols((WASMModule *)module);
+        resolved = wasm_resolve_symbols((WASMModule *)module);
+        goto done;
     }
 #endif
 #if WASM_ENABLE_AOT != 0
     if (module->module_type == Wasm_Module_AoT) {
-        return aot_resolve_symbols((AOTModule *)module);
+        resolved = aot_resolve_symbols((AOTModule *)module);
+        goto done;
     }
 #endif
-    return false;
+
+done:
+    wasm_allocation_quota_scope_leave(&scope);
+    return resolved;
 }
 
 WASMModuleCommon *
@@ -1700,7 +1874,14 @@ wasm_runtime_load_from_sections(WASMSection *section_list, bool is_aot,
 void
 wasm_runtime_unload(WASMModuleCommon *module)
 {
+    WASMAllocationQuotaScope scope;
+
     if (!module) {
+        return;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, module)) {
+        LOG_ERROR("failed to establish allocation quota owner while unloading "
+                  "a module");
         return;
     }
 
@@ -1709,23 +1890,26 @@ wasm_runtime_unload(WASMModuleCommon *module)
      * wasm_runtime_destroy().  An explicitly unregistered module is owned by
      * the caller again and can be unloaded below. */
     if (wasm_runtime_find_module_registered_by_reference(module)) {
-        return;
+        goto done;
     }
 #endif
 
 #if WASM_ENABLE_INTERP != 0
     if (module->module_type == Wasm_Module_Bytecode) {
         wasm_unload((WASMModule *)module);
-        return;
+        goto done;
     }
 #endif
 
 #if WASM_ENABLE_AOT != 0
     if (module->module_type == Wasm_Module_AoT) {
         aot_unload((AOTModule *)module);
-        return;
+        goto done;
     }
 #endif
+
+done:
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 uint32
@@ -7903,6 +8087,18 @@ wasm_runtime_register_sub_module(const WASMModuleCommon *parent_module,
     WASMRegisteredModule *node = NULL;
     bh_list_status ret = BH_LIST_ERROR;
 
+    if (!wasm_allocation_quota_allocation_matches_current(parent_module)) {
+        LOG_ERROR("refusing to register a sub module outside its parent "
+                  "allocation quota owner scope");
+        return false;
+    }
+    if (!wasm_allocation_quota_allocations_share_owner(parent_module,
+                                                       sub_module)) {
+        LOG_ERROR("refusing to register a sub module with a different "
+                  "allocation quota owner");
+        return false;
+    }
+
     if (wasm_runtime_search_sub_module(parent_module, sub_module_name)) {
         LOG_DEBUG("%s has been registered in its parent", sub_module_name);
         return true;
@@ -7932,10 +8128,10 @@ wasm_runtime_register_sub_module(const WASMModuleCommon *parent_module,
     return true;
 }
 
-WASMModuleCommon *
-wasm_runtime_load_depended_module(const WASMModuleCommon *parent_module,
-                                  const char *sub_module_name, char *error_buf,
-                                  uint32 error_buf_size)
+static WASMModuleCommon *
+wasm_runtime_load_depended_module_internal(
+    const WASMModuleCommon *parent_module, const char *sub_module_name,
+    char *error_buf, uint32 error_buf_size)
 {
     WASMModuleCommon *sub_module = NULL;
     bool ret = false;
@@ -7946,6 +8142,14 @@ wasm_runtime_load_depended_module(const WASMModuleCommon *parent_module,
     /* check the registered module list of the parent */
     sub_module = wasm_runtime_search_sub_module(parent_module, sub_module_name);
     if (sub_module) {
+        if (!wasm_allocation_quota_allocations_share_owner(parent_module,
+                                                           sub_module)) {
+            set_error_buf_v(parent_module, error_buf, error_buf_size,
+                            "allocation quota owner mismatch for sub module "
+                            "%s",
+                            sub_module_name);
+            return NULL;
+        }
         LOG_DEBUG("%s has been loaded before", sub_module_name);
         return sub_module;
     }
@@ -7953,6 +8157,14 @@ wasm_runtime_load_depended_module(const WASMModuleCommon *parent_module,
     /* check the global registered module list */
     sub_module = wasm_runtime_find_module_registered(sub_module_name);
     if (sub_module) {
+        if (!wasm_allocation_quota_allocations_share_owner(parent_module,
+                                                           sub_module)) {
+            set_error_buf_v(parent_module, error_buf, error_buf_size,
+                            "allocation quota owner mismatch for sub module "
+                            "%s",
+                            sub_module_name);
+            return NULL;
+        }
         LOG_DEBUG("%s has been loaded", sub_module_name);
         goto wasm_runtime_register_sub_module;
     }
@@ -8007,6 +8219,13 @@ wasm_runtime_load_depended_module(const WASMModuleCommon *parent_module,
         /* others will be destroyed in runtime_destroy() */
         goto destroy_file_buffer;
     }
+    if (!wasm_allocation_quota_allocations_share_owner(parent_module,
+                                                       sub_module)) {
+        set_error_buf_v(parent_module, error_buf, error_buf_size,
+                        "allocation quota owner mismatch for sub module %s",
+                        sub_module_name);
+        goto unload_module;
+    }
     wasm_runtime_delete_loading_module(sub_module_name);
     /* register on a global list */
     ret = wasm_runtime_register_module_internal(
@@ -8049,6 +8268,29 @@ destroy_file_buffer:
 delete_loading_module:
     wasm_runtime_delete_loading_module(sub_module_name);
     return NULL;
+}
+
+WASMModuleCommon *
+wasm_runtime_load_depended_module(const WASMModuleCommon *parent_module,
+                                  const char *sub_module_name, char *error_buf,
+                                  uint32 error_buf_size)
+{
+    WASMAllocationQuotaScope scope;
+    WASMModuleCommon *sub_module;
+
+    if (!parent_module
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             parent_module)) {
+        set_error_buf(error_buf, error_buf_size,
+                      "allocation quota owner scope could not be established "
+                      "for sub module load");
+        return NULL;
+    }
+
+    sub_module = wasm_runtime_load_depended_module_internal(
+        parent_module, sub_module_name, error_buf, error_buf_size);
+    wasm_allocation_quota_scope_leave(&scope);
+    return sub_module;
 }
 
 bool

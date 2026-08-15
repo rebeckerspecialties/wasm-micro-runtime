@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <assert.h>
+#include "wasm_load_args.h"
 
 #ifndef WASM_API_EXTERN
 #if defined(_MSC_BUILD)
@@ -526,30 +527,23 @@ struct WASMModuleCommon;
 typedef struct WASMModuleCommon *wasm_module_t;
 #endif
 
-#ifndef LOAD_ARGS_OPTION_DEFINED
-#define LOAD_ARGS_OPTION_DEFINED
-typedef struct LoadArgs {
-    char *name;
-    /* True by default, used by wasm-c-api only.
-    If false, the wasm input buffer (wasm_byte_vec_t) is referenced by the
-    module instead of being cloned. Hence, it can be freed after module loading. */
-    bool clone_wasm_binary;
-    /* This option is only used by the AOT/wasm loader (see wasm_export.h) */
-    bool wasm_binary_freeable;
-    /* false by default, if true, don't resolve the symbols yet. The
-       wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
-       call */
-    bool no_resolve;
-    /* TODO: more fields? */
-} LoadArgs;
-#endif /* LOAD_ARGS_OPTION_DEFINED */
-
 WASM_API_EXTERN own wasm_module_t* wasm_module_new(
   wasm_store_t*, const wasm_byte_vec_t* binary);
 
 // please refer to wasm_runtime_load_ex(...) in core/iwasm/include/wasm_export.h
 WASM_API_EXTERN own wasm_module_t* wasm_module_new_ex(
   wasm_store_t*, wasm_byte_vec_t* binary, LoadArgs *args);
+
+WASM_API_EXTERN own wasm_module_t* wasm_module_new_ex2(
+  wasm_store_t*, wasm_byte_vec_t* binary, const LoadArgs2 *args);
+
+WASM_API_EXTERN void wasm_runtime_load_args2_init(LoadArgs2 *args);
+WASM_API_EXTERN void wasm_runtime_load_args2_set_allocation_quota(
+  LoadArgs2 *args, void *attachment,
+  wasm_allocation_quota_reserve_callback_t reserve_callback,
+  wasm_allocation_quota_release_callback_t release_callback,
+  wasm_allocation_quota_attachment_retain_callback_t retain_callback,
+  wasm_allocation_quota_attachment_release_callback_t attachment_release_callback);
 
 WASM_API_EXTERN void wasm_module_delete(own wasm_module_t*);
 

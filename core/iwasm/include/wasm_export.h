@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "lib_export.h"
+#include "wasm_load_args.h"
 
 #ifndef WASM_RUNTIME_API_EXTERN
 #if defined(_MSC_BUILD)
@@ -341,29 +342,6 @@ typedef struct RuntimeInitArgs {
     bool enable_linux_perf;
 } RuntimeInitArgs;
 
-#ifndef LOAD_ARGS_OPTION_DEFINED
-#define LOAD_ARGS_OPTION_DEFINED
-typedef struct LoadArgs {
-    char *name;
-    /* This option is only used by the Wasm C API (see wasm_c_api.h) */
-    bool clone_wasm_binary;
-    /* False by default, used by AOT/wasm loader only.
-    If true, the AOT/wasm loader creates a copy of some module fields (e.g.
-    const strings), making it possible to free the wasm binary buffer after
-    loading. */
-    bool wasm_binary_freeable;
-
-    /* false by default, if true, don't resolve the symbols yet. The
-       wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
-       call */
-    bool no_resolve;
-#if WASM_ENABLE_COMPONENT_MODEL != 0
-    bool is_component;
-#endif
-    /* TODO: more fields? */
-} LoadArgs;
-#endif /* LOAD_ARGS_OPTION_DEFINED */
-
 #ifndef INSTANTIATION_ARGS_OPTION_DEFINED
 #define INSTANTIATION_ARGS_OPTION_DEFINED
 /* WASM module instantiation arguments */
@@ -529,6 +507,7 @@ wasm_runtime_destroy(void);
 
 /**
  * Allocate memory from runtime memory environment.
+ * The returned pointer is aligned for any fundamental C object type.
  *
  * @param size bytes need to allocate
  *
@@ -555,6 +534,9 @@ wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment);
 
 /**
  * Reallocate memory from runtime memory environment
+ * A null pointer is handled as wasm_runtime_malloc(). A zero size frees a
+ * non-aligned allocation and returns NULL. Explicitly aligned allocations
+ * cannot be reallocated and remain owned by the caller when NULL is returned.
  *
  * @param ptr the original memory
  * @param size bytes need to reallocate
@@ -575,9 +557,7 @@ wasm_runtime_realloc(void *ptr, unsigned int size);
 WASM_RUNTIME_API_EXTERN void *
 wasm_runtime_calloc(uint64_t count, unsigned int size);
 
-/*
- * Free memory to runtime memory environment.
- */
+/* Free memory to runtime memory environment. A null pointer is a no-op. */
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_free(void *ptr);
 
@@ -763,6 +743,36 @@ wasm_runtime_load(uint8_t *buf, uint32_t size, char *error_buf,
 WASM_RUNTIME_API_EXTERN wasm_module_t
 wasm_runtime_load_ex(uint8_t *buf, uint32_t size, const LoadArgs *args,
                      char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Initialize versioned loader settings.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_load_args2_init(LoadArgs2 *args);
+
+/**
+ * Attach a native-allocation quota to versioned loader settings.
+ *
+ * Passing five NULL attachment/callback values disables accounting. Any
+ * partially specified callback set is rejected before loading begins.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_load_args2_set_allocation_quota(
+    LoadArgs2 *args, void *attachment,
+    wasm_allocation_quota_reserve_callback_t reserve_callback,
+    wasm_allocation_quota_release_callback_t release_callback,
+    wasm_allocation_quota_attachment_retain_callback_t retain_callback,
+    wasm_allocation_quota_attachment_release_callback_t
+        attachment_release_callback);
+
+/**
+ * Load a WASM module using sized, versioned settings. A configured allocation
+ * quota is installed before the first loader allocation and fails closed if
+ * its owner cannot be established.
+ */
+WASM_RUNTIME_API_EXTERN wasm_module_t
+wasm_runtime_load_ex2(uint8_t *buf, uint32_t size, const LoadArgs2 *args,
+                      char *error_buf, uint32_t error_buf_size);
 
 /**
  * Resolve symbols for a previously loaded WASM module. Only useful when the
@@ -1521,6 +1531,13 @@ wasm_runtime_get_exception(wasm_module_inst_t module_inst);
 WASM_RUNTIME_API_EXTERN WASMComponent *
 wasm_component_load(uint8_t *buf, uint32_t size, const LoadArgs *load_args,
                     char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Load and validate a component using sized, versioned loader settings.
+ */
+WASM_RUNTIME_API_EXTERN WASMComponent *
+wasm_component_load_ex2(uint8_t *buf, uint32_t size, const LoadArgs2 *load_args,
+                        char *error_buf, uint32_t error_buf_size);
 
 /**
  * Unload a component.

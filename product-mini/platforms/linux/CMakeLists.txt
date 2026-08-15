@@ -175,6 +175,7 @@ target_include_directories(vmlib INTERFACE
 set (WAMR_PUBLIC_HEADERS
   ${WAMR_ROOT_DIR}/core/iwasm/include/wasm_c_api.h
   ${WAMR_ROOT_DIR}/core/iwasm/include/wasm_export.h
+  ${WAMR_ROOT_DIR}/core/iwasm/include/wasm_load_args.h
   ${WAMR_ROOT_DIR}/core/iwasm/include/lib_export.h
 )
 

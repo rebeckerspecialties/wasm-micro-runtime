@@ -5653,25 +5653,6 @@ aot_resolve_function(const AOTModule *module, const char *function_name,
                      uint32 error_buf_size);
 
 static void *
-aot_resolve_function_ex(const char *module_name, const char *function_name,
-                        const AOTFuncType *expected_function_type,
-                        char *error_buf, uint32 error_buf_size)
-{
-    WASMModuleCommon *module_reg;
-
-    module_reg = wasm_runtime_find_module_registered(module_name);
-    if (!module_reg || module_reg->module_type != Wasm_Module_AoT) {
-        LOG_DEBUG("can not find a module named %s for function %s", module_name,
-                  function_name);
-        set_error_buf(error_buf, error_buf_size, "unknown import");
-        return NULL;
-    }
-    return aot_resolve_function((AOTModule *)module_reg, function_name,
-                                expected_function_type, error_buf,
-                                error_buf_size);
-}
-
-static void *
 aot_resolve_function(const AOTModule *module, const char *function_name,
                      const AOTFuncType *expected_function_type, char *error_buf,
                      uint32 error_buf_size)
@@ -5716,7 +5697,7 @@ bool
 aot_resolve_import_func(AOTModule *module, AOTImportFunc *import_func)
 {
 #if WASM_ENABLE_MULTI_MODULE != 0
-    char error_buf[128];
+    char error_buf[128] = { 0 };
     AOTModule *sub_module = NULL;
 #endif
     import_func->func_ptr_linked = wasm_native_resolve_symbol(
@@ -5732,10 +5713,6 @@ aot_resolve_import_func(AOTModule *module, AOTImportFunc *import_func)
             if (!sub_module) {
                 LOG_WARNING("Failed to load sub module: %s", error_buf);
             }
-            if (!sub_module)
-                import_func->func_ptr_linked = aot_resolve_function_ex(
-                    import_func->module_name, import_func->func_name,
-                    import_func->func_type, error_buf, sizeof(error_buf));
             else
                 import_func->func_ptr_linked = aot_resolve_function(
                     sub_module, import_func->func_name, import_func->func_type,
