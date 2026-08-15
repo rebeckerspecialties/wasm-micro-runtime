@@ -1759,6 +1759,14 @@ wasm_runtime_instantiate_internal(WASMModuleCommon *module,
                                   const struct InstantiationArgs2 *args,
                                   char *error_buf, uint32 error_buf_size)
 {
+    if ((args->memory_page_quota_reserve == NULL)
+        != (args->memory_page_quota_release == NULL)) {
+        set_error_buf(error_buf, error_buf_size,
+                      "Instantiate module failed, incomplete memory page "
+                      "quota callbacks");
+        return NULL;
+    }
+
 #if WASM_ENABLE_INTERP != 0
     if (module->module_type == Wasm_Module_Bytecode)
         return (WASMModuleInstanceCommon *)wasm_instantiate(
@@ -1847,6 +1855,17 @@ wasm_runtime_instantiation_args_set_max_memory_pages(
     struct InstantiationArgs2 *p, uint32 v)
 {
     p->v1.max_memory_pages = v;
+}
+
+void
+wasm_runtime_instantiation_args_set_memory_page_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_memory_page_quota_reserve_callback_t reserve_callback,
+    wasm_memory_page_quota_release_callback_t release_callback)
+{
+    p->memory_page_quota_attachment = attachment;
+    p->memory_page_quota_reserve = reserve_callback;
+    p->memory_page_quota_release = release_callback;
 }
 
 void
