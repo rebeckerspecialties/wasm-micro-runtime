@@ -26,24 +26,27 @@
 
 static uint32_t
 add_tcp_stream_resource(HostResourceTable *table, HostResourceType type,
-                        int32_t fd)
+                        int32_t fd, WasiP2NativeFdQuotaLease *fd_lease)
 {
     HostResource *resource;
     uint32_t rep;
 
     if (fd < 0) {
+        wasi_p2_native_fd_quota_release(fd_lease);
         return 0;
     }
 
     resource = host_resource_create(type, sizeof(StreamResourceType));
     if (!resource) {
         close(fd);
+        wasi_p2_native_fd_quota_release(fd_lease);
         return 0;
     }
 
     ((StreamResourceType *)resource->data)->fd = (uint32_t)fd;
     ((StreamResourceType *)resource->data)->type = STREAM_TYPE_SOCKET;
     host_resource_set_dtor(resource, tcp_owned_stream_dtor);
+    wasi_p2_native_fd_quota_transfer_to_host_resource(resource, fd_lease);
 
     rep = host_resource_table_add(table, resource);
     if (rep == 0) {
@@ -54,29 +57,48 @@ add_tcp_stream_resource(HostResourceTable *table, HostResourceType type,
 
 static uint32_t
 add_udp_datagram_stream_resource(HostResourceTable *table,
-                                 HostResourceType type, int32_t fd)
+                                 HostResourceType type, int32_t fd,
+                                 WasiP2NativeFdQuotaLease *fd_lease)
 {
     HostResource *resource;
     uint32_t rep;
 
     if (fd < 0) {
+        wasi_p2_native_fd_quota_release(fd_lease);
         return 0;
     }
 
     resource = host_resource_create(type, sizeof(uint32_t));
     if (!resource) {
         close(fd);
+        wasi_p2_native_fd_quota_release(fd_lease);
         return 0;
     }
 
     *(uint32_t *)resource->data = (uint32_t)fd;
     host_resource_set_dtor(resource, udp_datagram_stream_dtor);
+    wasi_p2_native_fd_quota_transfer_to_host_resource(resource, fd_lease);
 
     rep = host_resource_table_add(table, resource);
     if (rep == 0) {
         destroy_host_resource(resource);
     }
     return rep;
+}
+
+static wit_value_t
+make_resource_result(uint32_t rep)
+{
+    wit_value_t resource = wit_resource_ctor(rep);
+    wit_value_t result = NULL;
+
+    if (resource) {
+        result = wit_result_ctor(false, resource);
+        if (!result) {
+            free_wit_value(resource);
+        }
+    }
+    return result;
 }
 
 static wit_value_t
@@ -340,6 +362,9 @@ wasi_sockets_ip_name_lookup_resolve_addresses_wrapper(wasm_exec_env_t exec_env,
 
     wit_value_t lifted_handle = NULL;
     wit_value_t result = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease read_fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease write_fd_lease = { 0 };
     if (!lift_borrow(
             exec_env->cx, network_handle,
             func_type->params->params[0].type->type_specific.resource_handle,
@@ -383,7 +408,19 @@ wasi_sockets_ip_name_lookup_resolve_addresses_wrapper(wasm_exec_env_t exec_env,
     // Get the actual network fd from the host resource
     wasi_network_t network_fd = *((uint32_t *)hr->data);
 
-    wasi_sockets_resolve_addresses(network_fd, name, &stream, &err);
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 2, &fd_lease)
+        || !wasi_p2_native_fd_quota_lease_take(&fd_lease, 1, &read_fd_lease)
+        || !wasi_p2_native_fd_quota_lease_take(&fd_lease, 1, &write_fd_lease)) {
+        wasi_p2_native_fd_quota_release(&read_fd_lease);
+        wasi_p2_native_fd_quota_release(&write_fd_lease);
+        wasi_p2_native_fd_quota_release(&fd_lease);
+        wasm_runtime_free(name);
+        result = get_result_error_val(WASI_NETWORK_ERROR_CODE_NEW_SOCKET_LIMIT);
+        goto end;
+    }
+
+    wasi_sockets_resolve_addresses_with_fd_quota(
+        network_fd, name, &stream, &err, &read_fd_lease, &write_fd_lease);
 
     wasm_runtime_free(name);
 
@@ -396,6 +433,7 @@ wasi_sockets_ip_name_lookup_resolve_addresses_wrapper(wasm_exec_env_t exec_env,
             WASI_P2_RESOLVE_ADDRESS_STREAM, sizeof(stream));
 
         if (!hr_stream) {
+            wasi_sockets_drop_resolve_stream(stream);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
@@ -412,8 +450,12 @@ wasi_sockets_ip_name_lookup_resolve_addresses_wrapper(wasm_exec_env_t exec_env,
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
-        wit_value_t out_val = wit_resource_ctor(out);
-        result = wit_result_ctor(false, out_val);
+        result = make_resource_result(out);
+        if (!result) {
+            host_resource_table_delete(hr_table, out);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+        }
         goto end;
     }
 
@@ -515,6 +557,7 @@ wasi_sockets_ip_name_lookup_resolve_address_stream_subscribe_wrapper(
         wasm_get_component_func_type(exec_env);
 
     wit_value_t lifted_handle = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
 
     if (!lift_borrow(
             exec_env->cx, stream_handle,
@@ -543,9 +586,16 @@ wasi_sockets_ip_name_lookup_resolve_address_stream_subscribe_wrapper(
     // Get the actual stream fd from the host resource
     wasi_network_t stream_fd = *((uint32_t *)hr->data);
 
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "native file descriptor quota exceeded");
+        return 0;
+    }
+
     wasi_pollable_context_t pollable =
         wasi_sockets_resolve_address_stream_subscribe(stream_fd);
     if (pollable.fd < 0) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get pollable FD");
         return 0;
@@ -557,12 +607,14 @@ wasi_sockets_ip_name_lookup_resolve_address_stream_subscribe_wrapper(
     if (!hr_poll) {
         if (pollable.own_fd)
             close(pollable.fd);
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not create pollable resource");
         return 0;
     }
     *((wasi_pollable_context_t *)hr_poll->data) = pollable;
     host_resource_set_dtor(hr_poll, pollable_dtor);
+    wasi_p2_native_fd_quota_transfer_to_host_resource(hr_poll, &fd_lease);
 
     uint32_t index_rep = host_resource_table_add(hr_table, hr_poll);
     if (index_rep < 1) {
@@ -602,11 +654,17 @@ wasi_sockets_tcp_create_socket_create_tcp_socket_wrapper(
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
     wit_value_t result = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
         || !wasi_ctx->wasi_options->tcp) {
         result = get_result_error_val(WASI_NETWORK_ERROR_CODE_NOT_SUPPORTED);
+        goto end;
+    }
+
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        result = get_result_error_val(WASI_NETWORK_ERROR_CODE_NEW_SOCKET_LIMIT);
         goto end;
     }
 
@@ -616,6 +674,7 @@ wasi_sockets_tcp_create_socket_create_tcp_socket_wrapper(
     wasi_sockets_create_tcp_socket(address_family, &socket, &err);
 
     if (err != 0) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         result = get_result_error_val(errno_to_wasi_network(err));
         goto end;
     }
@@ -625,6 +684,8 @@ wasi_sockets_tcp_create_socket_create_tcp_socket_wrapper(
         host_resource_create(WASI_P2_TCP_SOCKET, sizeof(wasi_socket_context_t));
 
     if (!hr) {
+        close(socket);
+        wasi_p2_native_fd_quota_release(&fd_lease);
         result = get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
         goto end;
     }
@@ -633,6 +694,7 @@ wasi_sockets_tcp_create_socket_create_tcp_socket_wrapper(
     ((wasi_socket_context_t *)hr->data)->fd = socket;
     ((wasi_socket_context_t *)hr->data)->tcp_listen_backlog = SOMAXCONN;
     host_resource_set_dtor(hr, tcp_socket_dtor);
+    wasi_p2_native_fd_quota_transfer_to_host_resource(hr, &fd_lease);
 
     uint32_t index_rep = host_resource_table_add(hr_table, hr);
     if (index_rep < 1) {
@@ -641,8 +703,12 @@ wasi_sockets_tcp_create_socket_create_tcp_socket_wrapper(
         goto end;
     }
     else {
-        wit_value_t out_rep = wit_resource_ctor(index_rep);
-        result = wit_result_ctor(false, out_rep);
+        result = make_resource_result(index_rep);
+        if (!result) {
+            host_resource_table_delete(hr_table, index_rep);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+        }
         goto end;
     }
 end:
@@ -970,6 +1036,9 @@ wasi_sockets_tcp_tcp_socket_finish_connect_wrapper(wasm_exec_env_t exec_env,
 
     wit_value_t lifted_handle = NULL;
     wit_value_t result = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease input_fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease output_fd_lease = { 0 };
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -1001,25 +1070,51 @@ wasi_sockets_tcp_tcp_socket_finish_connect_wrapper(wasm_exec_env_t exec_env,
 
     // Get the actual socket fd from the host resource
     wasi_tcp_socket_t socket_fd = ((wasi_socket_context_t *)hr->data)->fd;
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 2, &fd_lease)) {
+        result = get_result_error_val(WASI_NETWORK_ERROR_CODE_NEW_SOCKET_LIMIT);
+        goto end;
+    }
     wasi_sockets_tcp_finish_connect(socket_fd, &input_stream_fd,
                                     &output_stream_fd, &err);
 
     if (err != 0) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         result = get_result_error_val(errno_to_wasi_network(err));
         goto end;
     }
     else {
-        uint32_t input_stream = add_tcp_stream_resource(
-            hr_table, WASI_P2_IO_INPUT_STREAM, input_stream_fd);
+        if (!wasi_p2_native_fd_quota_lease_take(&fd_lease, 1,
+                                                &input_fd_lease)) {
+            close(input_stream_fd);
+            close(output_stream_fd);
+            wasi_p2_native_fd_quota_release(&fd_lease);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+            goto end;
+        }
+        uint32_t input_stream =
+            add_tcp_stream_resource(hr_table, WASI_P2_IO_INPUT_STREAM,
+                                    input_stream_fd, &input_fd_lease);
         if (input_stream == 0) {
             close(output_stream_fd);
+            wasi_p2_native_fd_quota_release(&fd_lease);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
 
-        uint32_t output_stream = add_tcp_stream_resource(
-            hr_table, WASI_P2_IO_OUTPUT_STREAM, output_stream_fd);
+        if (!wasi_p2_native_fd_quota_lease_take(&fd_lease, 1,
+                                                &output_fd_lease)) {
+            host_resource_table_delete(hr_table, input_stream);
+            close(output_stream_fd);
+            wasi_p2_native_fd_quota_release(&fd_lease);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+            goto end;
+        }
+        uint32_t output_stream =
+            add_tcp_stream_resource(hr_table, WASI_P2_IO_OUTPUT_STREAM,
+                                    output_stream_fd, &output_fd_lease);
         if (output_stream == 0) {
             host_resource_table_delete(hr_table, input_stream);
             result =
@@ -1188,6 +1283,10 @@ wasi_sockets_tcp_tcp_socket_accept_wrapper(wasm_exec_env_t exec_env,
 
     wit_value_t lifted_handle = NULL;
     wit_value_t result = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease socket_fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease input_fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease output_fd_lease = { 0 };
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -1220,10 +1319,15 @@ wasi_sockets_tcp_tcp_socket_accept_wrapper(wasm_exec_env_t exec_env,
 
     // Get the actual socket fd from the host resource
     wasi_tcp_socket_t socket_fd = ((wasi_socket_context_t *)hr->data)->fd;
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 3, &fd_lease)) {
+        result = get_result_error_val(WASI_NETWORK_ERROR_CODE_NEW_SOCKET_LIMIT);
+        goto end;
+    }
     wasi_sockets_tcp_accept(socket_fd, &new_socket, &input_stream,
                             &output_stream, &err);
 
     if (err != 0) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         result = get_result_error_val(errno_to_wasi_network(err));
         goto end;
     }
@@ -1235,6 +1339,7 @@ wasi_sockets_tcp_tcp_socket_accept_wrapper(wasm_exec_env_t exec_env,
             close(new_socket);
             close(input_stream);
             close(output_stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
@@ -1245,29 +1350,64 @@ wasi_sockets_tcp_tcp_socket_accept_wrapper(wasm_exec_env_t exec_env,
         ((wasi_socket_context_t *)hr_new->data)->fd = new_socket;
         ((wasi_socket_context_t *)hr_new->data)->tcp_listen_backlog = 0;
         host_resource_set_dtor(hr_new, tcp_socket_dtor);
+        if (!wasi_p2_native_fd_quota_lease_take(&fd_lease, 1,
+                                                &socket_fd_lease)) {
+            destroy_host_resource(hr_new);
+            close(input_stream);
+            close(output_stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+            goto end;
+        }
+        wasi_p2_native_fd_quota_transfer_to_host_resource(hr_new,
+                                                          &socket_fd_lease);
 
         uint32_t out = host_resource_table_add(hr_table, hr_new);
         if (out < 1) {
             destroy_host_resource(hr_new);
             close(input_stream);
             close(output_stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
 
+        if (!wasi_p2_native_fd_quota_lease_take(&fd_lease, 1,
+                                                &input_fd_lease)) {
+            host_resource_table_delete(hr_table, out);
+            close(input_stream);
+            close(output_stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+            goto end;
+        }
         uint32_t incoming_rep = add_tcp_stream_resource(
-            hr_table, WASI_P2_IO_INPUT_STREAM, input_stream);
+            hr_table, WASI_P2_IO_INPUT_STREAM, input_stream, &input_fd_lease);
         if (incoming_rep == 0) {
             host_resource_table_delete(hr_table, out);
             close(output_stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
 
-        uint32_t outgoing_rep = add_tcp_stream_resource(
-            hr_table, WASI_P2_IO_OUTPUT_STREAM, output_stream);
+        if (!wasi_p2_native_fd_quota_lease_take(&fd_lease, 1,
+                                                &output_fd_lease)) {
+            host_resource_table_delete(hr_table, incoming_rep);
+            host_resource_table_delete(hr_table, out);
+            close(output_stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+            goto end;
+        }
+        uint32_t outgoing_rep =
+            add_tcp_stream_resource(hr_table, WASI_P2_IO_OUTPUT_STREAM,
+                                    output_stream, &output_fd_lease);
         if (outgoing_rep == 0) {
             host_resource_table_delete(hr_table, incoming_rep);
             host_resource_table_delete(hr_table, out);
@@ -2647,11 +2787,17 @@ wasi_sockets_udp_create_socket_create_udp_socket_wrapper(
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
     wit_value_t result = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
         || !wasi_ctx->wasi_options->udp) {
         result = get_result_error_val(WASI_NETWORK_ERROR_CODE_NOT_SUPPORTED);
+        goto end;
+    }
+
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        result = get_result_error_val(WASI_NETWORK_ERROR_CODE_NEW_SOCKET_LIMIT);
         goto end;
     }
 
@@ -2661,6 +2807,7 @@ wasi_sockets_udp_create_socket_create_udp_socket_wrapper(
     wasi_sockets_create_udp_socket(address_family, &socket, &err);
 
     if (err != 0) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         result = get_result_error_val(errno_to_wasi_network(err));
         goto end;
     }
@@ -2670,6 +2817,8 @@ wasi_sockets_udp_create_socket_create_udp_socket_wrapper(
                                                 sizeof(wasi_socket_context_t));
 
         if (!hr) {
+            close(socket);
+            wasi_p2_native_fd_quota_release(&fd_lease);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
@@ -2678,6 +2827,7 @@ wasi_sockets_udp_create_socket_create_udp_socket_wrapper(
         ((wasi_socket_context_t *)hr->data)->family = address_family;
         ((wasi_socket_context_t *)hr->data)->fd = socket;
         host_resource_set_dtor(hr, udp_socket_dtor);
+        wasi_p2_native_fd_quota_transfer_to_host_resource(hr, &fd_lease);
 
         uint32_t index_rep = host_resource_table_add(hr_table, hr);
         if (index_rep < 1) {
@@ -2686,8 +2836,12 @@ wasi_sockets_udp_create_socket_create_udp_socket_wrapper(
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
-        wit_value_t out_rep = wit_resource_ctor(index_rep);
-        result = wit_result_ctor(false, out_rep);
+        result = make_resource_result(index_rep);
+        if (!result) {
+            host_resource_table_delete(hr_table, index_rep);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+        }
         goto end;
     }
 end:
@@ -2871,6 +3025,9 @@ wasi_sockets_udp_udp_socket_stream_wrapper(
 
     wit_value_t lifted_handle = NULL;
     wit_value_t result = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease input_fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease output_fd_lease = { 0 };
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -2911,25 +3068,52 @@ wasi_sockets_udp_udp_socket_stream_wrapper(
         remote_address_ptr = &remote_address;
     }
 
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 2, &fd_lease)) {
+        result = get_result_error_val(WASI_NETWORK_ERROR_CODE_NEW_SOCKET_LIMIT);
+        goto end;
+    }
+
     wasi_sockets_udp_stream(socket_fd, remote_address_ptr, &incoming_stream,
                             &outgoing_stream, &err);
 
     if (err != 0) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         result = get_result_error_val(errno_to_wasi_network(err));
         goto end;
     }
     else {
+        if (!wasi_p2_native_fd_quota_lease_take(&fd_lease, 1,
+                                                &input_fd_lease)) {
+            close(incoming_stream);
+            close(outgoing_stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+            goto end;
+        }
         uint32_t incoming_rep = add_udp_datagram_stream_resource(
-            hr_table, WASI_P2_UDP_INCOMING_DATAGRAM_STREAM, incoming_stream);
+            hr_table, WASI_P2_UDP_INCOMING_DATAGRAM_STREAM, incoming_stream,
+            &input_fd_lease);
         if (incoming_rep == 0) {
             close(outgoing_stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
             goto end;
         }
 
+        if (!wasi_p2_native_fd_quota_lease_take(&fd_lease, 1,
+                                                &output_fd_lease)) {
+            host_resource_table_delete(hr_table, incoming_rep);
+            close(outgoing_stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+            goto end;
+        }
         uint32_t outgoing_rep = add_udp_datagram_stream_resource(
-            hr_table, WASI_P2_UDP_OUTGOING_DATAGRAM_STREAM, outgoing_stream);
+            hr_table, WASI_P2_UDP_OUTGOING_DATAGRAM_STREAM, outgoing_stream,
+            &output_fd_lease);
         if (outgoing_rep == 0) {
             host_resource_table_delete(hr_table, incoming_rep);
             result =

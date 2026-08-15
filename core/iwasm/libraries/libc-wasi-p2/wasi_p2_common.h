@@ -60,6 +60,28 @@ wasm_get_string_encoding(WASMExecEnv *exec_env);
 bool
 close_host_resource_fd(HostResource *hr);
 
+typedef struct WasiP2NativeFdQuotaLease {
+    void *attachment;
+    wasm_native_fd_quota_release_callback_t release_callback;
+    uint32_t fd_count;
+} WasiP2NativeFdQuotaLease;
+
+bool
+wasi_p2_native_fd_quota_reserve(wasm_exec_env_t exec_env, uint32_t fd_count,
+                                WasiP2NativeFdQuotaLease *out_lease);
+
+bool
+wasi_p2_native_fd_quota_lease_take(WasiP2NativeFdQuotaLease *lease,
+                                   uint32_t fd_count,
+                                   WasiP2NativeFdQuotaLease *out_lease);
+
+void
+wasi_p2_native_fd_quota_release(WasiP2NativeFdQuotaLease *lease);
+
+void
+wasi_p2_native_fd_quota_transfer_to_host_resource(
+    HostResource *resource, WasiP2NativeFdQuotaLease *lease);
+
 /**
  * Lower a newly-created global host resource into the current component
  * instance's owned-resource table. If allocation or lowering fails, the

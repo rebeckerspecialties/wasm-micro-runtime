@@ -68,6 +68,12 @@ struct HostIoState {
     uint32_t ready_query_epoch;
     atomic_bool poll_level_ready;
     bool notify_result;
+    uint32_t fd_limit;
+    atomic_uint fd_active;
+    atomic_uint fd_peak;
+    atomic_uint fd_reserve_calls;
+    atomic_uint fd_release_calls;
+    atomic_uint fd_denied_calls;
 };
 
 static const uint8_t stream_payload[] =
@@ -79,6 +85,48 @@ get_host_state(wasm_exec_env_t exec_env)
     HostIoState *state = wasm_component_get_custom_data_from_exec_env(exec_env);
 
     return state && state->cookie == CUSTOM_DATA_COOKIE ? state : NULL;
+}
+
+static bool
+reserve_native_fds(void *attachment, uint32_t fd_count)
+{
+    HostIoState *state = attachment;
+    uint32_t current =
+        atomic_load_explicit(&state->fd_active, memory_order_relaxed);
+
+    atomic_fetch_add_explicit(&state->fd_reserve_calls, 1,
+                              memory_order_relaxed);
+    while (current <= state->fd_limit
+           && fd_count <= state->fd_limit - current) {
+        if (atomic_compare_exchange_weak_explicit(
+                &state->fd_active, &current, current + fd_count,
+                memory_order_relaxed, memory_order_relaxed)) {
+            uint32_t peak =
+                atomic_load_explicit(&state->fd_peak, memory_order_relaxed);
+            while (peak < current + fd_count
+                   && !atomic_compare_exchange_weak_explicit(
+                       &state->fd_peak, &peak, current + fd_count,
+                       memory_order_relaxed, memory_order_relaxed)) {
+            }
+            return true;
+        }
+    }
+    atomic_fetch_add_explicit(&state->fd_denied_calls, 1, memory_order_relaxed);
+    return false;
+}
+
+static void
+release_native_fds(void *attachment, uint32_t fd_count)
+{
+    HostIoState *state = attachment;
+    uint32_t previous = atomic_fetch_sub_explicit(&state->fd_active, fd_count,
+                                                  memory_order_relaxed);
+
+    if (previous < fd_count) {
+        abort();
+    }
+    atomic_fetch_add_explicit(&state->fd_release_calls, 1,
+                              memory_order_relaxed);
 }
 
 static wasm_component_wasi_input_stream_status_t
@@ -529,6 +577,7 @@ host_state_init(HostIoState *state)
     state->cookie = CUSTOM_DATA_COOKIE;
     state->next_file_representation = FIRST_FILE_REPRESENTATION;
     state->next_scanner_representation = FIRST_SCANNER_REPRESENTATION;
+    state->fd_limit = 5;
     if (pthread_mutex_init(&state->signal_lock, NULL) != 0) {
         return false;
     }
@@ -537,6 +586,11 @@ host_state_init(HostIoState *state)
         return false;
     }
     atomic_init(&state->poll_level_ready, false);
+    atomic_init(&state->fd_active, 0);
+    atomic_init(&state->fd_peak, 0);
+    atomic_init(&state->fd_reserve_calls, 0);
+    atomic_init(&state->fd_release_calls, 0);
+    atomic_init(&state->fd_denied_calls, 0);
     return true;
 }
 
@@ -560,6 +614,8 @@ instantiate_component(WASMComponent *component, HostIoState *state, char *error,
     wasm_runtime_instantiation_args_set_default_stack_size(args, 256 * 1024);
     wasm_runtime_instantiation_args_set_host_managed_heap_size(args, 0);
     wasm_runtime_instantiation_args_set_custom_data(args, state);
+    wasm_runtime_instantiation_args_set_native_fd_quota(
+        args, state, reserve_native_fds, release_native_fds);
     instance =
         wasm_component_instantiate_ex2(component, args, error, error_size);
     wasm_runtime_instantiation_args_destroy(args);
@@ -728,6 +784,17 @@ cleanup:
     if (signal) {
         wasm_component_wasi_pollable_signal_release(signal);
     }
+    if (atomic_load_explicit(&state.fd_active, memory_order_relaxed) != 0
+        || atomic_load_explicit(&state.fd_denied_calls, memory_order_relaxed)
+               != 0) {
+        fprintf(
+            stderr,
+            "termination fixture native FD quota cleanup failed: "
+            "active=%u denied=%u\n",
+            atomic_load_explicit(&state.fd_active, memory_order_relaxed),
+            atomic_load_explicit(&state.fd_denied_calls, memory_order_relaxed));
+        passed = false;
+    }
     host_state_destroy(&state);
     return passed;
 }
@@ -756,6 +823,7 @@ main(int argc, char **argv)
         .cookie = CUSTOM_DATA_COOKIE,
         .next_file_representation = FIRST_FILE_REPRESENTATION,
         .next_scanner_representation = FIRST_SCANNER_REPRESENTATION,
+        .fd_limit = 5,
     };
     pthread_t notifier;
     uint8_t *bytes = NULL;
@@ -780,6 +848,11 @@ main(int argc, char **argv)
         goto cleanup;
     }
     atomic_init(&state.poll_level_ready, false);
+    atomic_init(&state.fd_active, 0);
+    atomic_init(&state.fd_peak, 0);
+    atomic_init(&state.fd_reserve_calls, 0);
+    atomic_init(&state.fd_release_calls, 0);
+    atomic_init(&state.fd_denied_calls, 0);
 
     init_args.mem_alloc_type = Alloc_With_System_Allocator;
     if (!wasm_runtime_full_init(&init_args) || !test_constructor_failures()) {
@@ -825,6 +898,8 @@ main(int argc, char **argv)
     wasm_runtime_instantiation_args_set_host_managed_heap_size(
         instantiation_args, 0);
     wasm_runtime_instantiation_args_set_custom_data(instantiation_args, &state);
+    wasm_runtime_instantiation_args_set_native_fd_quota(
+        instantiation_args, &state, reserve_native_fds, release_native_fds);
     instance = wasm_component_instantiate_ex2(component, instantiation_args,
                                               error, sizeof(error));
     wasm_runtime_instantiation_args_destroy(instantiation_args);
@@ -957,6 +1032,21 @@ deinstantiate:
                 "pollables=%u/%u\n",
                 state.stream_drops, state.stream_constructions,
                 state.poll_drops, state.poll_constructions);
+        exit_code = 1;
+    }
+    if (exit_code == 0
+        && (atomic_load_explicit(&state.fd_active, memory_order_relaxed) != 0
+            || atomic_load_explicit(&state.fd_peak, memory_order_relaxed) != 5
+            || atomic_load_explicit(&state.fd_denied_calls,
+                                    memory_order_relaxed)
+                   != 0)) {
+        fprintf(
+            stderr,
+            "component native FD quota accounting failed: active=%u "
+            "peak=%u denied=%u\n",
+            atomic_load_explicit(&state.fd_active, memory_order_relaxed),
+            atomic_load_explicit(&state.fd_peak, memory_order_relaxed),
+            atomic_load_explicit(&state.fd_denied_calls, memory_order_relaxed));
         exit_code = 1;
     }
     if (exit_code == 0

@@ -163,6 +163,9 @@ host_resource_create(HostResourceType type, uint32_t data_size)
 
     hr->type = type;
     hr->dtor = NULL;
+    hr->native_fd_quota_attachment = NULL;
+    hr->native_fd_quota_release = NULL;
+    hr->native_fd_quota_count = 0;
 
     return hr;
 }
@@ -176,6 +179,19 @@ host_resource_set_dtor(HostResource *hr, host_resource_dtor_t dtor)
 }
 
 void
+host_resource_set_native_fd_quota(
+    HostResource *hr, void *attachment,
+    host_resource_native_fd_release_t release_callback, uint32_t fd_count)
+{
+    if (hr && release_callback && fd_count > 0) {
+        bh_assert(hr->native_fd_quota_count == 0);
+        hr->native_fd_quota_attachment = attachment;
+        hr->native_fd_quota_release = release_callback;
+        hr->native_fd_quota_count = fd_count;
+    }
+}
+
+void
 destroy_host_resource(HostResource *hr)
 {
     if (hr) {
@@ -184,6 +200,10 @@ destroy_host_resource(HostResource *hr)
                 hr->dtor(hr->data);
             }
             wasm_runtime_free(hr->data);
+        }
+        if (hr->native_fd_quota_release && hr->native_fd_quota_count > 0) {
+            hr->native_fd_quota_release(hr->native_fd_quota_attachment,
+                                        hr->native_fd_quota_count);
         }
         wasm_runtime_free(hr);
     }

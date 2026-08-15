@@ -14,11 +14,35 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <signal.h>
+#include <atomic>
+#include <cstdlib>
 
 extern "C" {
 #include "wasm_export.h"
 #include "wasi_p2_sockets.h"
+#include "wasi_p2_common.h"
 }
+
+namespace {
+
+struct DnsFdQuotaState {
+    std::atomic<uint32_t> active{ 2 };
+    std::atomic<uint32_t> releases{ 0 };
+};
+
+void
+release_dns_fd(void *attachment, uint32_t fd_count)
+{
+    auto *state = static_cast<DnsFdQuotaState *>(attachment);
+    uint32_t previous = state->active.fetch_sub(fd_count);
+
+    if (previous < fd_count) {
+        std::abort();
+    }
+    state->releases++;
+}
+
+} // namespace
 
 class WasiP2SocketsTest : public testing::Test {
 protected:
@@ -63,6 +87,35 @@ TEST_F(WasiP2SocketsTest, IpNameLookup_ResolveAddressStream) {
     ASSERT_TRUE(is_some);
 
     close(pollable.fd);
+}
+
+TEST_F(WasiP2SocketsTest, IpNameLookup_ReleasesPipeFdLeasesAtExactOwners)
+{
+    wasi_resolve_address_stream_t stream;
+    int err;
+    DnsFdQuotaState quota;
+    WasiP2NativeFdQuotaLease read_fd_lease = { &quota, release_dns_fd, 1 };
+    WasiP2NativeFdQuotaLease write_fd_lease = { &quota, release_dns_fd, 1 };
+
+    wasi_network_t network = wasi_sockets_instance_network();
+    wasi_sockets_resolve_addresses_with_fd_quota(
+        network, "localhost", &stream, &err, &read_fd_lease, &write_fd_lease);
+    ASSERT_EQ(err, WASI_ERROR_CODE_SUCCESS);
+    EXPECT_EQ(read_fd_lease.fd_count, 0U);
+    EXPECT_EQ(write_fd_lease.fd_count, 0U);
+
+    wasi_pollable_context_t pollable =
+        wasi_sockets_resolve_address_stream_subscribe(stream);
+    ASSERT_NE(pollable.fd, -1);
+    struct pollfd pfd = { .fd = pollable.fd, .events = POLLIN, .revents = 0 };
+    ASSERT_GT(poll(&pfd, 1, 1000), 0);
+    EXPECT_EQ(quota.active.load(), 1U);
+    EXPECT_EQ(quota.releases.load(), 1U);
+
+    close(pollable.fd);
+    wasi_sockets_drop_resolve_stream(stream);
+    EXPECT_EQ(quota.active.load(), 0U);
+    EXPECT_EQ(quota.releases.load(), 2U);
 }
 
 // Test: wasi:sockets/ip-name-lookup.resolve-next-address returns would-block

@@ -66,6 +66,7 @@ struct WasiP2WaitInterrupt {
     int read_fd;
     int write_fd;
     bool interrupted;
+    WasiP2NativeFdQuotaLease fd_lease;
 };
 
 static bool
@@ -106,6 +107,11 @@ wait_interrupt_get(wasm_exec_env_t exec_env)
     memset(interrupt, 0, sizeof(*interrupt));
     interrupt->read_fd = -1;
     interrupt->write_fd = -1;
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 2, &interrupt->fd_lease)) {
+        wasm_runtime_free(interrupt);
+        os_mutex_unlock(&exec_env->wait_lock);
+        return NULL;
+    }
     if (pipe(fds) != 0 || !wait_interrupt_set_nonblocking_cloexec(fds[0])
         || !wait_interrupt_set_nonblocking_cloexec(fds[1])) {
         if (fds[0] >= 0) {
@@ -114,6 +120,7 @@ wait_interrupt_get(wasm_exec_env_t exec_env)
         if (fds[1] >= 0) {
             close(fds[1]);
         }
+        wasi_p2_native_fd_quota_release(&interrupt->fd_lease);
         wasm_runtime_free(interrupt);
         os_mutex_unlock(&exec_env->wait_lock);
         return NULL;
@@ -197,6 +204,7 @@ wasi_p2_interrupt_wait_destroy(wasm_exec_env_t exec_env)
         if (interrupt->write_fd >= 0) {
             close(interrupt->write_fd);
         }
+        wasi_p2_native_fd_quota_release(&interrupt->fd_lease);
         wasm_runtime_free(interrupt);
     }
 }

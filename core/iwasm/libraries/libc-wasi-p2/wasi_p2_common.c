@@ -13,6 +13,96 @@
 #include <netdb.h>
 
 bool
+wasi_p2_native_fd_quota_reserve(wasm_exec_env_t exec_env, uint32_t fd_count,
+                                WasiP2NativeFdQuotaLease *out_lease)
+{
+    const struct InstantiationArgs2 *args = NULL;
+
+    if (!out_lease) {
+        return false;
+    }
+    memset(out_lease, 0, sizeof(*out_lease));
+    if (fd_count == 0 || !exec_env || !exec_env->component_inst) {
+        return true;
+    }
+
+    args = &exec_env->component_inst->instantiation_args;
+    if (!args->native_fd_quota_reserve || !args->native_fd_quota_release) {
+        return true;
+    }
+    if (!args->native_fd_quota_reserve(args->native_fd_quota_attachment,
+                                       fd_count)) {
+        return false;
+    }
+
+    out_lease->attachment = args->native_fd_quota_attachment;
+    out_lease->release_callback = args->native_fd_quota_release;
+    out_lease->fd_count = fd_count;
+    return true;
+}
+
+bool
+wasi_p2_native_fd_quota_lease_take(WasiP2NativeFdQuotaLease *lease,
+                                   uint32_t fd_count,
+                                   WasiP2NativeFdQuotaLease *out_lease)
+{
+    if (!lease || !out_lease || lease == out_lease) {
+        return false;
+    }
+    if (fd_count > lease->fd_count) {
+        if (!lease->release_callback) {
+            memset(out_lease, 0, sizeof(*out_lease));
+            return true;
+        }
+        return false;
+    }
+
+    memset(out_lease, 0, sizeof(*out_lease));
+    if (fd_count == 0) {
+        return true;
+    }
+    out_lease->attachment = lease->attachment;
+    out_lease->release_callback = lease->release_callback;
+    out_lease->fd_count = fd_count;
+    lease->fd_count -= fd_count;
+    if (lease->fd_count == 0) {
+        lease->attachment = NULL;
+        lease->release_callback = NULL;
+    }
+    return true;
+}
+
+void
+wasi_p2_native_fd_quota_release(WasiP2NativeFdQuotaLease *lease)
+{
+    void *attachment = NULL;
+    wasm_native_fd_quota_release_callback_t release_callback = NULL;
+    uint32_t fd_count = 0;
+
+    if (!lease || !lease->release_callback || lease->fd_count == 0) {
+        return;
+    }
+    attachment = lease->attachment;
+    release_callback = lease->release_callback;
+    fd_count = lease->fd_count;
+    memset(lease, 0, sizeof(*lease));
+    release_callback(attachment, fd_count);
+}
+
+void
+wasi_p2_native_fd_quota_transfer_to_host_resource(
+    HostResource *resource, WasiP2NativeFdQuotaLease *lease)
+{
+    if (!resource || !lease || !lease->release_callback
+        || lease->fd_count == 0) {
+        return;
+    }
+    host_resource_set_native_fd_quota(resource, lease->attachment,
+                                      lease->release_callback, lease->fd_count);
+    memset(lease, 0, sizeof(*lease));
+}
+
+bool
 lower_owned_host_resource(wasm_exec_env_t exec_env,
                           WASMComponentResourceHandleInstance *resource_type,
                           HostResourceTable *table, uint32_t rep,

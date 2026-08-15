@@ -4,9 +4,11 @@
 */
 
 #include <gtest/gtest.h>
+#include <atomic>
 #include <vector>
 #include <memory>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include "../component-instantiation/helpers.h"
@@ -19,6 +21,52 @@ extern "C" {
 
 }
 
+namespace {
+
+struct NativeFdQuotaState {
+    uint32_t limit = 1;
+    std::atomic<uint32_t> active{ 0 };
+    std::atomic<uint32_t> peak{ 0 };
+    std::atomic<uint32_t> reserve_calls{ 0 };
+    std::atomic<uint32_t> release_calls{ 0 };
+    std::atomic<uint32_t> denied_calls{ 0 };
+};
+
+bool
+reserve_native_fds(void *attachment, uint32_t fd_count)
+{
+    auto *state = static_cast<NativeFdQuotaState *>(attachment);
+    uint32_t current = state->active.load();
+
+    state->reserve_calls++;
+    while (current <= state->limit && fd_count <= state->limit - current) {
+        if (state->active.compare_exchange_weak(current, current + fd_count)) {
+            uint32_t peak = state->peak.load();
+            while (peak < current + fd_count
+                   && !state->peak.compare_exchange_weak(peak,
+                                                         current + fd_count)) {
+            }
+            return true;
+        }
+    }
+    state->denied_calls++;
+    return false;
+}
+
+void
+release_native_fds(void *attachment, uint32_t fd_count)
+{
+    auto *state = static_cast<NativeFdQuotaState *>(attachment);
+    uint32_t previous = state->active.fetch_sub(fd_count);
+
+    if (previous < fd_count) {
+        std::abort();
+    }
+    state->release_calls++;
+}
+
+} // namespace
+
 class WasiP2ClocksWrapperTest : public testing::Test
 {
   public:
@@ -30,8 +78,10 @@ class WasiP2ClocksWrapperTest : public testing::Test
     char global_heap_buf[HEAP_SIZE]; // 100 MB
 
     bool runtime_init = false;
-    WASMComponentInstance *comp_instance;
+    WASMComponent *component = nullptr;
+    WASMComponentInstance *comp_instance = nullptr;
     libc_wasi_parse_context_t parse_ctx = {};
+    NativeFdQuotaState fd_quota;
 
     virtual void SetUp() {
       printf("Starting setup\n");
@@ -52,13 +102,19 @@ class WasiP2ClocksWrapperTest : public testing::Test
 
       bh_log_set_verbose_level(WASM_LOG_LEVEL_WARNING);
 
-      WASMComponent *component = LoadfromCandidates("test_clocks_comp.wasm");
+      component = LoadfromCandidates("test_clocks_comp.wasm");
       ASSERT_NE(component, nullptr) << "Failed to load/parse component from candidates.";
 
       libc_wasi_set_default_options(&parse_ctx);
       libc_component_wasi_init(component, 0, NULL, &parse_ctx);
-      
-      comp_instance = wasm_component_instantiate_internal(component, NULL, error_buf, sizeof(error_buf));
+
+      struct InstantiationArgs2 *args = nullptr;
+      ASSERT_TRUE(wasm_runtime_instantiation_args_create(&args));
+      wasm_runtime_instantiation_args_set_native_fd_quota(
+          args, &fd_quota, reserve_native_fds, release_native_fds);
+      comp_instance = wasm_component_instantiate_ex2(component, args, error_buf,
+                                                     sizeof(error_buf));
+      wasm_runtime_instantiation_args_destroy(args);
       ASSERT_TRUE(comp_instance);
 
       bh_log_set_verbose_level(WASM_LOG_LEVEL_VERBOSE);
@@ -70,7 +126,16 @@ class WasiP2ClocksWrapperTest : public testing::Test
 
     virtual void TearDown() {
       printf("Starting teardown\n");
+      if (comp_instance) {
+          wasm_component_deinstantiate(comp_instance);
+          comp_instance = nullptr;
+      }
+      EXPECT_EQ(fd_quota.active.load(), 0U);
       destroy_host_resource_table();
+      if (component) {
+          wasm_component_unload(component);
+          component = nullptr;
+      }
         if (runtime_init) {
           printf("Starting to destroy runtime\n");
           wasm_runtime_destroy();
@@ -118,6 +183,32 @@ TEST_F(WasiP2ClocksWrapperTest, test_call_monotonic_clock_subscribe_duration)
   uint32 *argv1 = (uint32 *)wasm_runtime_malloc(sizeof(uint32) * 1);
   ASSERT_TRUE(wasm_component_application_execute_func_ex(comp_instance, (char*)"call-monotonic-clock-subscribe-duration()", &argc1, &argv1));
   ASSERT_TRUE(argv1[0] > 0);
+}
+
+TEST_F(WasiP2ClocksWrapperTest,
+       test_native_fd_quota_denies_second_live_clock_pollable)
+{
+    uint32 argc1 = 1;
+    uint32 *argv1 = (uint32 *)wasm_runtime_malloc(sizeof(uint32));
+    ASSERT_TRUE(wasm_component_application_execute_func_ex(
+        comp_instance, (char *)"call-monotonic-clock-subscribe-duration()",
+        &argc1, &argv1));
+    ASSERT_TRUE(argv1[0] > 0);
+    EXPECT_EQ(fd_quota.active.load(), 1U);
+    EXPECT_EQ(fd_quota.peak.load(), 1U);
+
+    argc1 = 1;
+    argv1[0] = 0;
+    EXPECT_FALSE(wasm_component_application_execute_func_ex(
+        comp_instance, (char *)"call-monotonic-clock-subscribe-duration()",
+        &argc1, &argv1));
+    EXPECT_EQ(fd_quota.denied_calls.load(), 1U);
+    EXPECT_EQ(fd_quota.active.load(), 1U);
+
+    wasm_component_deinstantiate(comp_instance);
+    comp_instance = nullptr;
+    EXPECT_EQ(fd_quota.release_calls.load(), 1U);
+    EXPECT_EQ(fd_quota.active.load(), 0U);
 }
 
 TEST_F(WasiP2ClocksWrapperTest, test_call_wall_clock_now)

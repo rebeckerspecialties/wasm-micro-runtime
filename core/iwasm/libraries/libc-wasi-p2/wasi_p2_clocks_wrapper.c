@@ -130,9 +130,17 @@ wasi_monotonic_clock_subscribe_instant_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "native file descriptor quota exceeded");
+        return 0;
+    }
+
     wasi_pollable_context_t pollable =
         wasi_monotonic_clock_subscribe_instant(when);
     if (pollable.fd < 0) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not create pollable timer");
         return 0;
@@ -145,6 +153,7 @@ wasi_monotonic_clock_subscribe_instant_wrapper(wasm_exec_env_t exec_env,
     if (!hr) {
         if (pollable.own_fd)
             close(pollable.fd);
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get pollable resource");
         return 0;
@@ -152,6 +161,7 @@ wasi_monotonic_clock_subscribe_instant_wrapper(wasm_exec_env_t exec_env,
 
     *((wasi_pollable_context_t *)hr->data) = pollable;
     host_resource_set_dtor(hr, pollable_dtor);
+    wasi_p2_native_fd_quota_transfer_to_host_resource(hr, &fd_lease);
 
     uint32_t out = host_resource_table_add(hr_table, hr);
     if (out < 1) {
@@ -190,9 +200,17 @@ wasi_monotonic_clock_subscribe_duration_wrapper(wasm_exec_env_t exec_env,
         return 0;
     }
 
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "native file descriptor quota exceeded");
+        return 0;
+    }
+
     wasi_pollable_context_t pollable =
         wasi_monotonic_clock_subscribe_duration(when);
     if (pollable.fd < 0) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not create pollable timer");
         return 0;
@@ -205,6 +223,7 @@ wasi_monotonic_clock_subscribe_duration_wrapper(wasm_exec_env_t exec_env,
     if (!hr) {
         if (pollable.own_fd)
             close(pollable.fd);
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get pollable resource");
         return 0;
@@ -212,6 +231,7 @@ wasi_monotonic_clock_subscribe_duration_wrapper(wasm_exec_env_t exec_env,
 
     *((wasi_pollable_context_t *)hr->data) = pollable;
     host_resource_set_dtor(hr, pollable_dtor);
+    wasi_p2_native_fd_quota_transfer_to_host_resource(hr, &fd_lease);
 
     uint32_t out = host_resource_table_add(hr_table, hr);
     if (out < 1) {

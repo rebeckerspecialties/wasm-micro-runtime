@@ -634,6 +634,9 @@ struct InstantiationArgs2 {
     void *memory_page_quota_attachment;
     wasm_memory_page_quota_reserve_callback_t memory_page_quota_reserve;
     wasm_memory_page_quota_release_callback_t memory_page_quota_release;
+    void *native_fd_quota_attachment;
+    wasm_native_fd_quota_reserve_callback_t native_fd_quota_reserve;
+    wasm_native_fd_quota_release_callback_t native_fd_quota_release;
 #if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIArguments wasi;
 #endif
@@ -763,6 +766,12 @@ wasm_runtime_instantiation_args_set_memory_page_quota(
     struct InstantiationArgs2 *p, void *attachment,
     wasm_memory_page_quota_reserve_callback_t reserve_callback,
     wasm_memory_page_quota_release_callback_t release_callback);
+
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_instantiation_args_set_native_fd_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_native_fd_quota_reserve_callback_t reserve_callback,
+    wasm_native_fd_quota_release_callback_t release_callback);
 
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN void

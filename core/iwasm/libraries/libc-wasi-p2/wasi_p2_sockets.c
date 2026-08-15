@@ -183,6 +183,7 @@ typedef struct resolve_stream {
     struct addrinfo *addr_current;
     // A pipe used to signal when the DNS resolution is complete.
     int pipe_fd;
+    WasiP2NativeFdQuotaLease read_fd_lease;
     // The handle for the background thread performing the resolution.
     pthread_t thread;
     // A flag indicating if the background thread has finished.
@@ -255,6 +256,7 @@ destroy_resolve_stream(void *stream)
             // Close the signaling pipe.
             close(s->pipe_fd);
         }
+        wasi_p2_native_fd_quota_release(&s->read_fd_lease);
         wasm_runtime_free(s);
     }
 }
@@ -309,6 +311,7 @@ resolve_stream_dtor(void *data)
 struct resolve_thread_args {
     long stream_id;
     int pipe_write_fd;
+    WasiP2NativeFdQuotaLease write_fd_lease;
     char *name;
 };
 
@@ -379,6 +382,7 @@ resolve_thread(void *arg)
     if (args->pipe_write_fd != -1) {
         close(args->pipe_write_fd);
     }
+    wasi_p2_native_fd_quota_release(&args->write_fd_lease);
     wasm_runtime_free(args->name);
     wasm_runtime_free(args);
 
@@ -562,11 +566,35 @@ void
 wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
                                wasi_resolve_address_stream_t *ret, int *err)
 {
+    wasi_sockets_resolve_addresses_with_fd_quota(network, name, ret, err, NULL,
+                                                 NULL);
+}
+
+void
+wasi_sockets_resolve_addresses_with_fd_quota(
+    wasi_network_t network, const char *name,
+    wasi_resolve_address_stream_t *ret, int *err,
+    WasiP2NativeFdQuotaLease *read_fd_lease,
+    WasiP2NativeFdQuotaLease *write_fd_lease)
+{
+    WasiP2NativeFdQuotaLease local_read_fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease local_write_fd_lease = { 0 };
+
+    if (read_fd_lease) {
+        local_read_fd_lease = *read_fd_lease;
+        memset(read_fd_lease, 0, sizeof(*read_fd_lease));
+    }
+    if (write_fd_lease) {
+        local_write_fd_lease = *write_fd_lease;
+        memset(write_fd_lease, 0, sizeof(*write_fd_lease));
+    }
     if (!name || !ret || !err) {
         if (err)
             *err = EINVAL;
         if (ret)
             *ret = -1;
+        wasi_p2_native_fd_quota_release(&local_read_fd_lease);
+        wasi_p2_native_fd_quota_release(&local_write_fd_lease);
         return;
     }
 
@@ -600,6 +628,8 @@ wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
     }
     memset(stream, 0, sizeof(resolve_stream_t));
     stream->pipe_fd = -1;
+    stream->read_fd_lease = local_read_fd_lease;
+    memset(&local_read_fd_lease, 0, sizeof(local_read_fd_lease));
 
     args = wasm_runtime_malloc(sizeof(*args));
     if (!args) {
@@ -608,6 +638,8 @@ wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
     }
     args->name = NULL;
     args->pipe_write_fd = -1;
+    args->write_fd_lease = local_write_fd_lease;
+    memset(&local_write_fd_lease, 0, sizeof(local_write_fd_lease));
 
     // Create a pipe to signal completion from the worker thread.
     // The read-end of this pipe will become the pollable for the stream's
@@ -699,6 +731,7 @@ fail:
     if (args) {
         if (args->pipe_write_fd != -1)
             close(args->pipe_write_fd);
+        wasi_p2_native_fd_quota_release(&args->write_fd_lease);
         if (args->name)
             wasm_runtime_free(args->name);
         wasm_runtime_free(args);
@@ -706,8 +739,12 @@ fail:
     if (stream) {
         if (stream->pipe_fd != -1)
             close(stream->pipe_fd);
+        wasi_p2_native_fd_quota_release(&stream->read_fd_lease);
         wasm_runtime_free(stream);
     }
+
+    wasi_p2_native_fd_quota_release(&local_read_fd_lease);
+    wasi_p2_native_fd_quota_release(&local_write_fd_lease);
 
     *ret = -1;
 }
