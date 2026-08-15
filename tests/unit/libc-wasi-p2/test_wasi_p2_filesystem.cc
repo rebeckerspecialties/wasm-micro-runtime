@@ -4,6 +4,7 @@
 */
 
 #include <gtest/gtest.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -25,6 +26,8 @@ protected:
     char test_dir[64] = { 0 };
     char test_file[128] = { 0 };
     char test_link[128] = { 0 };
+    char outside_dir[64] = { 0 };
+    char outside_file[128] = { 0 };
 
     void SetUp() override {
         wasm_runtime_init();
@@ -32,12 +35,21 @@ protected:
         ASSERT_NE(mkdtemp(test_dir), nullptr);
         snprintf(test_file, sizeof(test_file), "%s/test_file.txt", test_dir);
         snprintf(test_link, sizeof(test_link), "%s/test_link.txt", test_dir);
+        strcpy(outside_dir, "/tmp/wasi_p2_fs_outside.XXXXXX");
+        ASSERT_NE(mkdtemp(outside_dir), nullptr);
+        snprintf(outside_file, sizeof(outside_file), "%s/victim.txt",
+                 outside_dir);
     }
 
     void TearDown() override {
         if (test_dir[0] != '\0') {
             char command[256];
             snprintf(command, sizeof(command), "rm -rf %s", test_dir);
+            system(command);
+        }
+        if (outside_dir[0] != '\0') {
+            char command[256];
+            snprintf(command, sizeof(command), "rm -rf %s", outside_dir);
             system(command);
         }
         wasm_runtime_destroy();
@@ -65,6 +77,196 @@ TEST_F(WasiP2FilesystemTest, Filesystem_CreateAndRemoveDirectory) {
     err = wasi_filesystem_remove_directory_at(dir_fd, new_dir_name);
     ASSERT_EQ(err, WASI_ERROR_CODE_SUCCESS);
     ASSERT_NE(stat(new_dir_path, &st), 0);
+
+    close(dir_fd);
+}
+
+TEST_F(WasiP2FilesystemTest, Filesystem_MutationsRejectPathEscape)
+{
+    int dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
+    ASSERT_NE(dir_fd, -1);
+
+    int outside_fd = open(outside_file, O_CREAT | O_WRONLY, 0644);
+    ASSERT_NE(outside_fd, -1);
+    ASSERT_EQ(write(outside_fd, "safe", 4), 4);
+    close(outside_fd);
+
+    char inside_path[128];
+    snprintf(inside_path, sizeof(inside_path), "%s/inside.txt", test_dir);
+    int inside_fd = open(inside_path, O_CREAT | O_WRONLY, 0644);
+    ASSERT_NE(inside_fd, -1);
+    close(inside_fd);
+
+    const char *outside_name = strrchr(outside_dir, '/');
+    ASSERT_NE(outside_name, nullptr);
+    std::string escaped_victim =
+        std::string("../") + (outside_name + 1) + "/victim.txt";
+    std::string escaped_destination =
+        std::string("../") + (outside_name + 1) + "/renamed.txt";
+
+    EXPECT_EQ(wasi_filesystem_unlink_file_at(dir_fd, escaped_victim.c_str()),
+              EPERM);
+    EXPECT_EQ(wasi_filesystem_unlink_file_at(dir_fd, outside_file), EPERM);
+    EXPECT_EQ(wasi_filesystem_rename_at(dir_fd, escaped_victim.c_str(), dir_fd,
+                                        "stolen.txt"),
+              EPERM);
+    EXPECT_EQ(wasi_filesystem_rename_at(dir_fd, "inside.txt", dir_fd,
+                                        escaped_destination.c_str()),
+              EPERM);
+
+    struct stat st;
+    EXPECT_EQ(stat(outside_file, &st), 0);
+    EXPECT_EQ(stat(inside_path, &st), 0);
+    std::string outside_destination = std::string(outside_dir) + "/renamed.txt";
+    EXPECT_NE(stat(outside_destination.c_str(), &st), 0);
+
+    close(dir_fd);
+}
+
+TEST_F(WasiP2FilesystemTest, Filesystem_ContainedDotDotStaysBeneathRoot)
+{
+    int dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
+    ASSERT_NE(dir_fd, -1);
+    ASSERT_EQ(mkdirat(dir_fd, "nested", 0755), 0);
+
+    int inside_fd = openat(dir_fd, "inside.txt", O_CREAT | O_WRONLY, 0644);
+    ASSERT_NE(inside_fd, -1);
+    close(inside_fd);
+
+    wasi_descriptor_t opened_fd = -1;
+    int error = 0;
+    wasi_filesystem_open_at(dir_fd, 0, "nested/../inside.txt", 0,
+                            WASI_DESCRIPTOR_FLAGS_READ, 0, &opened_fd, &error);
+    ASSERT_EQ(error, WASI_ERROR_CODE_SUCCESS);
+    ASSERT_NE(opened_fd, -1);
+    close(opened_fd);
+
+    EXPECT_EQ(wasi_filesystem_rename_at(dir_fd, "nested/../inside.txt", dir_fd,
+                                        "nested/../renamed.txt"),
+              WASI_ERROR_CODE_SUCCESS);
+    EXPECT_EQ(wasi_filesystem_unlink_file_at(dir_fd,
+                                             "nested/../renamed.txt"),
+              WASI_ERROR_CODE_SUCCESS);
+
+    struct stat st;
+    EXPECT_NE(fstatat(dir_fd, "inside.txt", &st, 0), 0);
+    EXPECT_NE(fstatat(dir_fd, "renamed.txt", &st, 0), 0);
+
+    close(dir_fd);
+}
+
+TEST_F(WasiP2FilesystemTest, Filesystem_PathOperationsRejectIntermediateSymlink)
+{
+    int dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
+    ASSERT_NE(dir_fd, -1);
+
+    int outside_fd = open(outside_file, O_CREAT | O_WRONLY, 0644);
+    ASSERT_NE(outside_fd, -1);
+    ASSERT_EQ(write(outside_fd, "safe", 4), 4);
+    close(outside_fd);
+
+    char outside_subdir[128];
+    snprintf(outside_subdir, sizeof(outside_subdir), "%s/subdir", outside_dir);
+    ASSERT_EQ(mkdir(outside_subdir, 0755), 0);
+    char outside_link[128];
+    snprintf(outside_link, sizeof(outside_link), "%s/link", outside_dir);
+    ASSERT_EQ(symlink("victim.txt", outside_link), 0);
+
+    char portal_path[128];
+    snprintf(portal_path, sizeof(portal_path), "%s/portal", test_dir);
+    ASSERT_EQ(symlink(outside_dir, portal_path), 0);
+
+    char inside_path[128];
+    snprintf(inside_path, sizeof(inside_path), "%s/inside.txt", test_dir);
+    int inside_fd = open(inside_path, O_CREAT | O_WRONLY, 0644);
+    ASSERT_NE(inside_fd, -1);
+    close(inside_fd);
+
+    wasi_descriptor_t opened_fd = -1;
+    int error = 0;
+    wasi_filesystem_open_at(dir_fd, 0, "portal/victim.txt", 0,
+                            WASI_DESCRIPTOR_FLAGS_READ, 0, &opened_fd, &error);
+    EXPECT_NE(error, WASI_ERROR_CODE_SUCCESS);
+    EXPECT_EQ(opened_fd, -1);
+
+    wasi_filesystem_open_at(dir_fd, 0, "portal/../inside.txt", 0,
+                            WASI_DESCRIPTOR_FLAGS_READ, 0, &opened_fd, &error);
+    EXPECT_EQ(error, EPERM);
+    EXPECT_EQ(opened_fd, -1);
+
+    wasi_descriptor_stat_t descriptor_stat;
+    wasi_filesystem_stat_at(dir_fd, 0, "portal/victim.txt", &descriptor_stat,
+                            &error);
+    EXPECT_EQ(error, EPERM);
+
+    wasi_metadata_hash_value_t hash;
+    wasi_filesystem_metadata_hash_at(dir_fd, 0, "portal/victim.txt", &hash,
+                                     &error);
+    EXPECT_EQ(error, EPERM);
+
+    wasi_new_timestamp_t no_change = { .tag = WASI_NEW_TIMESTAMP_TAG_NO_CHANGE,
+                                       .timestamp = { .seconds = 0,
+                                                      .nanoseconds = 0 } };
+    EXPECT_EQ(wasi_filesystem_set_times_at(dir_fd, 0, "portal/victim.txt",
+                                           no_change, no_change),
+              EPERM);
+    EXPECT_EQ(wasi_filesystem_create_directory_at(dir_fd, "portal/newdir"),
+              EPERM);
+    EXPECT_EQ(wasi_filesystem_remove_directory_at(dir_fd, "portal/subdir"),
+              EPERM);
+    EXPECT_EQ(wasi_filesystem_unlink_file_at(dir_fd, "portal/victim.txt"),
+              EPERM);
+    EXPECT_EQ(wasi_filesystem_rename_at(dir_fd, "portal/victim.txt", dir_fd,
+                                        "stolen.txt"),
+              EPERM);
+    EXPECT_EQ(wasi_filesystem_rename_at(dir_fd, "inside.txt", dir_fd,
+                                        "portal/replaced.txt"),
+              EPERM);
+    EXPECT_EQ(wasi_filesystem_link_at(dir_fd, 0, "portal/victim.txt", dir_fd,
+                                      "linked.txt"),
+              EPERM);
+    EXPECT_EQ(wasi_filesystem_link_at(dir_fd, 0, "inside.txt", dir_fd,
+                                      "portal/linked.txt"),
+              EPERM);
+    EXPECT_EQ(
+        wasi_filesystem_symlink_at(dir_fd, "inside.txt", "portal/new-link"),
+        EPERM);
+
+    char *link_target = nullptr;
+    wasi_filesystem_readlink_at(dir_fd, "portal/link", &link_target, &error);
+    EXPECT_EQ(error, EPERM);
+    EXPECT_EQ(link_target, nullptr);
+
+    struct stat st;
+    EXPECT_EQ(stat(outside_file, &st), 0);
+    EXPECT_EQ(stat(outside_subdir, &st), 0);
+    EXPECT_EQ(stat(inside_path, &st), 0);
+
+    close(dir_fd);
+}
+
+TEST_F(WasiP2FilesystemTest, Filesystem_SymlinkTargetMustStayBeneathRoot)
+{
+    int dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
+    ASSERT_NE(dir_fd, -1);
+    ASSERT_EQ(mkdirat(dir_fd, "nested", 0755), 0);
+
+    EXPECT_EQ(
+        wasi_filesystem_symlink_at(dir_fd, "/tmp/outside", "nested/absolute"),
+        EPERM);
+    EXPECT_EQ(
+        wasi_filesystem_symlink_at(dir_fd, "../../outside", "nested/escaped"),
+        EPERM);
+    EXPECT_EQ(
+        wasi_filesystem_symlink_at(dir_fd, "../inside.txt", "nested/contained"),
+        WASI_ERROR_CODE_SUCCESS);
+
+    char contained_path[128];
+    snprintf(contained_path, sizeof(contained_path), "%s/nested/contained",
+             test_dir);
+    char target[64] = { 0 };
+    ASSERT_EQ(readlink(contained_path, target, sizeof(target) - 1), 13);
+    EXPECT_STREQ(target, "../inside.txt");
 
     close(dir_fd);
 }
