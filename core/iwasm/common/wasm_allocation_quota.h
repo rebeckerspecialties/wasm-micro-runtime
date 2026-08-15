@@ -16,6 +16,12 @@ extern "C" {
 
 typedef struct WASMAllocationQuotaToken WASMAllocationQuotaToken;
 
+typedef struct WASMAllocationQuotaScope {
+    WASMAllocationQuotaToken *token;
+    WASMAllocationQuotaToken *previous;
+    bool active;
+} WASMAllocationQuotaScope;
+
 #define WASM_ALLOCATION_HEADER_MAGIC UINT64_C(0x57414D52514F5441)
 
 /* C99-compatible equivalent of C11 max_align_t for runtime-owned metadata. */
@@ -50,7 +56,7 @@ typedef union WASMAllocationHeader {
 } WASMAllocationHeader;
 
 WASMAllocationQuotaToken *
-wasm_allocation_quota_token_create(const LoadArgs *args);
+wasm_allocation_quota_token_create(const LoadArgs2 *args);
 
 void
 wasm_allocation_quota_token_release(WASMAllocationQuotaToken *token);
@@ -75,6 +81,30 @@ wasm_allocation_quota_get_current(void);
  */
 WASMAllocationQuotaToken *
 wasm_allocation_quota_set_current(WASMAllocationQuotaToken *token);
+
+/*
+ * Establish a retained owner scope for a versioned load.  A disabled quota
+ * leaves the ambient scope unchanged.  Nested quota-enabled loads must match
+ * the already active owner exactly.
+ */
+bool
+wasm_allocation_quota_scope_enter_for_load(WASMAllocationQuotaScope *scope,
+                                           const LoadArgs2 *args);
+
+/* Establish a retained scope from a runtime-owned root allocation. */
+bool
+wasm_allocation_quota_scope_enter_for_allocation(
+    WASMAllocationQuotaScope *scope, const void *allocation);
+
+bool
+wasm_allocation_quota_allocations_share_owner(const void *first,
+                                              const void *second);
+
+bool
+wasm_allocation_quota_allocation_matches_current(const void *allocation);
+
+void
+wasm_allocation_quota_scope_leave(WASMAllocationQuotaScope *scope);
 
 /* Includes and rounds all header/alignment space charged to the allocator. */
 bool

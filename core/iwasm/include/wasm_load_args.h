@@ -7,6 +7,7 @@
 #define _WASM_LOAD_ARGS_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -36,23 +37,42 @@ typedef bool (*wasm_allocation_quota_attachment_retain_callback_t)(
 typedef void (*wasm_allocation_quota_attachment_release_callback_t)(
     void *attachment);
 
-/**
- * Loader settings shared by the runtime and WebAssembly C APIs.
- *
- * Keep every field unconditional so that clients and runtime libraries built
- * with different feature defines agree on the ABI. is_component is ignored
- * when component-model support is disabled.
+/*
+ * Keep the legacy loader settings ABI unchanged.  LoadArgs has no size or
+ * version field, so new runtimes must never read fields beyond this layout.
  */
+#ifndef LOAD_ARGS_OPTION_DEFINED
+#define LOAD_ARGS_OPTION_DEFINED
 typedef struct LoadArgs {
     char *name;
-    /* True by default for wasm_module_new_ex(), false elsewhere. */
+    /* This option is only used by the Wasm C API (see wasm_c_api.h). */
     bool clone_wasm_binary;
-    /* Allow the AOT/core-Wasm loader to copy fields from the input buffer. */
+    /* This option is only used by the AOT/wasm loader. */
     bool wasm_binary_freeable;
     /* Defer symbol resolution until wasm_runtime_resolve_symbols(). */
     bool no_resolve;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
     bool is_component;
+#endif
+} LoadArgs;
+#endif /* LOAD_ARGS_OPTION_DEFINED */
 
+/**
+ * Versioned loader settings.  Unlike LoadArgs, this layout is independent of
+ * WAMR feature defines.  Call wasm_runtime_load_args2_init() before assigning
+ * fields.  V1 callers must set struct_size to sizeof(LoadArgs2) and
+ * abi_version to WASM_LOAD_ARGS2_ABI_VERSION_1.
+ */
+#define WASM_LOAD_ARGS2_ABI_VERSION_1 UINT32_C(1)
+typedef struct LoadArgs2 {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    char *name;
+    uint8_t clone_wasm_binary;
+    uint8_t wasm_binary_freeable;
+    uint8_t no_resolve;
+    uint8_t is_component;
+    uint8_t reserved[4];
     void *allocation_quota_attachment;
     wasm_allocation_quota_reserve_callback_t allocation_quota_reserve;
     wasm_allocation_quota_release_callback_t allocation_quota_release;
@@ -60,7 +80,12 @@ typedef struct LoadArgs {
         allocation_quota_attachment_retain;
     wasm_allocation_quota_attachment_release_callback_t
         allocation_quota_attachment_release;
-} LoadArgs;
+} LoadArgs2;
+
+#define WASM_LOAD_ARGS2_SIZE_V1                                          \
+    ((uint32_t)(offsetof(LoadArgs2, allocation_quota_attachment_release) \
+                + sizeof(                                                \
+                    wasm_allocation_quota_attachment_release_callback_t)))
 
 #ifdef __cplusplus
 }

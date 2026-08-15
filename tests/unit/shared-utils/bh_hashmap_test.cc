@@ -10,6 +10,7 @@
 #include "wasm.h"
 #include "wasm_export.h"
 
+#include <cstdlib>
 #include <future>
 
 typedef struct HashMapElem {
@@ -29,6 +30,8 @@ struct HashMap {
     KeyEqualFunc key_equal_func;
     KeyDestroyFunc key_destroy_func;
     ValueDestroyFunc value_destroy_func;
+    HashMapMallocFunc malloc_func;
+    HashMapFreeFunc free_func;
     HashMapElem *elements[1];
 };
 
@@ -36,6 +39,53 @@ int DESTROY_NUM = 0;
 char TRAVERSE_KEY[] = "key_1";
 char TRAVERSE_VAL[] = "val_1";
 int TRAVERSE_COMP_RES = 0;
+
+static uint32 TRACKING_ALLOC_CALLS = 0;
+static uint32 TRACKING_FREE_CALLS = 0;
+static uint32 TRACKING_LIVE_ALLOCATIONS = 0;
+static uint32 TRACKING_FAIL_ON_CALL = 0;
+static uint32 TRACKING_ALLOC_SIZES[4] = { 0 };
+
+static void
+reset_tracking_allocator(uint32 fail_on_call = 0)
+{
+    TRACKING_ALLOC_CALLS = 0;
+    TRACKING_FREE_CALLS = 0;
+    TRACKING_LIVE_ALLOCATIONS = 0;
+    TRACKING_FAIL_ON_CALL = fail_on_call;
+    memset(TRACKING_ALLOC_SIZES, 0, sizeof(TRACKING_ALLOC_SIZES));
+}
+
+static void *
+tracking_malloc(uint32 size)
+{
+    void *ptr;
+
+    if (TRACKING_ALLOC_CALLS
+        < sizeof(TRACKING_ALLOC_SIZES) / sizeof(TRACKING_ALLOC_SIZES[0])) {
+        TRACKING_ALLOC_SIZES[TRACKING_ALLOC_CALLS] = size;
+    }
+    TRACKING_ALLOC_CALLS++;
+
+    if (TRACKING_FAIL_ON_CALL == TRACKING_ALLOC_CALLS)
+        return nullptr;
+
+    if ((ptr = std::malloc(size)))
+        TRACKING_LIVE_ALLOCATIONS++;
+
+    return ptr;
+}
+
+static void
+tracking_free(void *ptr)
+{
+    if (!ptr)
+        return;
+
+    TRACKING_FREE_CALLS++;
+    TRACKING_LIVE_ALLOCATIONS--;
+    std::free(ptr);
+}
 
 class bh_hashmap_test_suite : public testing::Test
 {
@@ -77,6 +127,79 @@ TEST_F(bh_hashmap_test_suite, bh_hash_map_create)
     EXPECT_EQ((HashMap *)nullptr,
               bh_hash_map_create(65536, true, (HashFunc)wasm_string_hash,
                                  nullptr, nullptr, wasm_runtime_free));
+}
+
+TEST_F(bh_hashmap_test_suite, bh_hash_map_create_with_allocator)
+{
+    HashMap *test_hash_map;
+
+    reset_tracking_allocator();
+    test_hash_map = bh_hash_map_create_with_allocator(
+        32, true, (HashFunc)wasm_string_hash, (KeyEqualFunc)wasm_string_equal,
+        nullptr, nullptr, tracking_malloc, tracking_free);
+    ASSERT_NE((HashMap *)nullptr, test_hash_map);
+    EXPECT_EQ(1U, TRACKING_ALLOC_CALLS);
+    EXPECT_EQ(1U, TRACKING_LIVE_ALLOCATIONS);
+    EXPECT_EQ(bh_hash_map_get_struct_size(test_hash_map),
+              TRACKING_ALLOC_SIZES[0]);
+
+    EXPECT_TRUE(
+        bh_hash_map_insert(test_hash_map, (void *)"key_1", (void *)"val_1"));
+    EXPECT_TRUE(
+        bh_hash_map_insert(test_hash_map, (void *)"key_2", (void *)"val_2"));
+    EXPECT_EQ(3U, TRACKING_ALLOC_CALLS);
+    EXPECT_EQ(bh_hash_map_get_elem_struct_size(), TRACKING_ALLOC_SIZES[1]);
+    EXPECT_EQ(bh_hash_map_get_elem_struct_size(), TRACKING_ALLOC_SIZES[2]);
+    EXPECT_EQ(3U, TRACKING_LIVE_ALLOCATIONS);
+
+    EXPECT_TRUE(
+        bh_hash_map_remove(test_hash_map, (void *)"key_1", nullptr, nullptr));
+    EXPECT_EQ(1U, TRACKING_FREE_CALLS);
+    EXPECT_EQ(2U, TRACKING_LIVE_ALLOCATIONS);
+
+    EXPECT_TRUE(bh_hash_map_destroy(test_hash_map));
+    EXPECT_EQ(3U, TRACKING_FREE_CALLS);
+    EXPECT_EQ(0U, TRACKING_LIVE_ALLOCATIONS);
+}
+
+TEST_F(bh_hashmap_test_suite, bh_hash_map_custom_allocator_failures)
+{
+    HashMap *test_hash_map;
+
+    reset_tracking_allocator();
+    EXPECT_EQ((HashMap *)nullptr, bh_hash_map_create_with_allocator(
+                                      32, false, (HashFunc)wasm_string_hash,
+                                      (KeyEqualFunc)wasm_string_equal, nullptr,
+                                      nullptr, nullptr, tracking_free));
+    EXPECT_EQ((HashMap *)nullptr, bh_hash_map_create_with_allocator(
+                                      32, false, (HashFunc)wasm_string_hash,
+                                      (KeyEqualFunc)wasm_string_equal, nullptr,
+                                      nullptr, tracking_malloc, nullptr));
+    EXPECT_EQ(0U, TRACKING_ALLOC_CALLS);
+    EXPECT_EQ(0U, TRACKING_LIVE_ALLOCATIONS);
+
+    reset_tracking_allocator(1);
+    EXPECT_EQ((HashMap *)nullptr, bh_hash_map_create_with_allocator(
+                                      32, false, (HashFunc)wasm_string_hash,
+                                      (KeyEqualFunc)wasm_string_equal, nullptr,
+                                      nullptr, tracking_malloc, tracking_free));
+    EXPECT_EQ(1U, TRACKING_ALLOC_CALLS);
+    EXPECT_EQ(0U, TRACKING_FREE_CALLS);
+    EXPECT_EQ(0U, TRACKING_LIVE_ALLOCATIONS);
+
+    reset_tracking_allocator(2);
+    test_hash_map = bh_hash_map_create_with_allocator(
+        32, false, (HashFunc)wasm_string_hash, (KeyEqualFunc)wasm_string_equal,
+        nullptr, nullptr, tracking_malloc, tracking_free);
+    ASSERT_NE((HashMap *)nullptr, test_hash_map);
+    EXPECT_FALSE(
+        bh_hash_map_insert(test_hash_map, (void *)"key_1", (void *)"val_1"));
+    EXPECT_EQ(2U, TRACKING_ALLOC_CALLS);
+    EXPECT_EQ(0U, TRACKING_FREE_CALLS);
+    EXPECT_EQ(1U, TRACKING_LIVE_ALLOCATIONS);
+    EXPECT_TRUE(bh_hash_map_destroy(test_hash_map));
+    EXPECT_EQ(1U, TRACKING_FREE_CALLS);
+    EXPECT_EQ(0U, TRACKING_LIVE_ALLOCATIONS);
 }
 
 TEST_F(bh_hashmap_test_suite, bh_hash_map_insert)

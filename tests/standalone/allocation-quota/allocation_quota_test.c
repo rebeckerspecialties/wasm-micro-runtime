@@ -38,6 +38,7 @@ typedef struct AllocatorState {
     uint32_t last_realloc_size;
     bool fail_next_malloc;
     bool fail_next_realloc;
+    bool user_data_alive;
 } AllocatorState;
 
 typedef struct QuotaState {
@@ -56,22 +57,34 @@ typedef struct QuotaState {
     uint32_t attachment_retain_calls;
     uint32_t attachment_release_calls;
     bool allow_attachment_retain;
+    AllocatorState *allocator_user_data_to_release;
 } QuotaState;
 
 static AllocatorState allocator_state;
 
 static void *
-test_malloc(unsigned int size)
+test_malloc(
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    void *user_data,
+#endif
+    unsigned int size)
 {
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    AllocatorState *state = user_data;
+#else
+    AllocatorState *state = &allocator_state;
+#endif
     bool fail;
     void *ptr;
 
-    pthread_mutex_lock(&allocator_state.lock);
-    allocator_state.malloc_calls++;
-    allocator_state.last_malloc_size = size;
-    fail = allocator_state.fail_next_malloc;
-    allocator_state.fail_next_malloc = false;
-    pthread_mutex_unlock(&allocator_state.lock);
+    CHECK(state != NULL);
+    pthread_mutex_lock(&state->lock);
+    CHECK(state->user_data_alive);
+    state->malloc_calls++;
+    state->last_malloc_size = size;
+    fail = state->fail_next_malloc;
+    state->fail_next_malloc = false;
+    pthread_mutex_unlock(&state->lock);
     if (fail)
         return NULL;
     ptr = malloc(size);
@@ -79,27 +92,50 @@ test_malloc(unsigned int size)
 }
 
 static void *
-test_realloc(void *ptr, unsigned int size)
+test_realloc(
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    void *user_data,
+#endif
+    void *ptr, unsigned int size)
 {
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    AllocatorState *state = user_data;
+#else
+    AllocatorState *state = &allocator_state;
+#endif
     bool fail;
 
-    pthread_mutex_lock(&allocator_state.lock);
-    allocator_state.realloc_calls++;
-    allocator_state.last_realloc_size = size;
-    fail = allocator_state.fail_next_realloc;
-    allocator_state.fail_next_realloc = false;
-    pthread_mutex_unlock(&allocator_state.lock);
+    CHECK(state != NULL);
+    pthread_mutex_lock(&state->lock);
+    CHECK(state->user_data_alive);
+    state->realloc_calls++;
+    state->last_realloc_size = size;
+    fail = state->fail_next_realloc;
+    state->fail_next_realloc = false;
+    pthread_mutex_unlock(&state->lock);
     if (fail)
         return NULL;
     return realloc(ptr, size);
 }
 
 static void
-test_free(void *ptr)
+test_free(
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    void *user_data,
+#endif
+    void *ptr)
 {
-    pthread_mutex_lock(&allocator_state.lock);
-    allocator_state.free_calls++;
-    pthread_mutex_unlock(&allocator_state.lock);
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    AllocatorState *state = user_data;
+#else
+    AllocatorState *state = &allocator_state;
+#endif
+
+    CHECK(state != NULL);
+    pthread_mutex_lock(&state->lock);
+    CHECK(state->user_data_alive);
+    state->free_calls++;
+    pthread_mutex_unlock(&state->lock);
     free(ptr);
 }
 
@@ -157,6 +193,19 @@ allocator_last_realloc_size(void)
     pthread_mutex_unlock(&allocator_state.lock);
     return size;
 }
+
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+static bool
+allocator_user_data_alive(void)
+{
+    bool alive;
+
+    pthread_mutex_lock(&allocator_state.lock);
+    alive = allocator_state.user_data_alive;
+    pthread_mutex_unlock(&allocator_state.lock);
+    return alive;
+}
+#endif
 
 static void
 allocator_fail_next_realloc(void)
@@ -249,23 +298,30 @@ static void
 quota_attachment_release(void *attachment)
 {
     QuotaState *quota = attachment;
+    AllocatorState *allocator_user_data;
 
     pthread_mutex_lock(&quota->lock);
     quota->attachment_release_calls++;
+    allocator_user_data = quota->allocator_user_data_to_release;
     pthread_mutex_unlock(&quota->lock);
+
+    if (allocator_user_data) {
+        pthread_mutex_lock(&allocator_user_data->lock);
+        CHECK(allocator_user_data->user_data_alive);
+        allocator_user_data->user_data_alive = false;
+        pthread_mutex_unlock(&allocator_user_data->lock);
+    }
 }
 
-static LoadArgs
+static LoadArgs2
 quota_load_args(QuotaState *quota)
 {
-    LoadArgs args;
+    LoadArgs2 args;
 
-    memset(&args, 0, sizeof(args));
-    args.allocation_quota_attachment = quota;
-    args.allocation_quota_reserve = quota_reserve;
-    args.allocation_quota_release = quota_release;
-    args.allocation_quota_attachment_retain = quota_attachment_retain;
-    args.allocation_quota_attachment_release = quota_attachment_release;
+    wasm_runtime_load_args2_init(&args);
+    wasm_runtime_load_args2_set_allocation_quota(
+        &args, quota, quota_reserve, quota_release, quota_attachment_retain,
+        quota_attachment_release);
     return args;
 }
 
@@ -313,7 +369,7 @@ static void
 test_token_retain_failure_is_inert(void)
 {
     QuotaState quota;
-    LoadArgs args;
+    LoadArgs2 args;
     uint32_t malloc_calls;
     uint32_t free_calls;
 
@@ -323,10 +379,46 @@ test_token_retain_failure_is_inert(void)
     malloc_calls = allocator_malloc_calls();
     free_calls = allocator_free_calls();
     CHECK(wasm_allocation_quota_token_create(&args) == NULL);
-    CHECK(allocator_malloc_calls() == malloc_calls + 1);
-    CHECK(allocator_free_calls() == free_calls + 1);
+    CHECK(allocator_malloc_calls() == malloc_calls);
+    CHECK(allocator_free_calls() == free_calls);
     CHECK(quota.attachment_retain_calls == 1);
     CHECK(quota.attachment_release_calls == 0);
+    CHECK(quota.reserve_calls == 0);
+    quota_destroy(&quota);
+}
+
+static void
+test_token_storage_reservation_failures_are_refunded(void)
+{
+    QuotaState quota;
+    LoadArgs2 args;
+    uint32_t malloc_calls;
+    uint32_t free_calls;
+
+    quota_init(&quota);
+    quota.allocation_limit = 0;
+    args = quota_load_args(&quota);
+    malloc_calls = allocator_malloc_calls();
+    CHECK(wasm_allocation_quota_token_create(&args) == NULL);
+    CHECK(allocator_malloc_calls() == malloc_calls);
+    CHECK(quota.denied_calls == 1);
+    CHECK(quota.attachment_retain_calls == 1);
+    CHECK(quota.attachment_release_calls == 1);
+    quota_destroy(&quota);
+
+    quota_init(&quota);
+    args = quota_load_args(&quota);
+    malloc_calls = allocator_malloc_calls();
+    free_calls = allocator_free_calls();
+    allocator_fail_next_malloc();
+    CHECK(wasm_allocation_quota_token_create(&args) == NULL);
+    CHECK(allocator_malloc_calls() == malloc_calls + 1);
+    CHECK(allocator_free_calls() == free_calls);
+    CHECK(quota.reserved_allocations == 1);
+    CHECK(quota.released_allocations == 1);
+    CHECK(quota.reserved_bytes == quota.released_bytes);
+    CHECK(quota.attachment_retain_calls == 1);
+    CHECK(quota.attachment_release_calls == 1);
     quota_destroy(&quota);
 }
 
@@ -335,8 +427,8 @@ test_nested_scope_calloc_and_overflow(void)
 {
     QuotaState first;
     QuotaState second;
-    LoadArgs first_args;
-    LoadArgs second_args;
+    LoadArgs2 first_args;
+    LoadArgs2 second_args;
     WASMAllocationQuotaToken *first_token;
     WASMAllocationQuotaToken *second_token;
     WASMAllocationQuotaToken *previous;
@@ -350,6 +442,8 @@ test_nested_scope_calloc_and_overflow(void)
     uint32_t free_calls;
     uint32_t reserve_calls;
     uint64_t released_bytes;
+    uint64_t first_token_bytes;
+    uint64_t second_token_bytes;
     uint32_t index;
 
     quota_init(&first);
@@ -360,6 +454,13 @@ test_nested_scope_calloc_and_overflow(void)
     second_token = wasm_allocation_quota_token_create(&second_args);
     CHECK(first_token != NULL);
     CHECK(second_token != NULL);
+    first_token_bytes = first.live_bytes;
+    second_token_bytes = second.live_bytes;
+    CHECK(first_token_bytes > 0);
+    CHECK(first_token_bytes % WASM_ALLOCATION_MAX_ALIGNMENT == 0);
+    CHECK(second_token_bytes == first_token_bytes);
+    CHECK(first.live_allocations == 1);
+    CHECK(second.live_allocations == 1);
     CHECK(first.attachment_retain_calls == 1);
     CHECK(second.attachment_retain_calls == 1);
 
@@ -371,17 +472,22 @@ test_nested_scope_calloc_and_overflow(void)
 
     second_ptr = wasm_runtime_malloc(13);
     CHECK(second_ptr != NULL);
+    CHECK(wasm_allocation_quota_allocation_matches_current(second_ptr));
     CHECK((uintptr_t)second_ptr % WASM_ALLOCATION_MAX_ALIGNMENT == 0);
-    CHECK(second.live_bytes == second_raw);
-    CHECK(second.live_allocations == 1);
+    CHECK(second.live_bytes == second_token_bytes + second_raw);
+    CHECK(second.live_allocations == 2);
 
     CHECK(wasm_allocation_quota_set_current(previous) == second_token);
+    CHECK(!wasm_allocation_quota_allocation_matches_current(second_ptr));
     first_ptr = wasm_runtime_calloc(3, 7);
     CHECK(first_ptr != NULL);
+    CHECK(wasm_allocation_quota_allocation_matches_current(first_ptr));
+    CHECK(
+        !wasm_allocation_quota_allocations_share_owner(first_ptr, second_ptr));
     for (index = 0; index < 21; index++)
         CHECK(first_ptr[index] == 0);
-    CHECK(first.live_bytes == first_raw);
-    CHECK(first.live_allocations == 1);
+    CHECK(first.live_bytes == first_token_bytes + first_raw);
+    CHECK(first.live_allocations == 2);
 
     first.byte_limit = first.live_bytes;
     malloc_calls = allocator_malloc_calls();
@@ -401,8 +507,8 @@ test_nested_scope_calloc_and_overflow(void)
     CHECK(wasm_runtime_malloc(33) == NULL);
     CHECK(allocator_last_malloc_size()
           == raw_size_for(33, WASM_ALLOCATION_MAX_ALIGNMENT));
-    CHECK(first.live_bytes == first_raw);
-    CHECK(first.live_allocations == 1);
+    CHECK(first.live_bytes == first_token_bytes + first_raw);
+    CHECK(first.live_allocations == 2);
     CHECK(first.released_bytes
           == released_bytes + raw_size_for(33, WASM_ALLOCATION_MAX_ALIGNMENT));
 
@@ -417,10 +523,13 @@ test_nested_scope_calloc_and_overflow(void)
 
     null_realloc_ptr = wasm_runtime_realloc(NULL, 5);
     CHECK(null_realloc_ptr != NULL);
-    CHECK(first.live_bytes == (uint64_t)first_raw + null_realloc_raw);
-    CHECK(first.live_allocations == 2);
+    CHECK(wasm_allocation_quota_allocations_share_owner(first_ptr,
+                                                        null_realloc_ptr));
+    CHECK(first.live_bytes == first_token_bytes + first_raw + null_realloc_raw);
+    CHECK(first.live_allocations == 3);
 
     CHECK(wasm_allocation_quota_set_current(NULL) == first_token);
+    CHECK(!wasm_allocation_quota_allocation_matches_current(first_ptr));
     free_calls = allocator_free_calls();
     wasm_runtime_free(NULL);
     CHECK(allocator_free_calls() == free_calls);
@@ -428,13 +537,17 @@ test_nested_scope_calloc_and_overflow(void)
     wasm_runtime_free(second_ptr);
     wasm_runtime_free(first_ptr);
     CHECK(wasm_runtime_realloc(null_realloc_ptr, 0) == NULL);
+    CHECK(first.live_bytes == first_token_bytes);
+    CHECK(first.live_allocations == 1);
+    CHECK(second.live_bytes == second_token_bytes);
+    CHECK(second.live_allocations == 1);
+
+    wasm_allocation_quota_token_release(second_token);
+    wasm_allocation_quota_token_release(first_token);
     CHECK(first.live_bytes == 0);
     CHECK(first.live_allocations == 0);
     CHECK(second.live_bytes == 0);
     CHECK(second.live_allocations == 0);
-
-    wasm_allocation_quota_token_release(second_token);
-    wasm_allocation_quota_token_release(first_token);
     CHECK(first.attachment_release_calls == 1);
     CHECK(second.attachment_release_calls == 1);
     quota_destroy(&second);
@@ -459,7 +572,7 @@ static void
 test_realloc_accounting_and_cross_thread_free(void)
 {
     QuotaState quota;
-    LoadArgs args;
+    LoadArgs2 args;
     WASMAllocationQuotaToken *token;
     WASMAllocationQuotaToken *previous;
     CrossThreadFreeArgs free_args;
@@ -472,12 +585,15 @@ test_realloc_accounting_and_cross_thread_free(void)
     uint32_t raw_9 = raw_size_for(9, WASM_ALLOCATION_MAX_ALIGNMENT);
     uint32_t realloc_calls;
     uint64_t released_bytes;
+    uint64_t token_bytes;
     uint32_t index;
 
     quota_init(&quota);
     args = quota_load_args(&quota);
     token = wasm_allocation_quota_token_create(&args);
     CHECK(token != NULL);
+    token_bytes = quota.live_bytes;
+    CHECK(quota.live_allocations == 1);
     previous = wasm_allocation_quota_set_current(token);
     CHECK(previous == NULL);
 
@@ -486,16 +602,16 @@ test_realloc_accounting_and_cross_thread_free(void)
     CHECK(allocator_last_malloc_size() == raw_17);
     for (index = 0; index < 17; index++)
         ptr[index] = (uint8_t)(index + 1);
-    CHECK(quota.live_bytes == raw_17);
-    CHECK(quota.live_allocations == 1);
+    CHECK(quota.live_bytes == token_bytes + raw_17);
+    CHECK(quota.live_allocations == 2);
     CHECK(wasm_allocation_quota_set_current(previous) == token);
 
     new_ptr = wasm_runtime_realloc(ptr, 100);
     CHECK(new_ptr != NULL);
     CHECK(allocator_last_realloc_size() == raw_100);
     ptr = new_ptr;
-    CHECK(quota.live_bytes == raw_100);
-    CHECK(quota.live_allocations == 1);
+    CHECK(quota.live_bytes == token_bytes + raw_100);
+    CHECK(quota.live_allocations == 2);
     for (index = 0; index < 17; index++)
         CHECK(ptr[index] == (uint8_t)(index + 1));
 
@@ -503,7 +619,7 @@ test_realloc_accounting_and_cross_thread_free(void)
     allocator_fail_next_realloc();
     CHECK(wasm_runtime_realloc(ptr, 500) == NULL);
     CHECK(allocator_last_realloc_size() == raw_500);
-    CHECK(quota.live_bytes == raw_100);
+    CHECK(quota.live_bytes == token_bytes + raw_100);
     CHECK(quota.released_bytes
           == released_bytes + (uint64_t)(raw_500 - raw_100));
     for (index = 0; index < 17; index++)
@@ -514,14 +630,14 @@ test_realloc_accounting_and_cross_thread_free(void)
     CHECK(wasm_runtime_realloc(ptr, 500) == NULL);
     CHECK(allocator_realloc_calls() == realloc_calls);
     CHECK(quota.denied_calls == 1);
-    CHECK(quota.live_bytes == raw_100);
+    CHECK(quota.live_bytes == token_bytes + raw_100);
     quota.byte_limit = UINT64_MAX;
 
     released_bytes = quota.released_bytes;
     allocator_fail_next_realloc();
     CHECK(wasm_runtime_realloc(ptr, 9) == NULL);
     CHECK(allocator_last_realloc_size() == raw_9);
-    CHECK(quota.live_bytes == raw_100);
+    CHECK(quota.live_bytes == token_bytes + raw_100);
     CHECK(quota.released_bytes == released_bytes);
     for (index = 0; index < 17; index++)
         CHECK(ptr[index] == (uint8_t)(index + 1));
@@ -530,8 +646,8 @@ test_realloc_accounting_and_cross_thread_free(void)
     CHECK(new_ptr != NULL);
     CHECK(allocator_last_realloc_size() == raw_9);
     ptr = new_ptr;
-    CHECK(quota.live_bytes == raw_9);
-    CHECK(quota.live_allocations == 1);
+    CHECK(quota.live_bytes == token_bytes + raw_9);
+    CHECK(quota.live_allocations == 2);
     for (index = 0; index < 9; index++)
         CHECK(ptr[index] == (uint8_t)(index + 1));
 
@@ -555,7 +671,7 @@ test_pool_aligned_allocation_keeps_ownership_metadata(void)
     uint8_t *heap;
     MemAllocOption option;
     QuotaState quota;
-    LoadArgs args;
+    LoadArgs2 args;
     WASMAllocationQuotaToken *token;
     void *ptr;
     void *small_alignment_ptr;
@@ -564,6 +680,7 @@ test_pool_aligned_allocation_keeps_ownership_metadata(void)
     uint32_t small_alignment_raw_size =
         raw_size_for(24, WASM_ALLOCATION_MAX_ALIGNMENT);
     uint32_t common_raw_size = raw_size_for(257, WASM_ALLOCATION_MAX_ALIGNMENT);
+    uint64_t token_bytes;
     uint32_t index;
 
     heap = malloc(256 * 1024);
@@ -577,14 +694,16 @@ test_pool_aligned_allocation_keeps_ownership_metadata(void)
     args = quota_load_args(&quota);
     token = wasm_allocation_quota_token_create(&args);
     CHECK(token != NULL);
+    token_bytes = quota.live_bytes;
+    CHECK(quota.live_allocations == 1);
     CHECK(wasm_allocation_quota_set_current(token) == NULL);
     ptr = wasm_runtime_aligned_alloc(user_size, alignment);
     CHECK(ptr != NULL);
     CHECK((uintptr_t)ptr % alignment == 0);
-    CHECK(quota.live_bytes == raw_size);
-    CHECK(quota.live_allocations == 1);
+    CHECK(quota.live_bytes == token_bytes + raw_size);
+    CHECK(quota.live_allocations == 2);
     CHECK(wasm_runtime_realloc(ptr, user_size * 2) == NULL);
-    CHECK(quota.live_bytes == raw_size);
+    CHECK(quota.live_bytes == token_bytes + raw_size);
 
     common_ptr = wasm_runtime_malloc(17);
     CHECK(common_ptr != NULL);
@@ -598,8 +717,9 @@ test_pool_aligned_allocation_keeps_ownership_metadata(void)
     CHECK(small_alignment_ptr != NULL);
     CHECK((uintptr_t)small_alignment_ptr % WASM_ALLOCATION_MAX_ALIGNMENT == 0);
     CHECK(quota.live_bytes
-          == (uint64_t)raw_size + common_raw_size + small_alignment_raw_size);
-    CHECK(quota.live_allocations == 3);
+          == token_bytes + raw_size + common_raw_size
+                 + small_alignment_raw_size);
+    CHECK(quota.live_allocations == 4);
     CHECK(wasm_allocation_quota_set_current(NULL) == token);
 
     wasm_allocation_quota_token_release(token);
@@ -629,6 +749,31 @@ test_system_allocator_mode(void)
     wasm_runtime_memory_destroy();
 }
 
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+static void
+test_token_storage_is_freed_before_allocator_user_data_release(void)
+{
+    QuotaState quota;
+    LoadArgs2 args;
+    WASMAllocationQuotaToken *token;
+    uint32_t free_calls;
+
+    quota_init(&quota);
+    quota.allocator_user_data_to_release = &allocator_state;
+    args = quota_load_args(&quota);
+    token = wasm_allocation_quota_token_create(&args);
+    CHECK(token != NULL);
+    free_calls = allocator_free_calls();
+
+    wasm_allocation_quota_token_release(token);
+
+    CHECK(allocator_free_calls() == free_calls + 1);
+    CHECK(quota.attachment_release_calls == 1);
+    CHECK(!allocator_user_data_alive());
+    quota_destroy(&quota);
+}
+#endif
+
 int
 main(void)
 {
@@ -636,16 +781,24 @@ main(void)
 
     memset(&allocator_state, 0, sizeof(allocator_state));
     CHECK(pthread_mutex_init(&allocator_state.lock, NULL) == 0);
+    allocator_state.user_data_alive = true;
     memset(&option, 0, sizeof(option));
     option.allocator.malloc_func = (void *)test_malloc;
     option.allocator.realloc_func = (void *)test_realloc;
     option.allocator.free_func = (void *)test_free;
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    option.allocator.user_data = &allocator_state;
+#endif
     CHECK(wasm_runtime_memory_init(Alloc_With_Allocator, &option));
 
     test_unowned_common_allocations();
     test_token_retain_failure_is_inert();
+    test_token_storage_reservation_failures_are_refunded();
     test_nested_scope_calloc_and_overflow();
     test_realloc_accounting_and_cross_thread_free();
+#if WASM_MEM_ALLOC_WITH_USER_DATA != 0
+    test_token_storage_is_freed_before_allocator_user_data_release();
+#endif
     CHECK(wasm_allocation_quota_get_current() == NULL);
     wasm_runtime_memory_destroy();
 

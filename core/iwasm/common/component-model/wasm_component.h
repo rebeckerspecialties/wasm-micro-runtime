@@ -1712,6 +1712,10 @@ is_wasm_component(WASMHeader header);
 WASMComponent *
 wasm_component_load(uint8_t *buf, uint32_t size, const LoadArgs *load_args,
                     char *error_buf, uint32_t error_buf_size);
+
+WASMComponent *
+wasm_component_load_ex2(uint8_t *buf, uint32_t size, const LoadArgs2 *load_args,
+                        char *error_buf, uint32_t error_buf_size);
 void
 wasm_component_unload(WASMComponent *component);
 bool

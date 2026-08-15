@@ -745,24 +745,34 @@ wasm_runtime_load_ex(uint8_t *buf, uint32_t size, const LoadArgs *args,
                      char *error_buf, uint32_t error_buf_size);
 
 /**
- * Attach a native-allocation quota to a load and to module/component instances
- * derived from it.
+ * Initialize versioned loader settings.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_load_args2_init(LoadArgs2 *args);
+
+/**
+ * Attach a native-allocation quota to versioned loader settings.
  *
  * Passing five NULL attachment/callback values disables accounting. Any
- * partially specified callback set is rejected by wasm_runtime_load_ex() and
- * wasm_component_load().
+ * partially specified callback set is rejected before loading begins.
  */
-#ifndef WASM_LOAD_ARGS_SET_ALLOCATION_QUOTA_DECLARED
-#define WASM_LOAD_ARGS_SET_ALLOCATION_QUOTA_DECLARED
 WASM_RUNTIME_API_EXTERN void
-wasm_runtime_load_args_set_allocation_quota(
-    LoadArgs *args, void *attachment,
+wasm_runtime_load_args2_set_allocation_quota(
+    LoadArgs2 *args, void *attachment,
     wasm_allocation_quota_reserve_callback_t reserve_callback,
     wasm_allocation_quota_release_callback_t release_callback,
     wasm_allocation_quota_attachment_retain_callback_t retain_callback,
     wasm_allocation_quota_attachment_release_callback_t
         attachment_release_callback);
-#endif
+
+/**
+ * Load a WASM module using sized, versioned settings. A configured allocation
+ * quota is installed before the first loader allocation and fails closed if
+ * its owner cannot be established.
+ */
+WASM_RUNTIME_API_EXTERN wasm_module_t
+wasm_runtime_load_ex2(uint8_t *buf, uint32_t size, const LoadArgs2 *args,
+                      char *error_buf, uint32_t error_buf_size);
 
 /**
  * Resolve symbols for a previously loaded WASM module. Only useful when the
@@ -1521,6 +1531,13 @@ wasm_runtime_get_exception(wasm_module_inst_t module_inst);
 WASM_RUNTIME_API_EXTERN WASMComponent *
 wasm_component_load(uint8_t *buf, uint32_t size, const LoadArgs *load_args,
                     char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Load and validate a component using sized, versioned loader settings.
+ */
+WASM_RUNTIME_API_EXTERN WASMComponent *
+wasm_component_load_ex2(uint8_t *buf, uint32_t size, const LoadArgs2 *load_args,
+                        char *error_buf, uint32_t error_buf_size);
 
 /**
  * Unload a component.

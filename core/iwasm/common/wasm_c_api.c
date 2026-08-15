@@ -7,6 +7,7 @@
 #include "wasm_c_api_internal.h"
 
 #include "bh_assert.h"
+#include "wasm_allocation_quota.h"
 #include "wasm_export.h"
 #include "wasm_memory.h"
 #if WASM_ENABLE_INTERP != 0
@@ -2212,7 +2213,8 @@ check_loaded_module(Vector *modules, char *binary_hash)
              && memcmp(module->hash, binary_hash, SHA256_DIGEST_LENGTH) == 0);
         os_mutex_unlock(&module->lock);
 
-        if (is_valid) {
+        if (is_valid
+            && wasm_allocation_quota_allocation_matches_current(module)) {
             return module;
         }
     }
@@ -2227,6 +2229,8 @@ try_reuse_loaded_module(wasm_store_t *store, char *binary_hash)
 
     cached = check_loaded_module(&singleton_engine->modules, binary_hash);
     if (!cached)
+        goto quit;
+    if (!wasm_allocation_quota_allocation_matches_current(cached))
         goto quit;
 
     os_mutex_lock(&cached->lock);
@@ -2246,8 +2250,9 @@ quit:
 }
 #endif /* WASM_ENABLE_WASM_CACHE != 0 */
 
-wasm_module_t *
-wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
+static wasm_module_t *
+wasm_module_new_internal(wasm_store_t *store, wasm_byte_vec_t *binary,
+                         LoadArgs *args)
 {
     char error_buf[128] = { 0 };
     wasm_module_ex_t *module_ex = NULL;
@@ -2357,6 +2362,36 @@ free_module:
 quit:
     LOG_ERROR("%s failed", __FUNCTION__);
     return NULL;
+}
+
+wasm_module_t *
+wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
+{
+    return wasm_module_new_internal(store, binary, args);
+}
+
+wasm_module_t *
+wasm_module_new_ex2(wasm_store_t *store, wasm_byte_vec_t *binary,
+                    const LoadArgs2 *args)
+{
+    char error_buf[128] = { 0 };
+    LoadArgs legacy_args;
+    WASMAllocationQuotaScope scope;
+    wasm_module_t *module;
+
+    if (!wasm_runtime_load_args2_normalize(args, &legacy_args, error_buf,
+                                           (uint32)sizeof(error_buf))) {
+        LOG_ERROR("%s", error_buf);
+        return NULL;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_load(&scope, args)) {
+        LOG_ERROR("allocation quota owner could not be established");
+        return NULL;
+    }
+
+    module = wasm_module_new_internal(store, binary, &legacy_args);
+    wasm_allocation_quota_scope_leave(&scope);
+    return module;
 }
 
 wasm_module_t *

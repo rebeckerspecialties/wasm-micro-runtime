@@ -369,25 +369,22 @@ wasm_resolve_symbols(WASMModule *module)
 
 #if WASM_ENABLE_MULTI_MODULE != 0
 static WASMFunction *
-wasm_resolve_function(const char *module_name, const char *function_name,
+wasm_resolve_function(WASMModule *module, const char *module_name,
+                      const char *function_name,
                       const WASMFuncType *expected_function_type,
                       char *error_buf, uint32 error_buf_size)
 {
-    WASMModuleCommon *module_reg;
     WASMFunction *function = NULL;
     WASMExport *export = NULL;
-    WASMModule *module = NULL;
     WASMFuncType *target_function_type = NULL;
 
-    module_reg = wasm_runtime_find_module_registered(module_name);
-    if (!module_reg || module_reg->module_type != Wasm_Module_Bytecode) {
+    if (!module || module->module_type != Wasm_Module_Bytecode) {
         LOG_DEBUG("can not find a module named %s for function %s", module_name,
                   function_name);
         set_error_buf(error_buf, error_buf_size, "unknown import");
         return NULL;
     }
 
-    module = (WASMModule *)module_reg;
     export = loader_find_export((WASMModuleCommon *)module, module_name,
                                 function_name, EXPORT_KIND_FUNC, error_buf,
                                 error_buf_size);
@@ -427,7 +424,7 @@ bool
 wasm_resolve_import_func(const WASMModule *module, WASMFunctionImport *function)
 {
 #if WASM_ENABLE_MULTI_MODULE != 0
-    char error_buf[128];
+    char error_buf[128] = { 0 };
     WASMModule *sub_module = NULL;
 #endif
     function->func_ptr_linked = wasm_native_resolve_symbol(
@@ -449,9 +446,11 @@ wasm_resolve_import_func(const WASMModule *module, WASMFunctionImport *function)
             return false;
         }
     }
-    function->import_func_linked = wasm_resolve_function(
-        function->module_name, function->field_name, function->func_type,
-        error_buf, sizeof(error_buf));
+    if (sub_module) {
+        function->import_func_linked = wasm_resolve_function(
+            sub_module, function->module_name, function->field_name,
+            function->func_type, error_buf, sizeof(error_buf));
+    }
 
     if (function->import_func_linked) {
         function->import_module = sub_module;

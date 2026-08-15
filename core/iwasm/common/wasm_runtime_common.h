@@ -692,7 +692,11 @@ wasm_runtime_load(uint8 *buf, uint32 size, char *error_buf,
                   uint32 error_buf_size);
 
 bool
-wasm_runtime_load_args_has_valid_allocation_quota(const LoadArgs *args);
+wasm_runtime_load_args2_normalize(const LoadArgs2 *args, LoadArgs *legacy_args,
+                                  char *error_buf, uint32 error_buf_size);
+
+bool
+wasm_runtime_load_args2_quota_enabled(const LoadArgs2 *args);
 
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN WASMModuleCommon *

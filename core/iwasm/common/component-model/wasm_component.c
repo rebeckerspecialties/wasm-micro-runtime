@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include "wasm_loader_common.h"
 #include "wasm_runtime_common.h"
+#include "wasm_allocation_quota.h"
 #include "wasm_export.h"
 #include "wasm_component_validate.h"
 #include <stdio.h>
@@ -302,13 +303,6 @@ wasm_component_load(uint8_t *buf, uint32_t size, const LoadArgs *load_args,
         set_error_buf_ex(error_buf, error_buf_size, "Invalid component buffer");
         return NULL;
     }
-    if (load_args
-        && !wasm_runtime_load_args_has_valid_allocation_quota(load_args)) {
-        set_error_buf_ex(error_buf, error_buf_size,
-                         "Incomplete allocation quota callbacks");
-        return NULL;
-    }
-
     if (load_args) {
         args = *load_args;
     }
@@ -340,6 +334,31 @@ wasm_component_load(uint8_t *buf, uint32_t size, const LoadArgs *load_args,
         return NULL;
     }
 
+    return component;
+}
+
+WASMComponent *
+wasm_component_load_ex2(uint8_t *buf, uint32_t size, const LoadArgs2 *load_args,
+                        char *error_buf, uint32_t error_buf_size)
+{
+    WASMAllocationQuotaScope scope;
+    LoadArgs legacy_args;
+    WASMComponent *component;
+
+    if (!wasm_runtime_load_args2_normalize(load_args, &legacy_args, error_buf,
+                                           error_buf_size)) {
+        return NULL;
+    }
+    legacy_args.is_component = true;
+    if (!wasm_allocation_quota_scope_enter_for_load(&scope, load_args)) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Allocation quota owner could not be established");
+        return NULL;
+    }
+
+    component =
+        wasm_component_load(buf, size, &legacy_args, error_buf, error_buf_size);
+    wasm_allocation_quota_scope_leave(&scope);
     return component;
 }
 
@@ -452,10 +471,19 @@ wasm_component_find_host_resource_drop_callback(
 void
 wasm_component_unload(WASMComponent *component)
 {
-    if (component) {
-        wasm_component_free(component);
-        wasm_runtime_free(component);
+    WASMAllocationQuotaScope scope;
+
+    if (!component)
+        return;
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, component)) {
+        LOG_ERROR("failed to establish allocation quota owner while unloading "
+                  "a component");
+        return;
     }
+
+    wasm_component_free(component);
+    wasm_runtime_free(component);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 // Main component free function

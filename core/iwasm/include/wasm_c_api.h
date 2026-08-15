@@ -534,15 +534,16 @@ WASM_API_EXTERN own wasm_module_t* wasm_module_new(
 WASM_API_EXTERN own wasm_module_t* wasm_module_new_ex(
   wasm_store_t*, wasm_byte_vec_t* binary, LoadArgs *args);
 
-#ifndef WASM_LOAD_ARGS_SET_ALLOCATION_QUOTA_DECLARED
-#define WASM_LOAD_ARGS_SET_ALLOCATION_QUOTA_DECLARED
-WASM_API_EXTERN void wasm_runtime_load_args_set_allocation_quota(
-  LoadArgs *args, void *attachment,
+WASM_API_EXTERN own wasm_module_t* wasm_module_new_ex2(
+  wasm_store_t*, wasm_byte_vec_t* binary, const LoadArgs2 *args);
+
+WASM_API_EXTERN void wasm_runtime_load_args2_init(LoadArgs2 *args);
+WASM_API_EXTERN void wasm_runtime_load_args2_set_allocation_quota(
+  LoadArgs2 *args, void *attachment,
   wasm_allocation_quota_reserve_callback_t reserve_callback,
   wasm_allocation_quota_release_callback_t release_callback,
   wasm_allocation_quota_attachment_retain_callback_t retain_callback,
   wasm_allocation_quota_attachment_release_callback_t attachment_release_callback);
-#endif
 
 WASM_API_EXTERN void wasm_module_delete(own wasm_module_t*);
 

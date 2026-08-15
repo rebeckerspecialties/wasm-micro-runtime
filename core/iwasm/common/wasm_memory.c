@@ -35,6 +35,7 @@ struct WASMAllocationQuotaToken {
     void *attachment;
     wasm_allocation_quota_reserve_callback_t reserve;
     wasm_allocation_quota_release_callback_t release;
+    wasm_allocation_quota_attachment_retain_callback_t attachment_retain;
     wasm_allocation_quota_attachment_release_callback_t attachment_release;
 };
 
@@ -1094,31 +1095,76 @@ wasm_runtime_free_direct(void *ptr)
     }
 }
 
+static uint32
+wasm_allocation_quota_token_storage_size(void)
+{
+    const uint32 alignment = WASM_ALLOCATION_MAX_ALIGNMENT;
+
+    return (uint32)(((uint64)sizeof(WASMAllocationQuotaToken) + alignment - 1)
+                    & ~((uint64)alignment - 1));
+}
+
+static bool
+wasm_allocation_quota_args_are_complete(const LoadArgs2 *args)
+{
+    return args && args->allocation_quota_attachment
+           && args->allocation_quota_reserve && args->allocation_quota_release
+           && args->allocation_quota_attachment_retain
+           && args->allocation_quota_attachment_release;
+}
+
+static bool
+wasm_allocation_quota_token_matches(const WASMAllocationQuotaToken *token,
+                                    const LoadArgs2 *args)
+{
+    return token && wasm_allocation_quota_args_are_complete(args)
+           && token->attachment == args->allocation_quota_attachment
+           && token->reserve == args->allocation_quota_reserve
+           && token->release == args->allocation_quota_release
+           && token->attachment_retain
+                  == args->allocation_quota_attachment_retain
+           && token->attachment_release
+                  == args->allocation_quota_attachment_release;
+}
+
 WASMAllocationQuotaToken *
-wasm_allocation_quota_token_create(const LoadArgs *args)
+wasm_allocation_quota_token_create(const LoadArgs2 *args)
 {
     WASMAllocationQuotaToken *token;
+    uint32 storage_size;
 
-    if (!args || !args->allocation_quota_attachment
-        || !args->allocation_quota_reserve || !args->allocation_quota_release
-        || !args->allocation_quota_attachment_retain
-        || !args->allocation_quota_attachment_release)
+    if (!wasm_allocation_quota_args_are_complete(args))
         return NULL;
-
-    token = wasm_runtime_malloc_direct(sizeof(*token));
-    if (!token)
-        return NULL;
-
-    memset(token, 0, sizeof(*token));
-    if (os_mutex_init(&token->lock) != BHT_OK) {
-        wasm_runtime_free_direct(token);
-        return NULL;
-    }
 
     if (!args->allocation_quota_attachment_retain(
             args->allocation_quota_attachment)) {
-        os_mutex_destroy(&token->lock);
+        return NULL;
+    }
+
+    storage_size = wasm_allocation_quota_token_storage_size();
+    if (!args->allocation_quota_reserve(args->allocation_quota_attachment,
+                                        storage_size, 1)) {
+        args->allocation_quota_attachment_release(
+            args->allocation_quota_attachment);
+        return NULL;
+    }
+
+    token = wasm_runtime_malloc_direct(storage_size);
+    if (!token) {
+        args->allocation_quota_release(args->allocation_quota_attachment,
+                                       storage_size, 1);
+        args->allocation_quota_attachment_release(
+            args->allocation_quota_attachment);
+        return NULL;
+    }
+
+    memset(token, 0, storage_size);
+    if (os_mutex_init(&token->lock) != BHT_OK) {
         wasm_runtime_free_direct(token);
+        args->allocation_quota_release(args->allocation_quota_attachment,
+                                       storage_size, 1);
+        args->allocation_quota_attachment_release(
+            args->allocation_quota_attachment);
         return NULL;
     }
 
@@ -1126,6 +1172,7 @@ wasm_allocation_quota_token_create(const LoadArgs *args)
     token->attachment = args->allocation_quota_attachment;
     token->reserve = args->allocation_quota_reserve;
     token->release = args->allocation_quota_release;
+    token->attachment_retain = args->allocation_quota_attachment_retain;
     token->attachment_release = args->allocation_quota_attachment_release;
     return token;
 }
@@ -1164,9 +1211,16 @@ wasm_allocation_quota_token_release(WASMAllocationQuotaToken *token)
     os_mutex_unlock(&token->lock);
 
     if (destroy) {
+        void *attachment = token->attachment;
+        uint32 storage_size = wasm_allocation_quota_token_storage_size();
+        wasm_allocation_quota_release_callback_t quota_release = token->release;
+        wasm_allocation_quota_attachment_release_callback_t attachment_release =
+            token->attachment_release;
+
         os_mutex_destroy(&token->lock);
-        token->attachment_release(token->attachment);
         wasm_runtime_free_direct(token);
+        quota_release(attachment, storage_size, 1);
+        attachment_release(attachment);
     }
 }
 
@@ -1200,6 +1254,127 @@ wasm_allocation_quota_set_current(WASMAllocationQuotaToken *token)
 
     current_allocation_quota = token;
     return previous;
+}
+
+static bool
+wasm_allocation_quota_scope_enter_token(WASMAllocationQuotaScope *scope,
+                                        WASMAllocationQuotaToken *token)
+{
+    WASMAllocationQuotaToken *previous;
+
+    if (!scope || !token)
+        return false;
+
+    memset(scope, 0, sizeof(*scope));
+    previous = wasm_allocation_quota_get_current();
+    if (previous && previous != token)
+        return false;
+    if (!wasm_allocation_quota_token_retain(token))
+        return false;
+
+    scope->token = token;
+    scope->previous = wasm_allocation_quota_set_current(token);
+    scope->active = true;
+    return true;
+}
+
+bool
+wasm_allocation_quota_scope_enter_for_load(WASMAllocationQuotaScope *scope,
+                                           const LoadArgs2 *args)
+{
+    WASMAllocationQuotaToken *token;
+    bool entered;
+
+    if (!scope || !args)
+        return false;
+    memset(scope, 0, sizeof(*scope));
+
+    if (!args->allocation_quota_attachment && !args->allocation_quota_reserve
+        && !args->allocation_quota_release
+        && !args->allocation_quota_attachment_retain
+        && !args->allocation_quota_attachment_release) {
+        return true;
+    }
+    if (!wasm_allocation_quota_args_are_complete(args))
+        return false;
+
+    token = wasm_allocation_quota_get_current();
+    if (token) {
+        if (!wasm_allocation_quota_token_matches(token, args))
+            return false;
+        return wasm_allocation_quota_scope_enter_token(scope, token);
+    }
+
+    token = wasm_allocation_quota_token_create(args);
+    if (!token)
+        return false;
+    entered = wasm_allocation_quota_scope_enter_token(scope, token);
+    wasm_allocation_quota_token_release(token);
+    return entered;
+}
+
+bool
+wasm_allocation_quota_scope_enter_for_allocation(
+    WASMAllocationQuotaScope *scope, const void *allocation)
+{
+    WASMAllocationHeader *header;
+    WASMAllocationQuotaToken *current;
+
+    if (!scope || !allocation)
+        return false;
+    memset(scope, 0, sizeof(*scope));
+
+    header = wasm_allocation_header_from_user((void *)allocation);
+    if (!header)
+        return false;
+
+    current = wasm_allocation_quota_get_current();
+    if (!header->data.owner)
+        return current == NULL;
+    if (current && current != header->data.owner)
+        return false;
+    return wasm_allocation_quota_scope_enter_token(scope, header->data.owner);
+}
+
+bool
+wasm_allocation_quota_allocations_share_owner(const void *first,
+                                              const void *second)
+{
+    WASMAllocationHeader *first_header;
+    WASMAllocationHeader *second_header;
+
+    if (!first || !second)
+        return false;
+    first_header = wasm_allocation_header_from_user((void *)first);
+    second_header = wasm_allocation_header_from_user((void *)second);
+    return first_header && second_header
+           && first_header->data.owner == second_header->data.owner;
+}
+
+bool
+wasm_allocation_quota_allocation_matches_current(const void *allocation)
+{
+    WASMAllocationHeader *header;
+
+    if (!allocation)
+        return false;
+    header = wasm_allocation_header_from_user((void *)allocation);
+    return header && header->data.owner == wasm_allocation_quota_get_current();
+}
+
+void
+wasm_allocation_quota_scope_leave(WASMAllocationQuotaScope *scope)
+{
+    WASMAllocationQuotaToken *token;
+
+    if (!scope || !scope->active)
+        return;
+
+    token = scope->token;
+    bh_assert(wasm_allocation_quota_get_current() == token);
+    wasm_allocation_quota_set_current(scope->previous);
+    memset(scope, 0, sizeof(*scope));
+    wasm_allocation_quota_token_release(token);
 }
 
 bool

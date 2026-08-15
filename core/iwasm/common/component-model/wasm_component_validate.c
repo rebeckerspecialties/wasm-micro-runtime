@@ -19,6 +19,24 @@ static bool
 defvaltype_equal(WASMComponentDefValType *a, WASMComponentDefValType *b,
                  WASMComponentValidationContext *ctx);
 
+static bool
+record_resource_type_name(WASMComponentValidationContext *ctx, const char *name,
+                          char *error_buf, uint32_t error_buf_size)
+{
+    if (bh_hash_map_find(ctx->resource_type_names, (void *)name))
+        return true;
+
+    if (!bh_hash_map_insert(
+            ctx->resource_type_names, (void *)name,
+            (void *)(uintptr_t)1)) { // NOLINT(performance-no-int-to-ptr)
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "could not record resource type name");
+        return false;
+    }
+
+    return true;
+}
+
 // Grow types[] and type_is_local[] if needed, then record the entry at
 // ctx->type_count.
 static bool
@@ -2425,9 +2443,13 @@ validate_imports_section(WASMComponentValidationContext *ctx,
                              "duplicate import name");
             return false;
         }
-        bh_hash_map_insert(
-            ctx->import_names, (void *)name,
-            (void *)(uintptr_t)1); // NOLINT(performance-no-int-to-ptr);
+        if (!bh_hash_map_insert(
+                ctx->import_names, (void *)name,
+                (void *)(uintptr_t)1)) { // NOLINT(performance-no-int-to-ptr)
+            set_error_buf_ex(error_buf, error_buf_size,
+                             "could not record component import name");
+            return false;
+        }
 
         WASMComponentExternDesc *desc = imp->extern_desc;
         switch (desc->type) {
@@ -2504,12 +2526,10 @@ validate_imports_section(WASMComponentValidationContext *ctx,
                 }
                 // Sub-resource import: save the name for [static] annotation
                 // validation
-                if (tb->tag == WASM_COMP_TYPEBOUND_TYPE) {
-                    bh_hash_map_insert(
-                        ctx->resource_type_names, (void *)name,
-                        (void
-                             *)(uintptr_t)1); // NOLINT(performance-no-int-to-ptr);
-                }
+                if (tb->tag == WASM_COMP_TYPEBOUND_TYPE
+                    && !record_resource_type_name(ctx, name, error_buf,
+                                                  error_buf_size))
+                    return false;
                 if (!ctx_push_type(ctx, NULL, false, error_buf, error_buf_size))
                     return false;
                 ctx->type_count++;
@@ -2586,9 +2606,13 @@ validate_exports_section(WASMComponentValidationContext *ctx,
                              "duplicate export name");
             return false;
         }
-        bh_hash_map_insert(
-            ctx->export_names, (void *)name,
-            (void *)(uintptr_t)1); // NOLINT(performance-no-int-to-ptr);
+        if (!bh_hash_map_insert(
+                ctx->export_names, (void *)name,
+                (void *)(uintptr_t)1)) { // NOLINT(performance-no-int-to-ptr)
+            set_error_buf_ex(error_buf, error_buf_size,
+                             "could not record component export name");
+            return false;
+        }
 
         // Check that the referenced item is within bounds for its sort
         uint32_t idx = exp->sort_idx->idx;
@@ -2775,9 +2799,9 @@ validate_exports_section(WASMComponentValidationContext *ctx,
             && idx < ctx->type_count && ctx->types[idx]
             && (ctx->types[idx]->tag == WASM_COMP_RESOURCE_TYPE_SYNC
                 || ctx->types[idx]->tag == WASM_COMP_RESOURCE_TYPE_ASYNC)) {
-            bh_hash_map_insert(
-                ctx->resource_type_names, (void *)name,
-                (void *)(uintptr_t)1); // NOLINT(performance-no-int-to-ptr);
+            if (!record_resource_type_name(ctx, name, error_buf,
+                                           error_buf_size))
+                return false;
         }
 
         // Exporting a value consumes the original entry in the value index
@@ -2886,18 +2910,18 @@ wasm_component_validate(WASMComponent *comp,
     memset(&ctx, 0, sizeof(WASMComponentValidationContext));
     ctx.parent = parent;
 
-    ctx.import_names =
-        bh_hash_map_create(32, false, (HashFunc)wasm_string_hash,
-                           (KeyEqualFunc)wasm_string_equal, NULL, NULL);
+    ctx.import_names = bh_hash_map_create_with_allocator(
+        32, false, (HashFunc)wasm_string_hash, (KeyEqualFunc)wasm_string_equal,
+        NULL, NULL, wasm_runtime_malloc, wasm_runtime_free);
     if (!ctx.import_names) {
         set_error_buf_ex(error_buf, error_buf_size,
                          "could not allocate hashmap for import names");
         return false;
     }
 
-    ctx.export_names =
-        bh_hash_map_create(32, false, (HashFunc)wasm_string_hash,
-                           (KeyEqualFunc)wasm_string_equal, NULL, NULL);
+    ctx.export_names = bh_hash_map_create_with_allocator(
+        32, false, (HashFunc)wasm_string_hash, (KeyEqualFunc)wasm_string_equal,
+        NULL, NULL, wasm_runtime_malloc, wasm_runtime_free);
     if (!ctx.export_names) {
         bh_hash_map_destroy(ctx.import_names);
         set_error_buf_ex(error_buf, error_buf_size,
@@ -2905,9 +2929,9 @@ wasm_component_validate(WASMComponent *comp,
         return false;
     }
 
-    ctx.resource_type_names =
-        bh_hash_map_create(16, false, (HashFunc)wasm_string_hash,
-                           (KeyEqualFunc)wasm_string_equal, NULL, NULL);
+    ctx.resource_type_names = bh_hash_map_create_with_allocator(
+        16, false, (HashFunc)wasm_string_hash, (KeyEqualFunc)wasm_string_equal,
+        NULL, NULL, wasm_runtime_malloc, wasm_runtime_free);
     if (!ctx.resource_type_names) {
         bh_hash_map_destroy(ctx.import_names);
         bh_hash_map_destroy(ctx.export_names);

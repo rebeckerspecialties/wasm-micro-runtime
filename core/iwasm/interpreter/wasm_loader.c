@@ -2596,23 +2596,20 @@ wasm_loader_find_export(const WASMModule *module, const char *module_name,
 
 #if WASM_ENABLE_MULTI_MODULE != 0
 static WASMTable *
-wasm_loader_resolve_table(const char *module_name, const char *table_name,
-                          uint32 init_size, uint32 max_size, char *error_buf,
+wasm_loader_resolve_table(WASMModule *module, const char *module_name,
+                          const char *table_name, uint32 init_size,
+                          uint32 max_size, char *error_buf,
                           uint32 error_buf_size)
 {
-    WASMModuleCommon *module_reg;
     WASMTable *table = NULL;
     WASMExport *export = NULL;
-    WASMModule *module = NULL;
 
-    module_reg = wasm_runtime_find_module_registered(module_name);
-    if (!module_reg || module_reg->module_type != Wasm_Module_Bytecode) {
+    if (!module || module->module_type != Wasm_Module_Bytecode) {
         LOG_DEBUG("can not find a module named %s for table", module_name);
         set_error_buf(error_buf, error_buf_size, "unknown import");
         return NULL;
     }
 
-    module = (WASMModule *)module_reg;
     export =
         wasm_loader_find_export(module, module_name, table_name,
                                 EXPORT_KIND_TABLE, error_buf, error_buf_size);
@@ -2641,23 +2638,20 @@ wasm_loader_resolve_table(const char *module_name, const char *table_name,
 }
 
 static WASMMemory *
-wasm_loader_resolve_memory(const char *module_name, const char *memory_name,
-                           uint32 init_page_count, uint32 max_page_count,
-                           char *error_buf, uint32 error_buf_size)
+wasm_loader_resolve_memory(WASMModule *module, const char *module_name,
+                           const char *memory_name, uint32 init_page_count,
+                           uint32 max_page_count, char *error_buf,
+                           uint32 error_buf_size)
 {
-    WASMModuleCommon *module_reg;
     WASMMemory *memory = NULL;
     WASMExport *export = NULL;
-    WASMModule *module = NULL;
 
-    module_reg = wasm_runtime_find_module_registered(module_name);
-    if (!module_reg || module_reg->module_type != Wasm_Module_Bytecode) {
+    if (!module || module->module_type != Wasm_Module_Bytecode) {
         LOG_DEBUG("can not find a module named %s for memory", module_name);
         set_error_buf(error_buf, error_buf_size, "unknown import");
         return NULL;
     }
 
-    module = (WASMModule *)module_reg;
     export =
         wasm_loader_find_export(module, module_name, memory_name,
                                 EXPORT_KIND_MEMORY, error_buf, error_buf_size);
@@ -2686,23 +2680,19 @@ wasm_loader_resolve_memory(const char *module_name, const char *memory_name,
 }
 
 static WASMGlobal *
-wasm_loader_resolve_global(const char *module_name, const char *global_name,
-                           uint8 type, bool is_mutable, char *error_buf,
-                           uint32 error_buf_size)
+wasm_loader_resolve_global(WASMModule *module, const char *module_name,
+                           const char *global_name, uint8 type, bool is_mutable,
+                           char *error_buf, uint32 error_buf_size)
 {
-    WASMModuleCommon *module_reg;
     WASMGlobal *global = NULL;
     WASMExport *export = NULL;
-    WASMModule *module = NULL;
 
-    module_reg = wasm_runtime_find_module_registered(module_name);
-    if (!module_reg || module_reg->module_type != Wasm_Module_Bytecode) {
+    if (!module || module->module_type != Wasm_Module_Bytecode) {
         LOG_DEBUG("can not find a module named %s for global", module_name);
         set_error_buf(error_buf, error_buf_size, "unknown import");
         return NULL;
     }
 
-    module = (WASMModule *)module_reg;
     export =
         wasm_loader_find_export(module, module_name, global_name,
                                 EXPORT_KIND_GLOBAL, error_buf, error_buf_size);
@@ -2732,25 +2722,21 @@ wasm_loader_resolve_global(const char *module_name, const char *global_name,
 
 #if WASM_ENABLE_TAGS != 0
 static WASMTag *
-wasm_loader_resolve_tag(const char *module_name, const char *tag_name,
-                        const WASMType *expected_tag_type,
+wasm_loader_resolve_tag(WASMModule *module, const char *module_name,
+                        const char *tag_name, const WASMType *expected_tag_type,
                         uint32 *linked_tag_index, char *error_buf,
                         uint32 error_buf_size)
 {
-    WASMModuleCommon *module_reg;
     WASMTag *tag = NULL;
     WASMExport *export = NULL;
-    WASMModule *module = NULL;
 
-    module_reg = wasm_runtime_find_module_registered(module_name);
-    if (!module_reg || module_reg->module_type != Wasm_Module_Bytecode) {
+    if (!module || module->module_type != Wasm_Module_Bytecode) {
         LOG_DEBUG("can not find a module named %s for tag %s", module_name,
                   tag_name);
         set_error_buf(error_buf, error_buf_size, "unknown import");
         return NULL;
     }
 
-    module = (WASMModule *)module_reg;
     export =
         wasm_loader_find_export(module, module_name, tag_name, EXPORT_KIND_TAG,
                                 error_buf, error_buf_size);
@@ -2932,7 +2918,7 @@ load_table_import(const uint8 **p_buf, const uint8 *buf_end,
             error_buf_size);
         if (sub_module) {
             linked_table = wasm_loader_resolve_table(
-                sub_module_name, table_name, declare_init_size,
+                sub_module, sub_module_name, table_name, declare_init_size,
                 declare_max_size, error_buf, error_buf_size);
             if (linked_table) {
                 /* reset with linked table limit */
@@ -3112,8 +3098,9 @@ load_memory_import(const uint8 **p_buf, const uint8 *buf_end,
             error_buf_size);
         if (sub_module) {
             linked_memory = wasm_loader_resolve_memory(
-                sub_module_name, memory_name, declare_init_page_count,
-                declare_max_page_count, error_buf, error_buf_size);
+                sub_module, sub_module_name, memory_name,
+                declare_init_page_count, declare_max_page_count, error_buf,
+                error_buf_size);
             if (linked_memory) {
                 /**
                  * reset with linked memory limit
@@ -3240,7 +3227,7 @@ load_tag_import(const uint8 **p_buf, const uint8 *buf_end,
              */
             uint32 linked_tag_index = 0;
             WASMTag *linked_tag = wasm_loader_resolve_tag(
-                sub_module_name, tag_name, declare_tag_type,
+                sub_module, sub_module_name, tag_name, declare_tag_type,
                 &linked_tag_index /* out */, error_buf, error_buf_size);
             if (linked_tag) {
                 tag->import_module = sub_module;
@@ -3348,8 +3335,8 @@ load_global_import(const uint8 **p_buf, const uint8 *buf_end,
         if (sub_module) {
             /* check sub modules */
             linked_global = wasm_loader_resolve_global(
-                sub_module_name, global_name, declare_type, declare_mutable,
-                error_buf, error_buf_size);
+                sub_module, sub_module_name, global_name, declare_type,
+                declare_mutable, error_buf, error_buf_size);
             if (linked_global) {
                 global->import_module = sub_module;
                 global->import_global_linked = linked_global;
