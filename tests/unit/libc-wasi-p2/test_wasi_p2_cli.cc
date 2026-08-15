@@ -20,6 +20,10 @@ extern "C" {
 #include "wasi_p2_cli.h"
 }
 
+#if defined(__APPLE__)
+extern char **environ;
+#endif
+
 // The set_wasi_p2_args function is not in a public header,
 // so we declare it here.
 extern "C" void
