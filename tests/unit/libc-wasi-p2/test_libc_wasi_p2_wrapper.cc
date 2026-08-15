@@ -4,10 +4,16 @@
 */
 
 #include "gtest/gtest.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "wasm_native.h"
 #include "libc_wasi_p2_wrapper.h"
 #include "wasi_p2_common.h"
 #include "test_helper.h"
+#include "component-model/wasm_component_resource.h"
+#include "component-model/wasm_component_resource_table.h"
 
 static uint32_t failed_lower_resource_drop_count;
 
@@ -109,6 +115,204 @@ TEST_F(WasiP2WrapperTest, OfflineCommonsFailedOwnedLoweringReclaimsHostResource)
     EXPECT_EQ(lowered_index, UINT32_MAX);
 
     destroy_host_resource_table();
+}
+
+struct FailedOwnedResultQuotaState {
+    uint32_t active = 0;
+    uint32_t releases = 0;
+    uint32_t closes = 0;
+    bool underflow = false;
+};
+
+struct FailedOwnedResultFd {
+    FailedOwnedResultQuotaState *state;
+    int fd;
+};
+
+static void
+close_failed_owned_result_fd(void *data)
+{
+    auto *owned_fd = static_cast<FailedOwnedResultFd *>(data);
+
+    if (owned_fd && owned_fd->state && owned_fd->fd >= 0) {
+        close(owned_fd->fd);
+        owned_fd->fd = -1;
+        owned_fd->state->closes++;
+    }
+}
+
+static void
+release_failed_owned_result_quota(void *attachment, uint32_t fd_count)
+{
+    auto *state = static_cast<FailedOwnedResultQuotaState *>(attachment);
+
+    if (!state || fd_count > state->active) {
+        if (state) {
+            state->underflow = true;
+        }
+        return;
+    }
+    state->active -= fd_count;
+    state->releases++;
+}
+
+class WasiP2OwnedResultRollbackTest : public testing::Test
+{
+  protected:
+    void SetUp() override
+    {
+        runtime_ = std::make_unique<WAMRRuntimeRAII<>>();
+        ASSERT_TRUE(instantiate_host_resource_table());
+        host_table_ = get_global_host_resource_table();
+        ASSERT_NE(host_table_, nullptr);
+
+        component_.table = wasm_component_table_init(4, 100);
+        ASSERT_NE(component_.table, nullptr);
+        context_.inst = &component_;
+        exec_env_.cx = &context_;
+        exec_env_.component_inst = &component_;
+        resource_type_.is_builtin_wasi = true;
+        handle_type_.resource = &resource_type_;
+    }
+
+    void TearDown() override
+    {
+        if (component_.table) {
+            wasm_component_table_destroy(component_.table);
+            component_.table = nullptr;
+        }
+        destroy_host_resource_table();
+        EXPECT_FALSE(quota_.underflow);
+        EXPECT_EQ(quota_.active, 0u);
+        runtime_.reset();
+    }
+
+    uint32_t AddMeteredFd(int fd, HostResourceType type)
+    {
+        HostResource *resource =
+            host_resource_create(type, sizeof(FailedOwnedResultFd));
+        if (!resource) {
+            close(fd);
+            return 0;
+        }
+
+        auto *owned_fd = static_cast<FailedOwnedResultFd *>(resource->data);
+        owned_fd->state = &quota_;
+        owned_fd->fd = fd;
+        host_resource_set_dtor(resource, close_failed_owned_result_fd);
+        quota_.active++;
+        host_resource_set_native_fd_quota(resource, &quota_,
+                                          release_failed_owned_result_quota, 1);
+
+        uint32_t rep = host_resource_table_add(host_table_, resource);
+        if (rep == 0) {
+            destroy_host_resource(resource);
+        }
+        return rep;
+    }
+
+    bool LowerOwn(uint32_t rep, uint32_t *out_index)
+    {
+        wit_value_t value = wit_resource_ctor(rep);
+        if (!value) {
+            return false;
+        }
+        bool lowered = lower_own(&context_, &handle_type_, value, out_index);
+        free_wit_value(value);
+        return lowered;
+    }
+
+    std::unique_ptr<WAMRRuntimeRAII<>> runtime_;
+    HostResourceTable *host_table_ = nullptr;
+    WASMComponentInstance component_ = {};
+    LiftLowerContext context_ = {};
+    WASMExecEnv exec_env_ = {};
+    WASMComponentResourceInstance resource_type_ = {};
+    WASMComponentResourceHandleInstance handle_type_ = {};
+    FailedOwnedResultQuotaState quota_;
+};
+
+TEST_F(WasiP2OwnedResultRollbackTest, FailureBeforeFirstOwnRefundsEveryResource)
+{
+    int pipe_fds[2] = { -1, -1 };
+    ASSERT_EQ(pipe(pipe_fds), 0);
+    uint32_t reps[] = {
+        AddMeteredFd(pipe_fds[0], WASI_P2_IO_INPUT_STREAM),
+        AddMeteredFd(pipe_fds[1], WASI_P2_IO_OUTPUT_STREAM),
+    };
+    ASSERT_NE(reps[0], 0u);
+    ASSERT_NE(reps[1], 0u);
+    ASSERT_EQ(quota_.active, 2u);
+
+    EXPECT_FALSE(wasi_p2_store_owned_host_resource_result(
+        &exec_env_, 0, nullptr, nullptr, reps, 2));
+
+    EXPECT_EQ(host_resource_table_get(host_table_, reps[0]), nullptr);
+    EXPECT_EQ(host_resource_table_get(host_table_, reps[1]), nullptr);
+    EXPECT_EQ(quota_.active, 0u);
+    EXPECT_EQ(quota_.releases, 2u);
+    EXPECT_EQ(quota_.closes, 2u);
+    errno = 0;
+    EXPECT_EQ(fcntl(pipe_fds[0], F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    errno = 0;
+    EXPECT_EQ(fcntl(pipe_fds[1], F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+}
+
+TEST_F(WasiP2OwnedResultRollbackTest,
+       ExhaustedTableRollsBackPartialTupleAndAllowsReopen)
+{
+    int first_pipe[2] = { -1, -1 };
+    ASSERT_EQ(pipe(first_pipe), 0);
+    uint32_t first_reps[] = {
+        AddMeteredFd(first_pipe[0], WASI_P2_IO_INPUT_STREAM),
+        AddMeteredFd(first_pipe[1], WASI_P2_IO_OUTPUT_STREAM),
+    };
+    ASSERT_NE(first_reps[0], 0u);
+    ASSERT_NE(first_reps[1], 0u);
+
+    /* Leave exactly one reusable slot, then put the monotonic index past the
+     * canonical table limit. The first tuple own lowers; the second cannot. */
+    component_.table->free_list[0] = 1;
+    component_.table->free_count = 1;
+    component_.table->next_index = WASM_COMPONENT_TABLE_MAX_LENGTH + 1;
+    uint32_t first_index = 0;
+    uint32_t second_index = 0;
+    EXPECT_TRUE(LowerOwn(first_reps[0], &first_index));
+    EXPECT_EQ(first_index, 1u);
+    EXPECT_FALSE(LowerOwn(first_reps[1], &second_index));
+
+    wasi_p2_cleanup_failed_owned_host_resources(&exec_env_, first_reps, 2);
+    /* Restore the synthetic exhaustion state before any assertion can exit the
+     * test and before fixture teardown walks the table. */
+    component_.table->next_index = 2;
+
+    EXPECT_EQ(component_.table->array[first_index], nullptr);
+    EXPECT_EQ(host_resource_table_get(host_table_, first_reps[0]), nullptr);
+    EXPECT_EQ(host_resource_table_get(host_table_, first_reps[1]), nullptr);
+    EXPECT_EQ(quota_.active, 0u);
+    EXPECT_EQ(quota_.releases, 2u);
+    EXPECT_EQ(quota_.closes, 2u);
+
+    int reopened_pipe[2] = { -1, -1 };
+    ASSERT_EQ(pipe(reopened_pipe), 0);
+    uint32_t reopened_reps[] = {
+        AddMeteredFd(reopened_pipe[0], WASI_P2_IO_INPUT_STREAM),
+        AddMeteredFd(reopened_pipe[1], WASI_P2_IO_OUTPUT_STREAM),
+    };
+    ASSERT_NE(reopened_reps[0], 0u);
+    ASSERT_NE(reopened_reps[1], 0u);
+    uint32_t reopened_indices[2] = { 0 };
+    ASSERT_TRUE(LowerOwn(reopened_reps[0], &reopened_indices[0]));
+    ASSERT_TRUE(LowerOwn(reopened_reps[1], &reopened_indices[1]));
+    EXPECT_TRUE(wasm_component_table_drop_resource(component_.table,
+                                                   reopened_indices[1]));
+    EXPECT_TRUE(wasm_component_table_drop_resource(component_.table,
+                                                   reopened_indices[0]));
+    EXPECT_EQ(quota_.active, 0u);
+    EXPECT_EQ(quota_.releases, 4u);
+    EXPECT_EQ(quota_.closes, 4u);
 }
 
 // Test to verify that all exported WASI P2 symbols can be resolved.

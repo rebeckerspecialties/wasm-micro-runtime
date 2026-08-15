@@ -5,6 +5,7 @@
 
 #include "wasi_p2_host_io.h"
 #include "wasi_p2_io.h"
+#include "wasi_p2_common.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -494,6 +495,7 @@ wasm_component_wasi_pollable_new(
     HostResource *resource = NULL;
     WasiP2CallbackPollable *pollable = NULL;
     wasm_component_wasi_pollable_signal_t signal = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
     uint32_t representation = 0;
 
     if (out_signal) {
@@ -512,8 +514,14 @@ wasm_component_wasi_pollable_new(
         return false;
     }
 
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 2, &fd_lease)) {
+        callbacks->drop(attachment);
+        return false;
+    }
+
     signal = pollable_signal_create();
     if (!signal) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         callbacks->drop(attachment);
         return false;
     }
@@ -522,6 +530,7 @@ wasm_component_wasi_pollable_new(
     if (!resource) {
         pollable_signal_deactivate(signal);
         wasm_component_wasi_pollable_signal_release(signal);
+        wasi_p2_native_fd_quota_release(&fd_lease);
         callbacks->drop(attachment);
         return false;
     }
@@ -532,6 +541,7 @@ wasm_component_wasi_pollable_new(
     pollable->signal = signal;
     SET_HOST_CALLBACK_POLLABLE(&pollable->pollable, signal->read_fd, pollable);
     host_resource_set_dtor(resource, pollable_drop);
+    wasi_p2_native_fd_quota_transfer_to_host_resource(resource, &fd_lease);
 
     representation = host_resource_table_add(table, resource);
     if (representation == 0) {

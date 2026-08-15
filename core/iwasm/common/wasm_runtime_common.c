@@ -1868,6 +1868,24 @@ wasm_runtime_instantiation_args_set_memory_page_quota(
 }
 
 void
+wasm_runtime_instantiation_args_set_native_fd_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_native_fd_quota_reserve_callback_t reserve_callback,
+    wasm_native_fd_quota_release_callback_t release_callback)
+{
+    if (reserve_callback == NULL || release_callback == NULL) {
+        p->native_fd_quota_attachment = NULL;
+        p->native_fd_quota_reserve = NULL;
+        p->native_fd_quota_release = NULL;
+        return;
+    }
+
+    p->native_fd_quota_attachment = attachment;
+    p->native_fd_quota_reserve = reserve_callback;
+    p->native_fd_quota_release = release_callback;
+}
+
+void
 wasm_runtime_instantiation_args_set_custom_data(struct InstantiationArgs2 *p,
                                                 void *custom_data)
 {

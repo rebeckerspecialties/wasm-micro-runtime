@@ -8,6 +8,7 @@
 #include "wasi_p2_types.h"
 #include "wasm_runtime_common.h"
 #include "wasi_p2_filesystem.h"
+#include "wasi_p2_filesystem_quota.h"
 #include "component-model/wasm_component_host_resource.h"
 #include "component-model/wasm_canonical_abi.h"
 #include "component-model/wasm_component_canonical.h"
@@ -16,6 +17,21 @@
 
 #include "posix.h"
 #include "errno.h"
+
+static wit_value_t
+make_resource_result(uint32_t rep)
+{
+    wit_value_t resource = wit_resource_ctor(rep);
+    wit_value_t result = NULL;
+
+    if (resource) {
+        result = wit_result_ctor(false, resource);
+        if (!result) {
+            free_wit_value(resource);
+        }
+    }
+    return result;
+}
 
 /* wasi:filesystem/preopens */
 
@@ -164,6 +180,8 @@ wasi_filesystem_read_via_stream_wrapper(wasm_exec_env_t exec_env,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -191,12 +209,18 @@ wasi_filesystem_read_via_stream_wrapper(wasm_exec_env_t exec_env,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        result = get_result_error_val(WASI_FILESYSTEM_CODE_QUOTA);
+        goto end;
+    }
     wasi_filesystem_read_via_stream(descriptor_fd, offset, &stream, &err);
     if (err == 0) {
         HostResource *hr_stream = host_resource_create(
             WASI_P2_IO_INPUT_STREAM, sizeof(StreamResourceType));
 
         if (!hr_stream) {
+            wasi_filesystem_close(stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
             wasm_runtime_set_exception(
                 exec_env->module_inst,
                 "Could not create stream input resource");
@@ -207,6 +231,7 @@ wasi_filesystem_read_via_stream_wrapper(wasm_exec_env_t exec_env,
         ((StreamResourceType *)hr_stream->data)->fd = stream;
         ((StreamResourceType *)hr_stream->data)->type = STREAM_TYPE_FILE;
         host_resource_set_dtor(hr_stream, file_stream_dtor);
+        wasi_p2_native_fd_quota_transfer_to_host_resource(hr_stream, &fd_lease);
 
         uint32_t index_rep = host_resource_table_add(hr_table, hr_stream);
         if (index_rep < 1) {
@@ -218,15 +243,25 @@ wasi_filesystem_read_via_stream_wrapper(wasm_exec_env_t exec_env,
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
             goto end;
         }
-        wit_value_t index_val = wit_resource_ctor(index_rep);
-        result = wit_result_ctor(false, index_val);
+        result = make_resource_result(index_rep);
+        if (!result) {
+            host_resource_table_delete(hr_table, index_rep);
+            result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
+        }
+        else {
+            owned_rep = index_rep;
+        }
     }
     else {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         result = get_result_error_val(errno_to_wasi_filesystem(err));
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -253,6 +288,8 @@ wasi_filesystem_write_via_stream_wrapper(wasm_exec_env_t exec_env,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -283,12 +320,18 @@ wasi_filesystem_write_via_stream_wrapper(wasm_exec_env_t exec_env,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        result = get_result_error_val(WASI_FILESYSTEM_CODE_QUOTA);
+        goto end;
+    }
     wasi_filesystem_write_via_stream(descriptor_fd, offset, &stream, &err);
     if (err == 0) {
         HostResource *hr_stream = host_resource_create(
             WASI_P2_IO_OUTPUT_STREAM, sizeof(StreamResourceType));
 
         if (!hr_stream) {
+            wasi_filesystem_close(stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
             wasm_runtime_set_exception(
                 exec_env->module_inst,
                 "Could not create stream input resource");
@@ -299,6 +342,7 @@ wasi_filesystem_write_via_stream_wrapper(wasm_exec_env_t exec_env,
         ((StreamResourceType *)hr_stream->data)->fd = stream;
         ((StreamResourceType *)hr_stream->data)->type = STREAM_TYPE_FILE;
         host_resource_set_dtor(hr_stream, file_stream_dtor);
+        wasi_p2_native_fd_quota_transfer_to_host_resource(hr_stream, &fd_lease);
 
         uint32_t index_rep = host_resource_table_add(hr_table, hr_stream);
         if (index_rep < 1) {
@@ -310,15 +354,25 @@ wasi_filesystem_write_via_stream_wrapper(wasm_exec_env_t exec_env,
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
             goto end;
         }
-        wit_value_t index_val = wit_resource_ctor(index_rep);
-        result = wit_result_ctor(false, index_val);
+        result = make_resource_result(index_rep);
+        if (!result) {
+            host_resource_table_delete(hr_table, index_rep);
+            result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
+        }
+        else {
+            owned_rep = index_rep;
+        }
     }
     else {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         result = get_result_error_val(errno_to_wasi_filesystem(err));
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -343,6 +397,8 @@ wasi_filesystem_append_via_stream_wrapper(wasm_exec_env_t exec_env,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -373,12 +429,18 @@ wasi_filesystem_append_via_stream_wrapper(wasm_exec_env_t exec_env,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        result = get_result_error_val(WASI_FILESYSTEM_CODE_QUOTA);
+        goto end;
+    }
     wasi_filesystem_append_via_stream(descriptor_fd, &stream, &err);
     if (err == 0) {
         HostResource *hr_stream = host_resource_create(
             WASI_P2_IO_OUTPUT_STREAM, sizeof(StreamResourceType));
 
         if (!hr_stream) {
+            wasi_filesystem_close(stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
             wasm_runtime_set_exception(
                 exec_env->module_inst,
                 "Could not create stream input resource");
@@ -389,6 +451,7 @@ wasi_filesystem_append_via_stream_wrapper(wasm_exec_env_t exec_env,
         ((StreamResourceType *)hr_stream->data)->fd = stream;
         ((StreamResourceType *)hr_stream->data)->type = STREAM_TYPE_FILE;
         host_resource_set_dtor(hr_stream, file_stream_dtor);
+        wasi_p2_native_fd_quota_transfer_to_host_resource(hr_stream, &fd_lease);
 
         uint32_t index_rep = host_resource_table_add(hr_table, hr_stream);
         if (index_rep < 1) {
@@ -400,15 +463,25 @@ wasi_filesystem_append_via_stream_wrapper(wasm_exec_env_t exec_env,
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
             goto end;
         }
-        wit_value_t index_val = wit_resource_ctor(index_rep);
-        result = wit_result_ctor(false, index_val);
+        result = make_resource_result(index_rep);
+        if (!result) {
+            host_resource_table_delete(hr_table, index_rep);
+            result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
+        }
+        else {
+            owned_rep = index_rep;
+        }
     }
     else {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         result = get_result_error_val(errno_to_wasi_filesystem(err));
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -1017,6 +1090,8 @@ wasi_filesystem_read_directory_wrapper(wasm_exec_env_t exec_env,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -1047,12 +1122,18 @@ wasi_filesystem_read_directory_wrapper(wasm_exec_env_t exec_env,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        result = get_result_error_val(WASI_FILESYSTEM_CODE_QUOTA);
+        goto end;
+    }
     wasi_filesystem_read_directory(descriptor_fd, &stream, &err);
     if (err == 0) {
         HostResource *hr_stream = host_resource_create(
             WASI_P2_DIRECTORY_ENTRY_STREAM, sizeof(stream));
 
         if (!hr_stream) {
+            directory_entry_stream_dtor(&stream);
+            wasi_p2_native_fd_quota_release(&fd_lease);
             wasm_runtime_set_exception(
                 exec_env->module_inst,
                 "Could not create dir entry stream resource");
@@ -1062,6 +1143,7 @@ wasi_filesystem_read_directory_wrapper(wasm_exec_env_t exec_env,
 
         *((wasi_directory_entry_stream_t *)hr_stream->data) = stream;
         host_resource_set_dtor(hr_stream, directory_entry_stream_dtor);
+        wasi_p2_native_fd_quota_transfer_to_host_resource(hr_stream, &fd_lease);
 
         uint32_t index_rep = host_resource_table_add(hr_table, hr_stream);
         if (index_rep < 1) {
@@ -1074,15 +1156,25 @@ wasi_filesystem_read_directory_wrapper(wasm_exec_env_t exec_env,
             goto end;
         }
 
-        wit_value_t index_val = wit_resource_ctor(index_rep);
-        result = wit_result_ctor(false, index_val);
+        result = make_resource_result(index_rep);
+        if (!result) {
+            host_resource_table_delete(hr_table, index_rep);
+            result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
+        }
+        else {
+            owned_rep = index_rep;
+        }
     }
     else {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         result = get_result_error_val(errno_to_wasi_filesystem(err));
         goto end;
     }
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -1210,7 +1302,8 @@ wasi_filesystem_create_directory_at_wrapper(wasm_exec_env_t exec_env,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
-    err = wasi_filesystem_create_directory_at(descriptor_fd, path);
+    err = wasi_filesystem_create_directory_at_with_fd_quota(
+        exec_env, descriptor_fd, path);
     wasm_runtime_free(path);
 
     if (err == 0) {
@@ -1373,8 +1466,9 @@ wasi_filesystem_stat_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
-    wasi_filesystem_stat_at(descriptor_fd, (wasi_path_flags_t)path_flags, path,
-                            &stat, &err);
+    wasi_filesystem_stat_at_with_fd_quota(exec_env, descriptor_fd,
+                                          (wasi_path_flags_t)path_flags, path,
+                                          &stat, &err);
 
     wasm_runtime_free(path);
 
@@ -1502,8 +1596,8 @@ wasi_filesystem_set_times_at_wrapper(
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
-    err = wasi_filesystem_set_times_at(
-        descriptor_fd, (wasi_path_flags_t)path_flags, path,
+    err = wasi_filesystem_set_times_at_with_fd_quota(
+        exec_env, descriptor_fd, (wasi_path_flags_t)path_flags, path,
         data_access_timestamp, data_modification_timestamp);
     wasm_runtime_free(path);
 
@@ -1610,9 +1704,9 @@ wasi_filesystem_link_at_wrapper(wasm_exec_env_t exec_env,
     wasi_descriptor_t descriptor_fd1 = *((wasi_descriptor_t *)hr1->data);
     wasi_descriptor_t descriptor_fd2 = *((wasi_descriptor_t *)hr2->data);
 
-    err = wasi_filesystem_link_at(descriptor_fd1,
-                                  (wasi_path_flags_t)old_path_flags, old_path,
-                                  descriptor_fd2, new_path);
+    err = wasi_filesystem_link_at_with_fd_quota(
+        exec_env, descriptor_fd1, (wasi_path_flags_t)old_path_flags, old_path,
+        descriptor_fd2, new_path);
     wasm_runtime_free(old_path);
     wasm_runtime_free(new_path);
 
@@ -1661,6 +1755,8 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
     wit_value_t path_val = NULL;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -1698,16 +1794,17 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
-    wasi_filesystem_open_at(descriptor_fd, (wasi_path_flags_t)path_flags, path,
-                            (wasi_open_flags_t)open_flags,
-                            (wasi_descriptor_flags_t)desc_flags, 0666, &new_fd,
-                            &err);
+    wasi_filesystem_open_at_with_fd_quota(
+        exec_env, descriptor_fd, (wasi_path_flags_t)path_flags, path,
+        (wasi_open_flags_t)open_flags, (wasi_descriptor_flags_t)desc_flags,
+        0666, &new_fd, &fd_lease, &err);
 
     if (err == 0) {
         HostResource *hr_new =
             host_resource_create(WASI_P2_FILESYSTEM_DESCRIPTOR, sizeof(new_fd));
 
         if (!hr_new) {
+            wasi_filesystem_close(new_fd);
             wasm_runtime_set_exception(exec_env->module_inst,
                                        "Could not create descriptor resource");
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
@@ -1716,6 +1813,7 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
 
         *((wasi_descriptor_t *)hr_new->data) = new_fd;
         host_resource_set_dtor(hr_new, filesystem_descriptor_dtor);
+        wasi_p2_native_fd_quota_transfer_to_host_resource(hr_new, &fd_lease);
 
         uint32_t index_rep = host_resource_table_add(hr_table, hr_new);
         if (index_rep < 1) {
@@ -1727,9 +1825,14 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
             goto end;
         }
+        owned_rep = index_rep;
 
-        wit_value_t index_val = wit_resource_ctor(index_rep);
-        result = wit_result_ctor(false, index_val);
+        result = make_resource_result(index_rep);
+        if (!result) {
+            host_resource_table_delete(hr_table, index_rep);
+            owned_rep = 0;
+            result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
+        }
     }
     else {
         result = get_result_error_val(errno_to_wasi_filesystem(err));
@@ -1737,7 +1840,10 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
     free_wit_value(path_val);
@@ -1805,7 +1911,8 @@ wasi_filesystem_readlink_at_wrapper(wasm_exec_env_t exec_env,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
-    wasi_filesystem_readlink_at(descriptor_fd, path, &link_content, &err);
+    wasi_filesystem_readlink_at_with_fd_quota(exec_env, descriptor_fd, path,
+                                              &link_content, &err);
     wasm_runtime_free(path);
 
     if (err != 0) {
@@ -1894,7 +2001,8 @@ wasi_filesystem_remove_directory_at_wrapper(wasm_exec_env_t exec_env,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
-    err = wasi_filesystem_remove_directory_at(descriptor_fd, path);
+    err = wasi_filesystem_remove_directory_at_with_fd_quota(
+        exec_env, descriptor_fd, path);
     wasm_runtime_free(path);
 
     if (err == 0) {
@@ -1997,8 +2105,8 @@ wasi_filesystem_rename_at_wrapper(wasm_exec_env_t exec_env,
     wasi_descriptor_t descriptor_fd1 = *((wasi_descriptor_t *)hr1->data);
     wasi_descriptor_t descriptor_fd2 = *((wasi_descriptor_t *)hr2->data);
 
-    err = wasi_filesystem_rename_at(descriptor_fd1, old_path, descriptor_fd2,
-                                    new_path);
+    err = wasi_filesystem_rename_at_with_fd_quota(
+        exec_env, descriptor_fd1, old_path, descriptor_fd2, new_path);
     wasm_runtime_free(old_path);
     wasm_runtime_free(new_path);
 
@@ -2091,7 +2199,8 @@ wasi_filesystem_symlink_at_wrapper(wasm_exec_env_t exec_env,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
-    err = wasi_filesystem_symlink_at(descriptor_fd, old_path, new_path);
+    err = wasi_filesystem_symlink_at_with_fd_quota(exec_env, descriptor_fd,
+                                                   old_path, new_path);
     wasm_runtime_free(old_path);
     wasm_runtime_free(new_path);
 
@@ -2175,7 +2284,8 @@ wasi_filesystem_unlink_file_at_wrapper(wasm_exec_env_t exec_env,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
-    err = wasi_filesystem_unlink_file_at(descriptor_fd, path);
+    err = wasi_filesystem_unlink_file_at_with_fd_quota(exec_env, descriptor_fd,
+                                                       path);
     wasm_runtime_free(path);
 
     if (err == 0) {
@@ -2390,8 +2500,9 @@ wasi_filesystem_metadata_hash_at_wrapper(wasm_exec_env_t exec_env,
 
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
-    wasi_filesystem_metadata_hash_at(
-        descriptor_fd, (wasi_path_flags_t)path_flags, path, &hash, &err);
+    wasi_filesystem_metadata_hash_at_with_fd_quota(
+        exec_env, descriptor_fd, (wasi_path_flags_t)path_flags, path, &hash,
+        &err);
     wasm_runtime_free(path);
 
     if (err != 0) {

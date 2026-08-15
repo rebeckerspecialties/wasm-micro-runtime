@@ -23,6 +23,7 @@ typedef int32_t wasi_udp_socket_t;
 typedef int32_t wasi_resolve_address_stream_t;
 typedef int32_t wasi_incoming_datagram_stream_t;
 typedef int32_t wasi_outgoing_datagram_stream_t;
+struct WasiP2NativeFdQuotaLease;
 typedef enum wasi_ip_address_family_t {
     WASI_IP_ADDRESS_FAMILY_IPV4,
     WASI_IP_ADDRESS_FAMILY_IPV6,
@@ -88,6 +89,12 @@ wasi_sockets_instance_network(void);
 void
 wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
                                wasi_resolve_address_stream_t *ret, int *err);
+void
+wasi_sockets_resolve_addresses_with_fd_quota(
+    wasi_network_t network, const char *name,
+    wasi_resolve_address_stream_t *ret, int *err,
+    struct WasiP2NativeFdQuotaLease *read_fd_lease,
+    struct WasiP2NativeFdQuotaLease *write_fd_lease);
 void
 wasi_sockets_resolve_next_address(wasi_resolve_address_stream_t stream,
                                   wasi_ip_address_t *ret, bool *is_some,

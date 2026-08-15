@@ -75,9 +75,9 @@ class HostResourceTableTest : public testing::Test
         HostResource *hr = (HostResource *)wasm_runtime_malloc(sizeof(HostResource));
         if (!hr) return nullptr;
 
+        std::memset(hr, 0, sizeof(*hr));
         hr->type = type;
         hr->data = data;
-        hr->dtor = NULL;
         return hr;
     }
 
