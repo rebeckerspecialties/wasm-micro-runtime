@@ -181,6 +181,7 @@ wasi_filesystem_read_via_stream_wrapper(wasm_exec_env_t exec_env,
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
     WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -247,6 +248,9 @@ wasi_filesystem_read_via_stream_wrapper(wasm_exec_env_t exec_env,
             host_resource_table_delete(hr_table, index_rep);
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
         }
+        else {
+            owned_rep = index_rep;
+        }
     }
     else {
         wasi_p2_native_fd_quota_release(&fd_lease);
@@ -254,7 +258,10 @@ wasi_filesystem_read_via_stream_wrapper(wasm_exec_env_t exec_env,
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -282,6 +289,7 @@ wasi_filesystem_write_via_stream_wrapper(wasm_exec_env_t exec_env,
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
     WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -351,6 +359,9 @@ wasi_filesystem_write_via_stream_wrapper(wasm_exec_env_t exec_env,
             host_resource_table_delete(hr_table, index_rep);
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
         }
+        else {
+            owned_rep = index_rep;
+        }
     }
     else {
         wasi_p2_native_fd_quota_release(&fd_lease);
@@ -358,7 +369,10 @@ wasi_filesystem_write_via_stream_wrapper(wasm_exec_env_t exec_env,
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -384,6 +398,7 @@ wasi_filesystem_append_via_stream_wrapper(wasm_exec_env_t exec_env,
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
     WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -453,6 +468,9 @@ wasi_filesystem_append_via_stream_wrapper(wasm_exec_env_t exec_env,
             host_resource_table_delete(hr_table, index_rep);
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
         }
+        else {
+            owned_rep = index_rep;
+        }
     }
     else {
         wasi_p2_native_fd_quota_release(&fd_lease);
@@ -460,7 +478,10 @@ wasi_filesystem_append_via_stream_wrapper(wasm_exec_env_t exec_env,
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -1070,6 +1091,7 @@ wasi_filesystem_read_directory_wrapper(wasm_exec_env_t exec_env,
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
     WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -1139,6 +1161,9 @@ wasi_filesystem_read_directory_wrapper(wasm_exec_env_t exec_env,
             host_resource_table_delete(hr_table, index_rep);
             result = get_result_error_val(WASI_FILESYSTEM_CODE_INVALID);
         }
+        else {
+            owned_rep = index_rep;
+        }
     }
     else {
         wasi_p2_native_fd_quota_release(&fd_lease);
@@ -1146,7 +1171,10 @@ wasi_filesystem_read_directory_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -1813,12 +1841,9 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
 
 end:
     wasi_p2_native_fd_quota_release(&fd_lease);
-    if (!store(exec_env->cx, offset_addr, func_type->results->result, result)
-        && owned_rep != 0) {
-        /* A failed canonical lower never transferred this representation into
-         * the component table, so the global resource still owns the FD. */
-        host_resource_table_delete(get_global_host_resource_table(), owned_rep);
-    }
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
     free_wit_value(path_val);

@@ -83,6 +83,30 @@ wasi_p2_native_fd_quota_transfer_to_host_resource(
     HostResource *resource, WasiP2NativeFdQuotaLease *lease);
 
 /**
+ * Reclaim newly-created built-in WASI host resources after canonical result
+ * lowering fails. Handles already installed by a partial lowering are dropped
+ * from the component table; representations that were not installed are
+ * removed directly from the global host-resource table.
+ */
+void
+wasi_p2_cleanup_failed_owned_host_resources(wasm_exec_env_t exec_env,
+                                            const uint32_t *reps,
+                                            uint32_t rep_count);
+
+/**
+ * Store a result that contains newly-created owned built-in WASI resources.
+ * A failed canonical lowering is transactional with respect to every
+ * representation in @p reps.
+ */
+bool
+wasi_p2_store_owned_host_resource_result(wasm_exec_env_t exec_env,
+                                         uint32_t offset_addr,
+                                         WASMComponentTypeInstance *result_type,
+                                         wit_value_t result,
+                                         const uint32_t *reps,
+                                         uint32_t rep_count);
+
+/**
  * Lower a newly-created global host resource into the current component
  * instance's owned-resource table. If allocation or lowering fails, the
  * global resource is removed so a failed canonical-ABI return cannot leak it.

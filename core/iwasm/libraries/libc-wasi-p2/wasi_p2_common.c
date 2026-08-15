@@ -5,6 +5,8 @@
 
 #include "wasi_p2_common.h"
 #include "wasi_p2_types.h"
+#include "component-model/wasm_component_resource.h"
+#include "component-model/wasm_component_resource_table.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -100,6 +102,91 @@ wasi_p2_native_fd_quota_transfer_to_host_resource(
     host_resource_set_native_fd_quota(resource, lease->attachment,
                                       lease->release_callback, lease->fd_count);
     memset(lease, 0, sizeof(*lease));
+}
+
+static bool
+drop_lowered_builtin_wasi_rep(WASMComponentResourceTable *table, uint32_t rep)
+{
+    uint32_t i;
+    uint32_t scan_limit;
+
+    if (!table || !table->array || rep == 0) {
+        return false;
+    }
+
+    /* Keep the scan within allocated storage even when next_index is at the
+     * resource-table limit that caused lowering to fail. */
+    scan_limit = table->next_index < table->array_size ? table->next_index
+                                                       : table->array_size;
+    for (i = 1; i < scan_limit; i++) {
+        WASMTableElement *element = table->array[i];
+        WASMResourceHandle *handle;
+
+        if (!element || element->type != WASM_TABLE_ELEM_RESOURCE_HANDLE
+            || !element->ptr) {
+            continue;
+        }
+        handle = (WASMResourceHandle *)element->ptr;
+        if (!handle->own || handle->rep != rep || !handle->rt
+            || !handle->rt->is_builtin_wasi) {
+            continue;
+        }
+
+        /* The representation is table-owned from this point. Drop commits the
+         * removal before invoking teardown, so never directly delete the rep
+         * afterward even if its destructor reports an error. */
+        (void)wasm_component_table_drop_resource(table, i);
+        return true;
+    }
+
+    return false;
+}
+
+void
+wasi_p2_cleanup_failed_owned_host_resources(wasm_exec_env_t exec_env,
+                                            const uint32_t *reps,
+                                            uint32_t rep_count)
+{
+    WASMComponentResourceTable *component_table = NULL;
+    HostResourceTable *host_table = get_global_host_resource_table();
+    uint32_t i;
+
+    if (!reps || rep_count == 0 || !host_table) {
+        return;
+    }
+    if (exec_env && exec_env->cx && exec_env->cx->inst) {
+        component_table = exec_env->cx->inst->table;
+    }
+
+    for (i = 0; i < rep_count; i++) {
+        uint32_t rep = reps[i];
+
+        if (rep == 0) {
+            continue;
+        }
+        if (!drop_lowered_builtin_wasi_rep(component_table, rep)) {
+            (void)host_resource_table_delete(host_table, rep);
+        }
+    }
+}
+
+bool
+wasi_p2_store_owned_host_resource_result(wasm_exec_env_t exec_env,
+                                         uint32_t offset_addr,
+                                         WASMComponentTypeInstance *result_type,
+                                         wit_value_t result,
+                                         const uint32_t *reps,
+                                         uint32_t rep_count)
+{
+    bool stored = false;
+
+    if (exec_env && exec_env->cx && result_type && result) {
+        stored = store(exec_env->cx, offset_addr, result_type, result);
+    }
+    if (!stored) {
+        wasi_p2_cleanup_failed_owned_host_resources(exec_env, reps, rep_count);
+    }
+    return stored;
 }
 
 bool

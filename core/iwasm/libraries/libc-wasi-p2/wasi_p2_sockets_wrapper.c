@@ -365,6 +365,7 @@ wasi_sockets_ip_name_lookup_resolve_addresses_wrapper(wasm_exec_env_t exec_env,
     WasiP2NativeFdQuotaLease fd_lease = { 0 };
     WasiP2NativeFdQuotaLease read_fd_lease = { 0 };
     WasiP2NativeFdQuotaLease write_fd_lease = { 0 };
+    uint32_t owned_rep = 0;
     if (!lift_borrow(
             exec_env->cx, network_handle,
             func_type->params->params[0].type->type_specific.resource_handle,
@@ -456,11 +457,19 @@ wasi_sockets_ip_name_lookup_resolve_addresses_wrapper(wasm_exec_env_t exec_env,
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
         }
+        else {
+            owned_rep = out;
+        }
         goto end;
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    wasi_p2_native_fd_quota_release(&read_fd_lease);
+    wasi_p2_native_fd_quota_release(&write_fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -655,6 +664,7 @@ wasi_sockets_tcp_create_socket_create_tcp_socket_wrapper(
         wasm_get_component_func_type(exec_env);
     wit_value_t result = NULL;
     WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -709,10 +719,16 @@ wasi_sockets_tcp_create_socket_create_tcp_socket_wrapper(
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
         }
+        else {
+            owned_rep = index_rep;
+        }
         goto end;
     }
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
 }
 
@@ -1039,6 +1055,8 @@ wasi_sockets_tcp_tcp_socket_finish_connect_wrapper(wasm_exec_env_t exec_env,
     WasiP2NativeFdQuotaLease fd_lease = { 0 };
     WasiP2NativeFdQuotaLease input_fd_lease = { 0 };
     WasiP2NativeFdQuotaLease output_fd_lease = { 0 };
+    uint32_t owned_reps[2] = { 0 };
+    uint32_t owned_rep_count = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -1130,11 +1148,21 @@ wasi_sockets_tcp_tcp_socket_finish_connect_wrapper(wasm_exec_env_t exec_env,
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
         }
+        else {
+            owned_reps[0] = input_stream;
+            owned_reps[1] = output_stream;
+            owned_rep_count = 2;
+        }
         goto end;
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    wasi_p2_native_fd_quota_release(&input_fd_lease);
+    wasi_p2_native_fd_quota_release(&output_fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, owned_reps,
+        owned_rep_count);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -1287,6 +1315,8 @@ wasi_sockets_tcp_tcp_socket_accept_wrapper(wasm_exec_env_t exec_env,
     WasiP2NativeFdQuotaLease socket_fd_lease = { 0 };
     WasiP2NativeFdQuotaLease input_fd_lease = { 0 };
     WasiP2NativeFdQuotaLease output_fd_lease = { 0 };
+    uint32_t owned_reps[3] = { 0 };
+    uint32_t owned_rep_count = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -1425,11 +1455,23 @@ wasi_sockets_tcp_tcp_socket_accept_wrapper(wasm_exec_env_t exec_env,
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
         }
+        else {
+            owned_reps[0] = out;
+            owned_reps[1] = incoming_rep;
+            owned_reps[2] = outgoing_rep;
+            owned_rep_count = 3;
+        }
 
         goto end;
     }
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    wasi_p2_native_fd_quota_release(&socket_fd_lease);
+    wasi_p2_native_fd_quota_release(&input_fd_lease);
+    wasi_p2_native_fd_quota_release(&output_fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, owned_reps,
+        owned_rep_count);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -2788,6 +2830,7 @@ wasi_sockets_udp_create_socket_create_udp_socket_wrapper(
         wasm_get_component_func_type(exec_env);
     wit_value_t result = NULL;
     WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    uint32_t owned_rep = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -2842,10 +2885,16 @@ wasi_sockets_udp_create_socket_create_udp_socket_wrapper(
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
         }
+        else {
+            owned_rep = index_rep;
+        }
         goto end;
     }
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, &owned_rep,
+        owned_rep != 0 ? 1 : 0);
     free_wit_value(result);
 }
 
@@ -3028,6 +3077,8 @@ wasi_sockets_udp_udp_socket_stream_wrapper(
     WasiP2NativeFdQuotaLease fd_lease = { 0 };
     WasiP2NativeFdQuotaLease input_fd_lease = { 0 };
     WasiP2NativeFdQuotaLease output_fd_lease = { 0 };
+    uint32_t owned_reps[2] = { 0 };
+    uint32_t owned_rep_count = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -3129,11 +3180,21 @@ wasi_sockets_udp_udp_socket_stream_wrapper(
             result =
                 get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
         }
+        else {
+            owned_reps[0] = incoming_rep;
+            owned_reps[1] = outgoing_rep;
+            owned_rep_count = 2;
+        }
         goto end;
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    wasi_p2_native_fd_quota_release(&fd_lease);
+    wasi_p2_native_fd_quota_release(&input_fd_lease);
+    wasi_p2_native_fd_quota_release(&output_fd_lease);
+    (void)wasi_p2_store_owned_host_resource_result(
+        exec_env, offset_addr, func_type->results->result, result, owned_reps,
+        owned_rep_count);
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
