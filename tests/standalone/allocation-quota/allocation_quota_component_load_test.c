@@ -11,6 +11,8 @@
 #include <string.h>
 
 #include "wasm_export.h"
+#include "wasm_allocation_quota.h"
+#include "component-model/wasm_canonical_abi.h"
 
 #define CHECK(condition)                                                   \
     do {                                                                   \
@@ -295,6 +297,41 @@ test_validation_maps_fail_closed(const Binary *source,
     CHECK(found_entry_denial);
 }
 
+static void
+test_payloadless_variant_refunds(void)
+{
+    QuotaState quota;
+    LoadArgs2 args;
+    WASMAllocationQuotaToken *token;
+    wit_value_t variant;
+    uint64_t baseline_bytes;
+    uint32_t baseline_allocations;
+
+    quota_init(&quota);
+    args = quota_load_args(&quota);
+    token = wasm_allocation_quota_token_create(&args);
+    CHECK(token != NULL);
+    baseline_bytes = quota.live_bytes;
+    baseline_allocations = quota.live_allocations;
+
+    CHECK(wasm_allocation_quota_set_current(token) == NULL);
+    variant = wit_variant_ctor("closed", 6, NULL);
+    CHECK(variant != NULL);
+    CHECK(quota.live_allocations == baseline_allocations + 2);
+    CHECK(wasm_allocation_quota_set_current(NULL) == token);
+
+    CHECK(wasm_allocation_quota_set_current(token) == NULL);
+    CHECK(free_wit_value(variant));
+    CHECK(wasm_allocation_quota_set_current(NULL) == token);
+    CHECK(quota.live_bytes == baseline_bytes);
+    CHECK(quota.live_allocations == baseline_allocations);
+
+    wasm_allocation_quota_token_release(token);
+    CHECK(quota.attachment_retain_calls == 1);
+    CHECK(quota.attachment_release_calls == 1);
+    quota_destroy(&quota);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -316,6 +353,7 @@ main(int argc, char **argv)
     test_validation_maps_fail_closed(&validation_heavy,
                                      validation_reserve_calls);
     (void)test_component_graph_uses_one_owner(&nested);
+    test_payloadless_variant_refunds();
 
     wasm_runtime_destroy();
     free(nested.data);

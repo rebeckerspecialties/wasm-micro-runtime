@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include "wasm_loader_common.h"
 #include "wasm_runtime_common.h"
+#include "wasm_allocation_quota.h"
 #include "wasm_export.h"
 #include <stdio.h>
 
@@ -502,6 +503,15 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
                     instance->expression.with_args.idx);
                 goto fail_inst;
             }
+            if (!wasm_allocation_quota_allocations_share_owner(comp_instance,
+                                                               new_inst)) {
+                set_error_buf_ex(
+                    error_buf, error_buf_size,
+                    "ERROR: Nested component instance has a different "
+                    "allocation quota owner\n");
+                wasm_component_deinstantiate(new_inst);
+                goto fail_inst;
+            }
             comp_instance->component_instances
                 [comp_instance->component_instances_count] = new_inst;
             comp_instance->component_instances_count++;
@@ -523,11 +533,22 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
                  == WASM_COMP_INSTANCE_EXPRESSION_WITHOUT_ARGS) {
             WASMComponentIndexCount index_count = { 0 };
             WASMComponentInlineExport *inst_expression = NULL;
+            WASMComponentInstance *new_inst;
+
+            index_count.exports =
+                instance->expression.without_args.inline_expr_len;
             for (idx = 0;
                  idx < instance->expression.without_args.inline_expr_len;
                  idx++) {
                 inst_expression =
                     &instance->expression.without_args.inline_expr[idx];
+                if (!inst_expression->sort_idx
+                    || !inst_expression->sort_idx->sort) {
+                    set_error_buf_ex(error_buf, error_buf_size,
+                                     "ERROR: Inline component export has an "
+                                     "invalid sort index");
+                    return false;
+                }
                 switch (inst_expression->sort_idx->sort->sort) {
                     case WASM_COMP_SORT_CORE_SORT:
                         if (inst_expression->sort_idx->sort->core_sort
@@ -539,29 +560,112 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
                                 inst_expression->sort_idx->sort->core_sort);
                             return false;
                         }
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->core_modules_count) {
+                            set_error_buf_ex(
+                                error_buf, error_buf_size,
+                                "ERROR: Inline core module %u not yet "
+                                "defined",
+                                inst_expression->sort_idx->idx);
+                            return false;
+                        }
+                        index_count.core_modules++;
                         break;
                     case WASM_COMP_SORT_FUNC:
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->functions_count) {
+                            set_error_buf_ex(error_buf, error_buf_size,
+                                             "ERROR: Inline function %u not "
+                                             "yet defined",
+                                             inst_expression->sort_idx->idx);
+                            return false;
+                        }
                         index_count.functions++;
                         break;
                     case WASM_COMP_SORT_VALUE:
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->values_count) {
+                            set_error_buf_ex(error_buf, error_buf_size,
+                                             "ERROR: Inline value %u not yet "
+                                             "defined",
+                                             inst_expression->sort_idx->idx);
+                            return false;
+                        }
                         index_count.values++;
                         break;
                     case WASM_COMP_SORT_TYPE:
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->types_count) {
+                            set_error_buf_ex(error_buf, error_buf_size,
+                                             "ERROR: Inline type %u not yet "
+                                             "defined",
+                                             inst_expression->sort_idx->idx);
+                            return false;
+                        }
                         index_count.types++;
                         break;
                     case WASM_COMP_SORT_COMPONENT:
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->components_count) {
+                            set_error_buf_ex(
+                                error_buf, error_buf_size,
+                                "ERROR: Inline component %u not yet defined",
+                                inst_expression->sort_idx->idx);
+                            return false;
+                        }
                         index_count.components++;
                         break;
                     case WASM_COMP_SORT_INSTANCE:
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->component_instances_count) {
+                            set_error_buf_ex(
+                                error_buf, error_buf_size,
+                                "ERROR: Inline instance %u not yet defined",
+                                inst_expression->sort_idx->idx);
+                            return false;
+                        }
                         index_count.instances++;
                         break;
                     default:
-                        break;
+                        set_error_buf_ex(
+                            error_buf, error_buf_size,
+                            "ERROR: Unsupported inline component export sort "
+                            "%u",
+                            inst_expression->sort_idx->sort->sort);
+                        return false;
                 }
             }
-            WASMComponentInstance *new_inst = wasm_component_instance_allocate(
-                &index_count, error_buf, error_buf_size);
+            new_inst = wasm_component_instance_allocate(&index_count, error_buf,
+                                                        error_buf_size);
+            if (!new_inst) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "ERROR: Inline component instance allocation "
+                                 "failed\n");
+                return false;
+            }
             new_inst->parent = comp_instance;
+            if (!wasm_allocation_quota_allocations_share_owner(comp_instance,
+                                                               new_inst)
+                || !wasm_allocation_quota_allocations_share_owner(
+                    new_inst, new_inst->table)) {
+                set_error_buf_ex(
+                    error_buf, error_buf_size,
+                    "ERROR: Inline component instance has a different "
+                    "allocation quota owner\n");
+                wasm_component_deinstantiate(new_inst);
+                return false;
+            }
+            if (index_count.exports > 0) {
+                new_inst->owned_export_names = wasm_component_checked_calloc(
+                    index_count.exports, sizeof(WASMComponentExportName), NULL,
+                    NULL, 0, "inline component export name", error_buf,
+                    error_buf_size);
+                if (!new_inst->owned_export_names) {
+                    wasm_component_deinstantiate(new_inst);
+                    return false;
+                }
+                new_inst->owned_export_names_count = index_count.exports;
+            }
 
             for (idx = 0;
                  idx < instance->expression.without_args.inline_expr_len;
@@ -571,6 +675,8 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
 
                 WASMComponentExportInstance *inline_export =
                     &new_inst->exports[new_inst->exports_count];
+                inline_export->export_name =
+                    &new_inst->owned_export_names[new_inst->exports_count];
                 inline_export->export_name->exported.simple.name =
                     inst_expression->name;
                 inline_export->export_name->tag =
@@ -591,7 +697,7 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
                                 "ERROR: Export definition only suport module "
                                 "core sort, sort %d not supported",
                                 inst_expression->sort_idx->sort->core_sort);
-                            free(new_inst);
+                            wasm_component_deinstantiate(new_inst);
                             return false;
                         }
                         new_inst->core_modules[new_inst->core_modules_count] =
@@ -655,6 +761,7 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
             }
             comp_instance->component_instances
                 [comp_instance->component_instances_count] = new_inst;
+            comp_instance->component_instances_count++;
             comp_instance
                 ->defined_instances[comp_instance->defined_instances_count] =
                 new_inst;

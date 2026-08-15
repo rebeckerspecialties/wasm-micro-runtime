@@ -1943,21 +1943,61 @@ wasm_runtime_instantiate_internal(WASMModuleCommon *module,
                                   const struct InstantiationArgs2 *args,
                                   char *error_buf, uint32 error_buf_size)
 {
+    WASMAllocationQuotaScope scope;
+    WASMModuleInstanceCommon *module_inst = NULL;
+
+    if (!module
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, module)) {
+        set_error_buf(error_buf, error_buf_size,
+                      "Instantiate module failed, allocation owner mismatch");
+        return NULL;
+    }
+    if ((parent
+         && !wasm_allocation_quota_allocations_share_owner(module, parent))
+        || (exec_env_main
+            && !wasm_allocation_quota_allocations_share_owner(module,
+                                                              exec_env_main))) {
+        set_error_buf(error_buf, error_buf_size,
+                      "Instantiate module failed, related allocation owner "
+                      "mismatch");
+        goto done;
+    }
+
 #if WASM_ENABLE_INTERP != 0
     if (module->module_type == Wasm_Module_Bytecode)
-        return (WASMModuleInstanceCommon *)wasm_instantiate(
+        module_inst = (WASMModuleInstanceCommon *)wasm_instantiate(
             (WASMModule *)module, (WASMModuleInstance *)parent, exec_env_main,
             args, error_buf, error_buf_size);
 #endif
 #if WASM_ENABLE_AOT != 0
     if (module->module_type == Wasm_Module_AoT)
-        return (WASMModuleInstanceCommon *)aot_instantiate(
+        module_inst = (WASMModuleInstanceCommon *)aot_instantiate(
             (AOTModule *)module, (AOTModuleInstance *)parent, exec_env_main,
             args, error_buf, error_buf_size);
 #endif
-    set_error_buf(error_buf, error_buf_size,
-                  "Instantiate module failed, invalid module type");
-    return NULL;
+    if (!module_inst) {
+        if (module->module_type != Wasm_Module_Bytecode
+#if WASM_ENABLE_AOT != 0
+            && module->module_type != Wasm_Module_AoT
+#endif
+        ) {
+            set_error_buf(error_buf, error_buf_size,
+                          "Instantiate module failed, invalid module type");
+        }
+        goto done;
+    }
+    if (!wasm_allocation_quota_allocations_share_owner(module, module_inst)) {
+        LOG_ERROR("Module and instance allocation owners differ");
+        wasm_runtime_deinstantiate_internal(module_inst, parent != NULL);
+        module_inst = NULL;
+        set_error_buf(error_buf, error_buf_size,
+                      "Instantiate module failed, result allocation owner "
+                      "mismatch");
+    }
+
+done:
+    wasm_allocation_quota_scope_leave(&scope);
+    return module_inst;
 }
 
 void
@@ -2049,6 +2089,24 @@ wasm_runtime_instantiation_args_set_memory_page_quota(
     p->memory_page_quota_attachment = attachment;
     p->memory_page_quota_reserve = reserve_callback;
     p->memory_page_quota_release = release_callback;
+}
+
+void
+wasm_runtime_instantiation_args_set_native_fd_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_native_fd_quota_reserve_callback_t reserve_callback,
+    wasm_native_fd_quota_release_callback_t release_callback)
+{
+    if (reserve_callback == NULL || release_callback == NULL) {
+        p->native_fd_quota_attachment = NULL;
+        p->native_fd_quota_reserve = NULL;
+        p->native_fd_quota_release = NULL;
+        return;
+    }
+
+    p->native_fd_quota_attachment = attachment;
+    p->native_fd_quota_reserve = reserve_callback;
+    p->native_fd_quota_release = release_callback;
 }
 
 void
@@ -2149,18 +2207,30 @@ void
 wasm_runtime_deinstantiate_internal(WASMModuleInstanceCommon *module_inst,
                                     bool is_sub_inst)
 {
+    WASMAllocationQuotaScope scope;
+
+    if (!module_inst
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             module_inst)) {
+        LOG_ERROR("Module deinstantiation rejected by allocation owner");
+        return;
+    }
+
 #if WASM_ENABLE_INTERP != 0
     if (module_inst->module_type == Wasm_Module_Bytecode) {
         wasm_deinstantiate((WASMModuleInstance *)module_inst, is_sub_inst);
-        return;
+        goto done;
     }
 #endif
 #if WASM_ENABLE_AOT != 0
     if (module_inst->module_type == Wasm_Module_AoT) {
         aot_deinstantiate((AOTModuleInstance *)module_inst, is_sub_inst);
-        return;
+        goto done;
     }
 #endif
+
+done:
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 bool
@@ -3076,20 +3146,44 @@ wasm_runtime_finalize_call_function(WASMExecEnv *exec_env,
 }
 #endif
 
+static bool
+wasm_runtime_call_scope_enter(WASMAllocationQuotaBorrowedScope *scope,
+                              WASMExecEnv *exec_env)
+{
+    if (!exec_env
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            scope, exec_env)) {
+        LOG_ERROR("Wasm call rejected by allocation owner");
+        return false;
+    }
+    if (!exec_env->module_inst
+        || !wasm_allocation_quota_allocations_share_owner(
+            exec_env, exec_env->module_inst)) {
+        LOG_ERROR("Exec env and module instance allocation owners differ");
+        wasm_allocation_quota_borrowed_scope_leave(scope);
+        return false;
+    }
+    return true;
+}
+
 bool
 wasm_runtime_call_wasm(WASMExecEnv *exec_env,
                        WASMFunctionInstanceCommon *function, uint32 argc,
                        uint32 argv[])
 {
+    WASMAllocationQuotaBorrowedScope scope;
     bool ret = false;
     uint32 *new_argv = NULL, param_argc;
 #if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
     uint32 result_argc = 0;
 #endif
 
+    if (!function || !wasm_runtime_call_scope_enter(&scope, exec_env))
+        return false;
+
     if (!wasm_runtime_exec_env_check(exec_env)) {
         LOG_ERROR("Invalid exec env stack info.");
-        return false;
+        goto done;
     }
 
 #if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
@@ -3098,7 +3192,7 @@ wasm_runtime_call_wasm(WASMExecEnv *exec_env,
                                             &result_argc)) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "the arguments conversion is failed");
-        return false;
+        goto done;
     }
 #else
     new_argv = argv;
@@ -3119,7 +3213,7 @@ wasm_runtime_call_wasm(WASMExecEnv *exec_env,
         if (new_argv != argv) {
             wasm_runtime_free(new_argv);
         }
-        return false;
+        goto done;
     }
 
 #if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
@@ -3127,10 +3221,13 @@ wasm_runtime_call_wasm(WASMExecEnv *exec_env,
                                              result_argc, argv)) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "the result conversion is failed");
-        return false;
+        ret = false;
+        goto done;
     }
 #endif
 
+done:
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
     return ret;
 }
 
@@ -3315,12 +3412,15 @@ parse_uint32_array_to_results(WASMFuncType *type, uint32 *argv,
     }
 }
 
-bool
-wasm_runtime_call_wasm_a(WASMExecEnv *exec_env,
-                         WASMFunctionInstanceCommon *function,
-                         uint32 num_results, wasm_val_t results[],
-                         uint32 num_args, wasm_val_t args[])
+static bool
+wasm_runtime_call_wasm_a_internal(WASMExecEnv *exec_env,
+                                  WASMFunctionInstanceCommon *function,
+                                  uint32 num_results, wasm_val_t results[],
+                                  uint32 num_args, wasm_val_t args[],
+                                  WASMCallPreEntryCallback pre_entry_callback,
+                                  void *pre_entry_attachment)
 {
+    WASMAllocationQuotaBorrowedScope scope;
     uint32 argc, argv_buf[16] = { 0 }, *argv = argv_buf, cell_num, module_type;
 #if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
     uint32 i, param_size_in_double_world = 0, result_size_in_double_world = 0;
@@ -3328,6 +3428,9 @@ wasm_runtime_call_wasm_a(WASMExecEnv *exec_env,
     uint64 total_size;
     WASMFuncType *type;
     bool ret = false;
+
+    if (!function || !wasm_runtime_call_scope_enter(&scope, exec_env))
+        return false;
 
     module_type = exec_env->module_inst->module_type;
     type = wasm_runtime_get_function_type(function, module_type);
@@ -3377,7 +3480,45 @@ wasm_runtime_call_wasm_a(WASMExecEnv *exec_env,
     }
 
     parse_args_to_uint32_array(type, args, argv);
-    if (!(ret = wasm_runtime_call_wasm(exec_env, function, argc, argv)))
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+    if (pre_entry_callback) {
+        if (exec_env->call_pre_entry_callback) {
+            wasm_runtime_set_exception(exec_env->module_inst,
+                                       "nested pre-entry callback");
+            goto fail2;
+        }
+        exec_env->call_pre_entry_callback = pre_entry_callback;
+        exec_env->call_pre_entry_attachment = pre_entry_attachment;
+    }
+#else
+    bh_assert(!pre_entry_callback && !pre_entry_attachment);
+#endif
+
+    ret = wasm_runtime_call_wasm(exec_env, function, argc, argv);
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+    if (pre_entry_callback) {
+        /* The interpreter clears these before invoking the callback. If a
+           pre-entry failure bypassed dispatch, clear the pending callback
+           here so its stack attachment cannot escape this synchronous call. */
+        if (exec_env->call_pre_entry_callback) {
+            exec_env->call_pre_entry_callback = NULL;
+            exec_env->call_pre_entry_attachment = NULL;
+            ret = false;
+            if (!wasm_runtime_get_exception(exec_env->module_inst)) {
+                wasm_runtime_set_exception(
+                    exec_env->module_inst,
+                    wasm_exec_env_call_pre_entry_is_terminated(exec_env)
+                        ? "terminated before function entry"
+                        : "function returned before pre-entry callback");
+            }
+        }
+    }
+#endif
+
+    if (!ret)
         goto fail2;
 
     parse_uint32_array_to_results(type, argv, results);
@@ -3386,8 +3527,35 @@ fail2:
     if (argv != argv_buf)
         wasm_runtime_free(argv);
 fail1:
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
     return ret;
 }
+
+bool
+wasm_runtime_call_wasm_a(WASMExecEnv *exec_env,
+                         WASMFunctionInstanceCommon *function,
+                         uint32 num_results, wasm_val_t results[],
+                         uint32 num_args, wasm_val_t args[])
+{
+    return wasm_runtime_call_wasm_a_internal(
+        exec_env, function, num_results, results, num_args, args, NULL, NULL);
+}
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+bool
+wasm_runtime_call_wasm_a_with_pre_entry(
+    WASMExecEnv *exec_env, WASMFunctionInstanceCommon *function,
+    uint32 num_results, wasm_val_t results[], uint32 num_args,
+    wasm_val_t args[], WASMCallPreEntryCallback callback, void *attachment)
+{
+    if (!callback)
+        return false;
+    return wasm_runtime_call_wasm_a_internal(exec_env, function, num_results,
+                                             results, num_args, args, callback,
+                                             attachment);
+}
+#endif
 
 bool
 wasm_runtime_call_wasm_v(WASMExecEnv *exec_env,
@@ -3395,12 +3563,16 @@ wasm_runtime_call_wasm_v(WASMExecEnv *exec_env,
                          uint32 num_results, wasm_val_t results[],
                          uint32 num_args, ...)
 {
+    WASMAllocationQuotaBorrowedScope scope;
     wasm_val_t args_buf[8] = { 0 }, *args = args_buf;
     WASMFuncType *type = NULL;
     bool ret = false;
     uint64 total_size;
     uint32 i = 0, module_type;
     va_list vargs;
+
+    if (!function || !wasm_runtime_call_scope_enter(&scope, exec_env))
+        return false;
 
     module_type = exec_env->module_inst->module_type;
     type = wasm_runtime_get_function_type(function, module_type);
@@ -3474,6 +3646,7 @@ wasm_runtime_call_wasm_v(WASMExecEnv *exec_env,
         wasm_runtime_free(args);
 
 fail1:
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
     return ret;
 }
 
@@ -5318,6 +5491,26 @@ wasm_runtime_unregister_natives(const char *module_name,
     return wasm_native_unregister_natives(module_name, native_symbols);
 }
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+static bool
+wasm_runtime_consume_call_pre_entry(WASMExecEnv *exec_env)
+{
+    if (!wasm_exec_env_consume_call_pre_entry(exec_env)) {
+        if (exec_env && exec_env->module_inst
+            && !wasm_runtime_get_exception(exec_env->module_inst)) {
+            wasm_runtime_set_exception(
+                exec_env->module_inst,
+                wasm_exec_env_call_pre_entry_is_terminated(exec_env)
+                    ? "terminated before function entry"
+                    : "component: pre-entry callback failed");
+        }
+        return false;
+    }
+    return true;
+}
+#endif
+
 bool
 wasm_runtime_invoke_native_raw(WASMExecEnv *exec_env, void *func_ptr,
                                const WASMFuncType *func_type,
@@ -5489,6 +5682,11 @@ wasm_runtime_invoke_native_raw(WASMExecEnv *exec_env, void *func_ptr,
         }
     }
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+    if (!wasm_runtime_consume_call_pre_entry(exec_env))
+        goto fail;
+#endif
     exec_env->attachment = attachment;
     invoke_native_raw(exec_env, argv1);
     exec_env->attachment = NULL;
@@ -6049,6 +6247,11 @@ wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
             stacks[n_stacks++] = *(uint32 *)argv_src++;
     }
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+    if (!wasm_runtime_consume_call_pre_entry(exec_env))
+        goto fail;
+#endif
     exec_env->attachment = attachment;
     if (func_type->result_count == 0) {
         invokeNative_Void(func_ptr, argv1, n_stacks);
@@ -6308,6 +6511,11 @@ wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
     word_copy(argv1 + j, argv, ext_ret_count);
 
     argc1 = j + ext_ret_count;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+    if (!wasm_runtime_consume_call_pre_entry(exec_env))
+        goto fail;
+#endif
     exec_env->attachment = attachment;
     if (func_type->result_count == 0) {
         invokeNative_Void(func_ptr, argv1, argc1);
@@ -6728,6 +6936,11 @@ wasm_runtime_invoke_native(WASMExecEnv *exec_env, void *func_ptr,
         argv_src += 2;
     }
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+    if (!wasm_runtime_consume_call_pre_entry(exec_env))
+        goto fail;
+#endif
     exec_env->attachment = attachment;
     if (result_count == 0) {
         invokeNative_Void(func_ptr, argv1, n_stacks);
@@ -6825,11 +7038,15 @@ bool
 wasm_runtime_call_indirect(WASMExecEnv *exec_env, uint32 element_index,
                            uint32 argc, uint32 argv[])
 {
+    WASMAllocationQuotaBorrowedScope scope;
     bool ret = false;
+
+    if (!wasm_runtime_call_scope_enter(&scope, exec_env))
+        return false;
 
     if (!wasm_runtime_exec_env_check(exec_env)) {
         LOG_ERROR("Invalid exec env stack info.");
-        return false;
+        goto done;
     }
 
     /* this function is called from native code, so exec_env->handle and
@@ -6845,6 +7062,8 @@ wasm_runtime_call_indirect(WASMExecEnv *exec_env, uint32 element_index,
         ret = aot_call_indirect(exec_env, 0, element_index, argc, argv);
 #endif
 
+done:
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
     return ret;
 }
 
@@ -6914,15 +7133,43 @@ wasm_runtime_destroy_spawned_exec_env(WASMExecEnv *exec_env)
 static void *
 wasm_runtime_thread_routine(void *arg)
 {
+    WASMAllocationQuotaThreadLease lease = { 0 };
+    WASMAllocationQuotaReservation native_stack_reservation = { 0 };
     WASMThreadArg *thread_arg = (WASMThreadArg *)arg;
     void *ret;
 
     bh_assert(thread_arg->new_exec_env);
+    if (!wasm_allocation_quota_thread_lease_enter_for_allocation(
+            &lease, thread_arg->new_exec_env)
+        || !wasm_allocation_quota_allocations_share_owner(
+            thread_arg, thread_arg->new_exec_env)) {
+        LOG_ERROR("Spawned runtime thread rejected by allocation owner");
+        thread_arg->new_exec_env->runtime_thread_arg = NULL;
+        wasm_exec_env_take_native_thread_stack(thread_arg->new_exec_env,
+                                               &native_stack_reservation);
+        wasm_runtime_destroy_spawned_exec_env(thread_arg->new_exec_env);
+        wasm_runtime_free(thread_arg);
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+        os_thread_signal_destroy();
+#endif
+        wasm_allocation_quota_reservation_release(&native_stack_reservation);
+        wasm_allocation_quota_thread_lease_leave(&lease);
+        return NULL;
+    }
+
     ret = thread_arg->callback(thread_arg->new_exec_env, thread_arg->arg);
 
+    thread_arg->new_exec_env->runtime_thread_arg = NULL;
+    wasm_exec_env_take_native_thread_stack(thread_arg->new_exec_env,
+                                           &native_stack_reservation);
     wasm_runtime_destroy_spawned_exec_env(thread_arg->new_exec_env);
     wasm_runtime_free(thread_arg);
 
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    os_thread_signal_destroy();
+#endif
+    wasm_allocation_quota_reservation_release(&native_stack_reservation);
+    wasm_allocation_quota_thread_lease_leave(&lease);
     os_thread_exit(ret);
     return ret;
 }
@@ -6931,31 +7178,54 @@ int32
 wasm_runtime_spawn_thread(WASMExecEnv *exec_env, wasm_thread_t *tid,
                           wasm_thread_callback_t callback, void *arg)
 {
-    WASMExecEnv *new_exec_env = wasm_runtime_spawn_exec_env(exec_env);
-    WASMThreadArg *thread_arg;
+    WASMAllocationQuotaScope scope;
+    WASMExecEnv *new_exec_env;
+    WASMThreadArg *thread_arg = NULL;
     int32 ret;
 
-    if (!new_exec_env)
+    if (!exec_env || !tid || !callback
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             exec_env)) {
         return -1;
+    }
+
+    new_exec_env = wasm_runtime_spawn_exec_env(exec_env);
+    if (!new_exec_env)
+        goto fail;
 
     if (!(thread_arg = wasm_runtime_malloc(sizeof(WASMThreadArg)))) {
         wasm_runtime_destroy_spawned_exec_env(new_exec_env);
-        return -1;
+        goto fail;
     }
 
     thread_arg->new_exec_env = new_exec_env;
     thread_arg->callback = callback;
     thread_arg->arg = arg;
 
+    if (!wasm_exec_env_reserve_native_thread_stack(
+            new_exec_env, APP_THREAD_STACK_SIZE_DEFAULT)) {
+        wasm_runtime_destroy_spawned_exec_env(new_exec_env);
+        wasm_runtime_free(thread_arg);
+        goto fail;
+    }
+    new_exec_env->runtime_thread_arg = thread_arg;
+
     ret = os_thread_create((korp_tid *)tid, wasm_runtime_thread_routine,
                            thread_arg, APP_THREAD_STACK_SIZE_DEFAULT);
 
     if (ret != 0) {
+        new_exec_env->runtime_thread_arg = NULL;
+        wasm_exec_env_release_native_thread_stack(new_exec_env);
         wasm_runtime_destroy_spawned_exec_env(new_exec_env);
         wasm_runtime_free(thread_arg);
     }
 
+    wasm_allocation_quota_scope_leave(&scope);
     return ret;
+
+fail:
+    wasm_allocation_quota_scope_leave(&scope);
+    return -1;
 }
 
 int32
@@ -6983,7 +7253,37 @@ typedef struct ExternRefMapNode {
     bool marked;
     /* cleanup function called when the externref is freed */
     void (*cleanup)(void *);
+    /* Intrusive link used after removal from the map. Cleanup callbacks run
+       without externref_lock held so they may safely re-enter this API. */
+    struct ExternRefMapNode *cleanup_next;
 } ExternRefMapNode;
+
+typedef struct ExternRefDetachList {
+    ExternRefMapNode *head;
+    ExternRefMapNode *tail;
+} ExternRefDetachList;
+
+typedef struct ExternRefTeardownMarker {
+    WASMModuleInstanceCommon *module_inst;
+    struct ExternRefTeardownMarker *next;
+} ExternRefTeardownMarker;
+
+static ExternRefTeardownMarker *externref_teardown_markers;
+
+/* Caller holds externref_lock. */
+static bool
+externref_module_is_tearing_down_locked(
+    const WASMModuleInstanceCommon *module_inst)
+{
+    ExternRefTeardownMarker *marker = externref_teardown_markers;
+
+    while (marker) {
+        if (marker->module_inst == module_inst)
+            return true;
+        marker = marker->next;
+    }
+    return false;
+}
 
 static uint32
 wasm_externref_hash(const void *key)
@@ -7003,29 +7303,43 @@ wasm_externref_equal(void *key1, void *key2)
 static bool
 wasm_externref_map_init()
 {
+    WASMAllocationQuotaToken *previous;
+    WASMAllocationQuotaToken *restored;
+
     if (os_mutex_init(&externref_lock) != 0)
         return false;
 
-    if (!(externref_map = bh_hash_map_create(32, false, wasm_externref_hash,
-                                             wasm_externref_equal, NULL,
-                                             wasm_runtime_free))) {
+    /* The process-global map is a host root. Its element allocator observes
+       the active owner at insertion time, while the map storage itself must
+       never retain the owner that happened to initialize the runtime. */
+    previous = wasm_allocation_quota_set_current(NULL);
+    externref_map = bh_hash_map_create_with_allocator(
+        32, false, wasm_externref_hash, wasm_externref_equal, NULL,
+        wasm_runtime_free, wasm_runtime_malloc, wasm_runtime_free);
+    restored = wasm_allocation_quota_set_current(previous);
+    bh_assert(restored == NULL);
+    (void)restored;
+    if (!externref_map) {
         os_mutex_destroy(&externref_lock);
         return false;
     }
 
     externref_global_id = 1;
+    externref_teardown_markers = NULL;
     return true;
 }
 
 static void
 wasm_externref_map_destroy()
 {
+    bh_assert(externref_teardown_markers == NULL);
     bh_hash_map_destroy(externref_map);
     os_mutex_destroy(&externref_lock);
 }
 
 typedef struct LookupExtObj_UserData {
     ExternRefMapNode node;
+    ExternRefDetachList detached;
     bool found;
     uint32 externref_idx;
 } LookupExtObj_UserData;
@@ -7039,20 +7353,70 @@ lookup_extobj_callback(void *key, void *value, void *user_data)
         (LookupExtObj_UserData *)user_data;
 
     if (node->extern_obj == user_data_lookup->node.extern_obj
-        && node->module_inst == user_data_lookup->node.module_inst) {
+        && node->module_inst == user_data_lookup->node.module_inst
+        && wasm_allocation_quota_allocation_matches_current(node)
+        && wasm_allocation_quota_allocations_share_owner(
+            node, user_data_lookup->node.module_inst)) {
         user_data_lookup->found = true;
         user_data_lookup->externref_idx = externref_idx;
     }
 }
 
-static void
-delete_externref(void *key, ExternRefMapNode *node)
+static bool
+detach_externref_locked(void *key, ExternRefMapNode *node,
+                        ExternRefDetachList *detached)
 {
-    bh_hash_map_remove(externref_map, key, NULL, NULL);
-    if (node->cleanup) {
-        (*node->cleanup)(node->extern_obj);
+    void *removed_node = NULL;
+
+    if (!node || !detached
+        || !wasm_allocation_quota_allocation_matches_current(node)) {
+        LOG_ERROR("Externref deletion rejected by allocation owner");
+        return false;
     }
-    wasm_runtime_free(node);
+    if (!node->module_inst
+        || !wasm_allocation_quota_allocations_share_owner(node,
+                                                          node->module_inst)) {
+        LOG_ERROR("Externref and module instance allocation owners differ");
+        return false;
+    }
+
+    if (!bh_hash_map_remove(externref_map, key, NULL, &removed_node)
+        || removed_node != node) {
+        return false;
+    }
+
+    node->cleanup_next = NULL;
+    if (detached->tail)
+        detached->tail->cleanup_next = node;
+    else
+        detached->head = node;
+    detached->tail = node;
+    return true;
+}
+
+static void
+destroy_detached_externrefs(ExternRefDetachList *detached)
+{
+    ExternRefMapNode *node;
+
+    while (detached && (node = detached->head)) {
+        WASMAllocationQuotaScope scope;
+
+        detached->head = node->cleanup_next;
+        if (!detached->head)
+            detached->tail = NULL;
+        node->cleanup_next = NULL;
+
+        if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, node)) {
+            LOG_ERROR("Externref cleanup rejected by allocation owner");
+            continue;
+        }
+
+        if (node->cleanup)
+            (*node->cleanup)(node->extern_obj);
+        wasm_runtime_free(node);
+        wasm_allocation_quota_scope_leave(&scope);
+    }
 }
 
 static void
@@ -7063,17 +7427,27 @@ delete_extobj_callback(void *key, void *value, void *user_data)
         (LookupExtObj_UserData *)user_data;
 
     if (node->extern_obj == lookup_user_data->node.extern_obj
-        && node->module_inst == lookup_user_data->node.module_inst) {
-        lookup_user_data->found = true;
-        delete_externref(key, node);
+        && node->module_inst == lookup_user_data->node.module_inst
+        && wasm_allocation_quota_allocation_matches_current(node)
+        && wasm_allocation_quota_allocations_share_owner(
+            node, lookup_user_data->node.module_inst)) {
+        lookup_user_data->found =
+            detach_externref_locked(key, node, &lookup_user_data->detached);
     }
 }
 
 bool
 wasm_externref_objdel(WASMModuleInstanceCommon *module_inst, void *extern_obj)
 {
+    WASMAllocationQuotaBorrowedScope scope;
     LookupExtObj_UserData lookup_user_data = { 0 };
     bool ok = false;
+
+    if (!module_inst
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &scope, module_inst)) {
+        return false;
+    }
 
     /* in a wrapper, extern_obj could be any value */
     lookup_user_data.node.extern_obj = extern_obj;
@@ -7081,6 +7455,11 @@ wasm_externref_objdel(WASMModuleInstanceCommon *module_inst, void *extern_obj)
     lookup_user_data.found = false;
 
     os_mutex_lock(&externref_lock);
+    if (externref_module_is_tearing_down_locked(module_inst)) {
+        os_mutex_unlock(&externref_lock);
+        wasm_allocation_quota_borrowed_scope_leave(&scope);
+        return false;
+    }
     /* Lookup hashmap firstly */
     bh_hash_map_traverse(externref_map, delete_extobj_callback,
                          (void *)&lookup_user_data);
@@ -7089,6 +7468,8 @@ wasm_externref_objdel(WASMModuleInstanceCommon *module_inst, void *extern_obj)
     }
     os_mutex_unlock(&externref_lock);
 
+    destroy_detached_externrefs(&lookup_user_data.detached);
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
     return ok;
 }
 
@@ -7096,9 +7477,15 @@ bool
 wasm_externref_set_cleanup(WASMModuleInstanceCommon *module_inst,
                            void *extern_obj, void (*extern_obj_cleanup)(void *))
 {
-
+    WASMAllocationQuotaBorrowedScope scope;
     LookupExtObj_UserData lookup_user_data = { 0 };
     bool ok = false;
+
+    if (!module_inst
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &scope, module_inst)) {
+        return false;
+    }
 
     /* in a wrapper, extern_obj could be any value */
     lookup_user_data.node.extern_obj = extern_obj;
@@ -7106,18 +7493,27 @@ wasm_externref_set_cleanup(WASMModuleInstanceCommon *module_inst,
     lookup_user_data.found = false;
 
     os_mutex_lock(&externref_lock);
+    if (externref_module_is_tearing_down_locked(module_inst)) {
+        os_mutex_unlock(&externref_lock);
+        wasm_allocation_quota_borrowed_scope_leave(&scope);
+        return false;
+    }
     /* Lookup hashmap firstly */
     bh_hash_map_traverse(externref_map, lookup_extobj_callback,
                          (void *)&lookup_user_data);
     if (lookup_user_data.found) {
         void *key = (void *)(uintptr_t)lookup_user_data.externref_idx;
         ExternRefMapNode *node = bh_hash_map_find(externref_map, key);
-        bh_assert(node);
-        node->cleanup = extern_obj_cleanup;
-        ok = true;
+        if (node && wasm_allocation_quota_allocation_matches_current(node)
+            && wasm_allocation_quota_allocations_share_owner(node,
+                                                             module_inst)) {
+            node->cleanup = extern_obj_cleanup;
+            ok = true;
+        }
     }
     os_mutex_unlock(&externref_lock);
 
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
     return ok;
 }
 
@@ -7125,9 +7521,16 @@ bool
 wasm_externref_obj2ref(WASMModuleInstanceCommon *module_inst, void *extern_obj,
                        uint32 *p_externref_idx)
 {
+    WASMAllocationQuotaBorrowedScope scope;
     LookupExtObj_UserData lookup_user_data = { 0 };
     ExternRefMapNode *node;
     uint32 externref_idx;
+
+    if (!module_inst || !p_externref_idx
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &scope, module_inst)) {
+        return false;
+    }
 
     /*
      * to catch a parameter from `wasm_application_execute_func`,
@@ -7139,6 +7542,7 @@ wasm_externref_obj2ref(WASMModuleInstanceCommon *module_inst, void *extern_obj,
     if ((uint64)-1LL == (uintptr_t)extern_obj) {
 #endif
         *p_externref_idx = NULL_REF;
+        wasm_allocation_quota_borrowed_scope_leave(&scope);
         return true;
     }
 
@@ -7149,12 +7553,18 @@ wasm_externref_obj2ref(WASMModuleInstanceCommon *module_inst, void *extern_obj,
 
     os_mutex_lock(&externref_lock);
 
+    /* A cleanup callback must not repopulate the process-global map with a
+       module instance that is about to be freed. */
+    if (externref_module_is_tearing_down_locked(module_inst))
+        goto fail1;
+
     /* Lookup hashmap firstly */
     bh_hash_map_traverse(externref_map, lookup_extobj_callback,
                          (void *)&lookup_user_data);
     if (lookup_user_data.found) {
         *p_externref_idx = lookup_user_data.externref_idx;
         os_mutex_unlock(&externref_lock);
+        wasm_allocation_quota_borrowed_scope_leave(&scope);
         return true;
     }
 
@@ -7182,11 +7592,13 @@ wasm_externref_obj2ref(WASMModuleInstanceCommon *module_inst, void *extern_obj,
     externref_global_id++;
     *p_externref_idx = externref_idx;
     os_mutex_unlock(&externref_lock);
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
     return true;
 fail2:
     wasm_runtime_free(node);
 fail1:
     os_mutex_unlock(&externref_lock);
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
     return false;
 }
 
@@ -7194,6 +7606,10 @@ bool
 wasm_externref_ref2obj(uint32 externref_idx, void **p_extern_obj)
 {
     ExternRefMapNode *node;
+    bool ok = false;
+
+    if (!p_extern_obj)
+        return false;
 
     /* catch a `ref.null` variable */
     if (externref_idx == NULL_REF) {
@@ -7203,25 +7619,51 @@ wasm_externref_ref2obj(uint32 externref_idx, void **p_extern_obj)
 
     os_mutex_lock(&externref_lock);
     node = bh_hash_map_find(externref_map, (void *)(uintptr_t)externref_idx);
+    if (node && wasm_allocation_quota_allocation_matches_current(node)) {
+        *p_extern_obj = node->extern_obj;
+        ok = true;
+    }
     os_mutex_unlock(&externref_lock);
-
-    if (!node)
-        return false;
-
-    *p_extern_obj = node->extern_obj;
-    return true;
+    return ok;
 }
+
+bool
+wasm_externref_ref2obj_access(uint32 externref_idx,
+                              wasm_externref_obj_access_t access,
+                              void *user_data)
+{
+    ExternRefMapNode *node;
+    bool ok = false;
+
+    if (!access || externref_idx == NULL_REF) {
+        return false;
+    }
+
+    os_mutex_lock(&externref_lock);
+    node = bh_hash_map_find(externref_map, (void *)(uintptr_t)externref_idx);
+    if (node && wasm_allocation_quota_allocation_matches_current(node)) {
+        /* The accessor must not re-enter the externref API.  Holding the lock
+         * makes detach/cleanup wait until an owned copy has been made. */
+        ok = access(node->extern_obj, user_data);
+    }
+    os_mutex_unlock(&externref_lock);
+    return ok;
+}
+
+typedef struct ReclaimExtObj_UserData {
+    WASMModuleInstanceCommon *module_inst;
+    ExternRefDetachList detached;
+} ReclaimExtObj_UserData;
 
 static void
 reclaim_extobj_callback(void *key, void *value, void *user_data)
 {
     ExternRefMapNode *node = (ExternRefMapNode *)value;
-    WASMModuleInstanceCommon *module_inst =
-        (WASMModuleInstanceCommon *)user_data;
+    ReclaimExtObj_UserData *reclaim = (ReclaimExtObj_UserData *)user_data;
 
-    if (node->module_inst == module_inst) {
+    if (node->module_inst == reclaim->module_inst) {
         if (!node->marked && !node->retained) {
-            delete_externref(key, node);
+            (void)detach_externref_locked(key, node, &reclaim->detached);
         }
         else {
             node->marked = false;
@@ -7237,7 +7679,7 @@ mark_externref(uint32 externref_idx)
     if (externref_idx != NULL_REF) {
         node =
             bh_hash_map_find(externref_map, (void *)(uintptr_t)externref_idx);
-        if (node) {
+        if (node && wasm_allocation_quota_allocation_matches_current(node)) {
             node->marked = true;
         }
     }
@@ -7314,6 +7756,16 @@ aot_mark_all_externrefs(AOTModuleInstance *module_inst)
 void
 wasm_externref_reclaim(WASMModuleInstanceCommon *module_inst)
 {
+    WASMAllocationQuotaScope scope;
+    ReclaimExtObj_UserData reclaim = { 0 };
+
+    if (!module_inst
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             module_inst)) {
+        return;
+    }
+
+    reclaim.module_inst = module_inst;
     os_mutex_lock(&externref_lock);
 #if WASM_ENABLE_INTERP != 0
     if (module_inst->module_type == Wasm_Module_Bytecode)
@@ -7325,29 +7777,69 @@ wasm_externref_reclaim(WASMModuleInstanceCommon *module_inst)
 #endif
 
     bh_hash_map_traverse(externref_map, reclaim_extobj_callback,
-                         (void *)module_inst);
+                         (void *)&reclaim);
     os_mutex_unlock(&externref_lock);
+    destroy_detached_externrefs(&reclaim.detached);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 static void
 cleanup_extobj_callback(void *key, void *value, void *user_data)
 {
     ExternRefMapNode *node = (ExternRefMapNode *)value;
-    WASMModuleInstanceCommon *module_inst =
-        (WASMModuleInstanceCommon *)user_data;
+    ReclaimExtObj_UserData *cleanup = (ReclaimExtObj_UserData *)user_data;
 
-    if (node->module_inst == module_inst) {
-        delete_externref(key, node);
-    }
+    if (node->module_inst == cleanup->module_inst)
+        (void)detach_externref_locked(key, node, &cleanup->detached);
 }
 
 void
 wasm_externref_cleanup(WASMModuleInstanceCommon *module_inst)
 {
+    WASMAllocationQuotaScope scope;
+    ReclaimExtObj_UserData cleanup = { 0 };
+    ExternRefTeardownMarker marker;
+    ExternRefTeardownMarker **marker_link;
+    bool detached_any;
+
+    if (!module_inst
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             module_inst)) {
+        return;
+    }
+
+    marker.module_inst = module_inst;
     os_mutex_lock(&externref_lock);
-    bh_hash_map_traverse(externref_map, cleanup_extobj_callback,
-                         (void *)module_inst);
+    if (externref_module_is_tearing_down_locked(module_inst)) {
+        os_mutex_unlock(&externref_lock);
+        wasm_allocation_quota_scope_leave(&scope);
+        return;
+    }
+    marker.next = externref_teardown_markers;
+    externref_teardown_markers = &marker;
     os_mutex_unlock(&externref_lock);
+
+    cleanup.module_inst = module_inst;
+    do {
+        cleanup.detached.head = NULL;
+        cleanup.detached.tail = NULL;
+        os_mutex_lock(&externref_lock);
+        bh_hash_map_traverse(externref_map, cleanup_extobj_callback,
+                             (void *)&cleanup);
+        os_mutex_unlock(&externref_lock);
+        detached_any = cleanup.detached.head != NULL;
+        destroy_detached_externrefs(&cleanup.detached);
+    } while (detached_any);
+
+    os_mutex_lock(&externref_lock);
+    marker_link = &externref_teardown_markers;
+    while (*marker_link && *marker_link != &marker)
+        marker_link = &(*marker_link)->next;
+    bh_assert(*marker_link == &marker);
+    if (*marker_link == &marker)
+        *marker_link = marker.next;
+    os_mutex_unlock(&externref_lock);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 bool
@@ -7361,6 +7853,10 @@ wasm_externref_retain(uint32 externref_idx)
         node =
             bh_hash_map_find(externref_map, (void *)(uintptr_t)externref_idx);
         if (node) {
+            if (!wasm_allocation_quota_allocation_matches_current(node)) {
+                os_mutex_unlock(&externref_lock);
+                return false;
+            }
             node->retained = true;
             os_mutex_unlock(&externref_lock);
             return true;
@@ -7810,17 +8306,28 @@ results_to_argv(WASMModuleInstanceCommon *module_inst, uint32 *out_argv,
     return true;
 }
 
-bool
-wasm_runtime_invoke_c_api_native(WASMModuleInstanceCommon *module_inst,
-                                 void *func_ptr, WASMFuncType *func_type,
-                                 uint32 argc, uint32 *argv, bool with_env,
-                                 void *wasm_c_api_env)
+static bool
+wasm_runtime_invoke_c_api_native_internal(WASMExecEnv *pre_entry_exec_env,
+                                          WASMModuleInstanceCommon *module_inst,
+                                          void *func_ptr,
+                                          WASMFuncType *func_type, uint32 argc,
+                                          uint32 *argv, bool with_env,
+                                          void *wasm_c_api_env)
 {
     wasm_val_t params_buf[16] = { 0 }, results_buf[4] = { 0 };
     wasm_val_t *params = params_buf, *results = results_buf;
     wasm_trap_t *trap = NULL;
     bool ret = false;
+    void *callback_env = NULL;
     wasm_val_vec_t params_vec = { 0 }, results_vec = { 0 };
+
+    if (with_env
+        && !wasm_c_api_callback_payload_get_env(wasm_c_api_env,
+                                                &callback_env)) {
+        wasm_runtime_set_exception(module_inst,
+                                   "invalid wasm-c-api callback environment");
+        return false;
+    }
 
     if (func_type->param_count > 16) {
         if (!(params =
@@ -7853,6 +8360,16 @@ wasm_runtime_invoke_c_api_native(WASMModuleInstanceCommon *module_inst,
     results_vec.num_elems = 0;
     results_vec.size = func_type->result_count;
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+    if (pre_entry_exec_env
+        && !wasm_runtime_consume_call_pre_entry(pre_entry_exec_env)) {
+        goto fail;
+    }
+#else
+    bh_assert(!pre_entry_exec_env);
+#endif
+
     if (!with_env) {
         wasm_func_callback_t callback = (wasm_func_callback_t)func_ptr;
         trap = callback(&params_vec, &results_vec);
@@ -7860,7 +8377,7 @@ wasm_runtime_invoke_c_api_native(WASMModuleInstanceCommon *module_inst,
     else {
         wasm_func_callback_with_env_t callback =
             (wasm_func_callback_with_env_t)func_ptr;
-        trap = callback(wasm_c_api_env, &params_vec, &results_vec);
+        trap = callback(callback_env, &params_vec, &results_vec);
     }
 
     if (trap) {
@@ -7898,6 +8415,33 @@ fail:
 }
 
 bool
+wasm_runtime_invoke_c_api_native(WASMModuleInstanceCommon *module_inst,
+                                 void *func_ptr, WASMFuncType *func_type,
+                                 uint32 argc, uint32 *argv, bool with_env,
+                                 void *wasm_c_api_env)
+{
+    return wasm_runtime_invoke_c_api_native_internal(
+        NULL, module_inst, func_ptr, func_type, argc, argv, with_env,
+        wasm_c_api_env);
+}
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+bool
+wasm_runtime_invoke_c_api_native_with_pre_entry(
+    WASMExecEnv *exec_env, WASMModuleInstanceCommon *module_inst,
+    void *func_ptr, WASMFuncType *func_type, uint32 argc, uint32 *argv,
+    bool with_env, void *wasm_c_api_env)
+{
+    if (!exec_env)
+        return false;
+    return wasm_runtime_invoke_c_api_native_internal(
+        exec_env, module_inst, func_ptr, func_type, argc, argv, with_env,
+        wasm_c_api_env);
+}
+#endif
+
+bool
 wasm_runtime_quick_invoke_c_api_native(WASMModuleInstanceCommon *inst_comm,
                                        CApiFuncImport *c_api_import,
                                        wasm_val_t *params, uint32 param_count,
@@ -7928,9 +8472,16 @@ wasm_runtime_quick_invoke_c_api_native(WASMModuleInstanceCommon *inst_comm,
         trap = callback(&params_vec, &results_vec);
     }
     else {
-        void *wasm_c_api_env = c_api_import->env_arg;
+        void *wasm_c_api_env = NULL;
         wasm_func_callback_with_env_t callback =
             (wasm_func_callback_with_env_t)func_ptr;
+        if (!wasm_c_api_callback_payload_get_env(c_api_import->env_arg,
+                                                 &wasm_c_api_env)) {
+            wasm_set_exception(module_inst,
+                               "invalid wasm-c-api callback environment");
+            ret = false;
+            goto fail;
+        }
         trap = callback(wasm_c_api_env, &params_vec, &results_vec);
     }
 

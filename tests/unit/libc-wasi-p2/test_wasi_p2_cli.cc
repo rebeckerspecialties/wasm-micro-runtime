@@ -74,10 +74,10 @@ TEST_F(WasiP2CliTest, Environment_GetEnvironment) {
         if (strcmp(env[i].key, "VAR3") == 0 && strcmp(env[i].value, "") == 0) {
             found_var3 = true;
         }
-        free(env[i].key);
-        free(env[i].value);
+        wasm_runtime_free(env[i].key);
+        wasm_runtime_free(env[i].value);
     }
-    free(env);
+    wasm_runtime_free(env);
     ASSERT_TRUE(found_var1);
     ASSERT_TRUE(found_var2);
     ASSERT_TRUE(found_var3);
@@ -156,5 +156,5 @@ TEST_F(WasiP2CliTest, Environment_InitialCwd)
 
     ASSERT_STREQ(cwd, expected_cwd);
 
-    free(cwd);
+    wasm_runtime_free(cwd);
 }

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include "../component-instantiation/helpers.h"
+#include "wasi_p2_unavailable_context_test.h"
 extern "C" {
 #include "wasm_component_runtime.h"
 #include "wasm_component_host_resource.h"
@@ -140,21 +141,103 @@ TEST_F(WasiP2FilesystemWrapperTest, test_call_fs_get_directories)
   ASSERT_TRUE(loaded_value->value.list_value.size);
 }
 
+TEST_F(WasiP2FilesystemWrapperTest,
+       preopen_paths_honor_non_utf8_canonical_encodings)
+{
+    const StringEncoding encodings[] = {
+        ENCODING_UTF_16,
+        ENCODING_LATIN_1_UTF_16,
+    };
+    for (StringEncoding encoding : encodings) {
+        wasi_p2_test::SideEffectSnapshot snapshot;
+        wasi_p2_test::ScopedStringEncoding scoped_encoding(
+            comp_instance->core_functions[34]->canon_options, encoding);
+        ASSERT_TRUE(scoped_encoding.valid());
+        ASSERT_TRUE(wasm_component_application_execute_func(
+            comp_instance, const_cast<char *>("call-fs-get-directories()")));
+
+        WASMComponentTypeInstance *ret_type =
+            comp_instance->functions[4]->func_type->results->result;
+        LiftLowerContext cx = {};
+        cx.canonical_opts = comp_instance->core_functions[34]->canon_options;
+        cx.inst = comp_instance;
+        wit_value_t loaded_value = nullptr;
+        ASSERT_TRUE(load(&cx, 0, ret_type, &loaded_value));
+        ASSERT_NE(loaded_value, nullptr);
+        ASSERT_EQ(loaded_value->type, COMPONENT_VAL_TYPE_LIST);
+        ASSERT_GT(loaded_value->value.list_value.size, 0u);
+        wit_value_t tuple = loaded_value->value.list_value.elems[0];
+        ASSERT_NE(tuple, nullptr);
+        ASSERT_EQ(tuple->type, COMPONENT_VAL_TYPE_TUPLE);
+        ASSERT_EQ(tuple->value.tuple_value.size, 2u);
+        wit_value_t descriptor = tuple->value.tuple_value.elems[0];
+        wit_value_t path = tuple->value.tuple_value.elems[1];
+        ASSERT_NE(descriptor, nullptr);
+        ASSERT_NE(path, nullptr);
+        EXPECT_STREQ(path->value.string_value.chars, test_dir);
+        EXPECT_EQ(path->value.string_value.hint_encoding, encoding);
+        const uint32_t rep = descriptor->value.resource_value.value;
+        free_wit_value(loaded_value);
+        ASSERT_EQ(
+            host_resource_table_delete(get_global_host_resource_table(), rep),
+            1u);
+        snapshot.expect_unchanged();
+    }
+}
+
+void
+exercise_unavailable_filesystem(WASMComponentInstance *comp_instance,
+                                bool remove_context)
+{
+    wasi_p2_test::SideEffectSnapshot snapshot;
+    wasi_p2_test::ScopedUnavailableWasi unavailable(comp_instance,
+                                                    remove_context);
+    ASSERT_TRUE(unavailable.valid());
+
+    ASSERT_TRUE(wasm_component_application_execute_func(
+        comp_instance, const_cast<char *>("call-fs-get-directories()")));
+    WASMComponentTypeInstance *ret_type =
+        comp_instance->functions[4]->func_type->results->result;
+    LiftLowerContext cx = {};
+    cx.canonical_opts = comp_instance->core_functions[34]->canon_options;
+    cx.inst = comp_instance;
+    wit_value_t loaded_value = nullptr;
+    ASSERT_TRUE(load(&cx, 0, ret_type, &loaded_value));
+    ASSERT_NE(loaded_value, nullptr);
+    ASSERT_EQ(loaded_value->type, COMPONENT_VAL_TYPE_LIST);
+    EXPECT_EQ(loaded_value->value.list_value.size, 0u);
+    free_wit_value(loaded_value);
+
+    snapshot.expect_unchanged();
+}
+
+TEST_F(WasiP2FilesystemWrapperTest, missing_wasi_context_fails_closed)
+{
+    exercise_unavailable_filesystem(comp_instance, true);
+}
+
+TEST_F(WasiP2FilesystemWrapperTest, null_wasi_options_fail_closed)
+{
+    exercise_unavailable_filesystem(comp_instance, false);
+}
+
 TEST_F(WasiP2FilesystemWrapperTest, test_call_fs_open_at)
 {
-  ASSERT_TRUE(wasm_component_application_execute_func(comp_instance, (char *)"call-fs-open-at()"));
-    
-  WASMComponentTypeInstance *ret_type = comp_instance->functions[23]->func_type->results->result;
-  LiftLowerContext cx;
-  cx.canonical_opts = comp_instance->core_functions[53]->canon_options;
-  cx.inst = comp_instance;
+    ASSERT_TRUE(wasm_component_application_execute_func(
+        comp_instance, (char *)"call-fs-open-at()"));
 
-  wit_value_t loaded_value;
-  bool load_result = load(&cx, 0, ret_type, &loaded_value);
+    WASMComponentTypeInstance *ret_type =
+        comp_instance->functions[23]->func_type->results->result;
+    LiftLowerContext cx;
+    cx.canonical_opts = comp_instance->core_functions[53]->canon_options;
+    cx.inst = comp_instance;
 
-  ASSERT_TRUE(load_result);
-  ASSERT_NE(loaded_value, nullptr);
-  ASSERT_TRUE(loaded_value->value.list_value.size);
+    wit_value_t loaded_value;
+    bool load_result = load(&cx, 0, ret_type, &loaded_value);
+
+    ASSERT_TRUE(load_result);
+    ASSERT_NE(loaded_value, nullptr);
+    ASSERT_TRUE(loaded_value->value.list_value.size);
 }
 
 TEST_F(WasiP2FilesystemWrapperTest, test_call_fs_read_via_stream)

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include "../component-instantiation/helpers.h"
+#include "wasi_p2_unavailable_context_test.h"
 
 extern "C" {
 #include "wasm_component_runtime.h"
@@ -152,3 +153,68 @@ TEST_F(WasiP2RandomWrapperTest, test_call_insecure_seed)
   ASSERT_TRUE(loaded_value->value.tuple_value.size == 2);
 }
 
+void
+exercise_unavailable_random(WASMComponentInstance *comp_instance,
+                            bool remove_context)
+{
+    wasi_p2_test::SideEffectSnapshot snapshot;
+    wasi_p2_test::ScopedUnavailableWasi unavailable(comp_instance,
+                                                    remove_context);
+    ASSERT_TRUE(unavailable.valid());
+
+    const char *scalar_calls[] = {
+        "call-get-random-u64()",
+        "call-get-insecure-random-u64()",
+    };
+    for (const char *call : scalar_calls) {
+        uint32_t argc = 1;
+        uint32_t *argv =
+            static_cast<uint32_t *>(wasm_runtime_malloc(sizeof(uint32_t)));
+        ASSERT_NE(argv, nullptr);
+        argv[0] = UINT32_MAX;
+        ASSERT_TRUE(wasm_component_application_execute_func_ex(
+            comp_instance, const_cast<char *>(call), &argc, &argv));
+        EXPECT_EQ(argv[0], 0u) << call;
+        wasm_runtime_free(argv);
+    }
+
+    const char *list_calls[] = {
+        "call-get-random-bytes()",
+        "call-get-insecure-random-bytes()",
+    };
+    for (const char *call : list_calls) {
+        EXPECT_FALSE(wasm_component_application_execute_func(
+            comp_instance, const_cast<char *>(call)));
+        ASSERT_NE(wasm_component_runtime_get_exception(comp_instance), nullptr);
+        EXPECT_STREQ(wasm_component_runtime_get_exception(comp_instance),
+                     "Exception: random capability is unavailable");
+    }
+
+    ASSERT_TRUE(wasm_component_application_execute_func(
+        comp_instance, const_cast<char *>("call-insecure-seed()")));
+    WASMComponentTypeInstance *seed_type =
+        comp_instance->functions[4]->func_type->results->result;
+    LiftLowerContext seed_cx = {};
+    seed_cx.canonical_opts = comp_instance->core_functions[8]->canon_options;
+    seed_cx.inst = comp_instance;
+    wit_value_t seed = nullptr;
+    ASSERT_TRUE(load(&seed_cx, 0, seed_type, &seed));
+    ASSERT_NE(seed, nullptr);
+    ASSERT_EQ(seed->type, COMPONENT_VAL_TYPE_TUPLE);
+    ASSERT_EQ(seed->value.tuple_value.size, 2u);
+    EXPECT_EQ(seed->value.tuple_value.elems[0]->value.u64_value, 0u);
+    EXPECT_EQ(seed->value.tuple_value.elems[1]->value.u64_value, 0u);
+    free_wit_value(seed);
+
+    snapshot.expect_unchanged();
+}
+
+TEST_F(WasiP2RandomWrapperTest, missing_wasi_context_fails_closed)
+{
+    exercise_unavailable_random(comp_instance, true);
+}
+
+TEST_F(WasiP2RandomWrapperTest, null_wasi_options_fail_closed)
+{
+    exercise_unavailable_random(comp_instance, false);
+}

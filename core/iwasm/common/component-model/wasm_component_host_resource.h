@@ -41,17 +41,46 @@ typedef enum IOStreamType {
 typedef struct StreamResourceType {
     IOStreamType type;
     uint32_t fd;
+    /* File streams use positional I/O so dup() never shares or mutates the
+       descriptor resource's kernel cursor/append flags. */
+    uint64_t position;
+    bool position_valid;
+    bool append;
 } StreamResourceType;
 
 typedef void (*host_resource_dtor_t)(void *data);
+typedef void (*host_resource_native_fd_release_t)(void *attachment,
+                                                  uint32_t fd_count);
 
 typedef struct HostResource {
     void *data;
     HostResourceType type;
     host_resource_dtor_t dtor;
+    void *native_fd_quota_attachment;
+    host_resource_native_fd_release_t native_fd_quota_release;
+    uint32_t native_fd_quota_count;
+    uint32_t pin_count;
+    bool registered;
+    bool closing;
+    struct HostResource *deferred_next;
 } HostResource;
 
 typedef HashMap HostResourceTable;
+
+/*
+ * Host resource borrows are scoped to one synchronous native call.  The
+ * actual pin records live in fixed thread-local storage so a guest trap or
+ * thread exit can unwind them without dereferencing an abandoned C stack
+ * frame.  This caller-owned value is only an opaque normal-return token.
+ */
+#define HOST_RESOURCE_PIN_SCOPE_CAPACITY 32
+#define HOST_RESOURCE_PIN_SCOPE_MAX_DEPTH 16
+
+typedef struct HostResourcePinScope {
+    uint64_t cookie;
+    uint32_t depth;
+    bool active;
+} HostResourcePinScope;
 
 extern HostResourceTable *g_host_resource_table;
 
@@ -62,6 +91,20 @@ get_global_host_resource_table();
 void
 destroy_host_resource_table();
 
+bool
+host_resource_pin_scope_enter(HostResourcePinScope *scope);
+bool
+host_resource_pin_scope_enter_for_unwind_target(HostResourcePinScope *scope,
+                                                const void *unwind_target);
+void
+host_resource_pin_scope_leave(HostResourcePinScope *scope);
+/* Release scopes abandoned by a nonlocal exit to the given runtime jmpbuf. */
+void
+host_resource_pin_scope_unwind_to(const void *unwind_target);
+/* Release every scope before a guest thread exits without returning. */
+void
+host_resource_pin_scope_unwind_current(void);
+
 uint32_t
 host_resource_table_add(HostResourceTable *table, HostResource *hr);
 HostResource *
@@ -71,12 +114,22 @@ host_resource_table_delete(HostResourceTable *table, uint32_t id);
 uint32_t
 host_resource_table_get_next_id(HostResourceType type);
 
+#if defined(WAMR_HOST_RESOURCE_ID_TESTING)
+uint32_t
+host_resource_table_set_next_id_for_test(uint32_t next_id);
+#endif
+
 // Helpers
 HostResource *
 host_resource_create(HostResourceType type, uint32_t data_size);
 
 void
 host_resource_set_dtor(HostResource *hr, host_resource_dtor_t dtor);
+
+void
+host_resource_set_native_fd_quota(
+    HostResource *hr, void *attachment,
+    host_resource_native_fd_release_t release_callback, uint32_t fd_count);
 
 void
 destroy_host_resource(HostResource *hr);

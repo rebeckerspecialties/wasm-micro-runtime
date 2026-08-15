@@ -634,6 +634,9 @@ struct InstantiationArgs2 {
     void *memory_page_quota_attachment;
     wasm_memory_page_quota_reserve_callback_t memory_page_quota_reserve;
     wasm_memory_page_quota_release_callback_t memory_page_quota_release;
+    void *native_fd_quota_attachment;
+    wasm_native_fd_quota_reserve_callback_t native_fd_quota_reserve;
+    wasm_native_fd_quota_release_callback_t native_fd_quota_release;
 #if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIArguments wasi;
 #endif
@@ -770,6 +773,12 @@ wasm_runtime_instantiation_args_set_memory_page_quota(
     struct InstantiationArgs2 *p, void *attachment,
     wasm_memory_page_quota_reserve_callback_t reserve_callback,
     wasm_memory_page_quota_release_callback_t release_callback);
+
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_instantiation_args_set_native_fd_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_native_fd_quota_reserve_callback_t reserve_callback,
+    wasm_native_fd_quota_release_callback_t release_callback);
 
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN void
@@ -946,6 +955,19 @@ wasm_runtime_call_wasm_a(WASMExecEnv *exec_env,
                          WASMFunctionInstanceCommon *function,
                          uint32 num_results, wasm_val_t *results,
                          uint32 num_args, wasm_val_t *args);
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+/* Internal component adapter entry point. The callback is consumed exactly
+   once, after every fallible pre-entry check and before guest dispatch. */
+bool
+wasm_runtime_call_wasm_a_with_pre_entry(WASMExecEnv *exec_env,
+                                        WASMFunctionInstanceCommon *function,
+                                        uint32 num_results, wasm_val_t *results,
+                                        uint32 num_args, wasm_val_t *args,
+                                        WASMCallPreEntryCallback callback,
+                                        void *attachment);
+#endif
 
 WASM_RUNTIME_API_EXTERN bool
 wasm_runtime_call_wasm_v(WASMExecEnv *exec_env,
@@ -1266,6 +1288,15 @@ wasm_externref_obj2ref(WASMModuleInstanceCommon *module_inst, void *extern_obj,
 WASM_RUNTIME_API_EXTERN bool
 wasm_externref_ref2obj(uint32 externref_idx, void **p_extern_obj);
 
+/* Invoke a non-reentrant accessor while the externref node remains protected
+ * by the global map lock.  Internal users which must copy/retain the mapped
+ * object use this instead of copying a raw pointer after ref2obj returns. */
+typedef bool (*wasm_externref_obj_access_t)(void *extern_obj, void *user_data);
+bool
+wasm_externref_ref2obj_access(uint32 externref_idx,
+                              wasm_externref_obj_access_t access,
+                              void *user_data);
+
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN bool
 wasm_externref_retain(uint32 externref_idx);
@@ -1419,7 +1450,28 @@ wasm_runtime_invoke_c_api_native(WASMModuleInstanceCommon *module_inst,
                                  uint32 argc, uint32 *argv, bool with_env,
                                  void *wasm_c_api_env);
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+bool
+wasm_runtime_invoke_c_api_native_with_pre_entry(
+    WASMExecEnv *exec_env, WASMModuleInstanceCommon *module_inst,
+    void *func_ptr, WASMFuncType *func_type, uint32 argc, uint32 *argv,
+    bool with_env, void *wasm_c_api_env);
+#endif
+
 struct CApiFuncImport;
+
+/* wasm-c-api with-env callbacks use an ABI-neutral shared payload behind the
+   existing CApiFuncImport::env_arg field. */
+bool
+wasm_c_api_callback_payload_get_env(void *payload, void **env);
+
+bool
+wasm_c_api_func_imports_retain(struct CApiFuncImport *imports, uint32 count);
+
+void
+wasm_c_api_func_imports_release(struct CApiFuncImport *imports, uint32 count);
+
 /* A quick version of wasm_runtime_invoke_c_api_native to directly invoke
    wasm-c-api import function from jitted code to improve performance */
 bool

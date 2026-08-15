@@ -1265,6 +1265,25 @@ FREE_FRAME(WASMExecEnv *exec_env, WASMInterpFrame *frame)
     wasm_exec_env_free_wasm_frame(exec_env, frame);
 }
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+static bool
+wasm_interp_consume_call_pre_entry(WASMExecEnv *exec_env,
+                                   WASMModuleInstance *module_inst)
+{
+    if (!wasm_exec_env_consume_call_pre_entry(exec_env)) {
+        if (!wasm_get_exception(module_inst)) {
+            wasm_set_exception(
+                module_inst,
+                wasm_exec_env_call_pre_entry_is_terminated(exec_env)
+                    ? "terminated before function entry"
+                    : "component: pre-entry callback failed");
+        }
+        return false;
+    }
+    return true;
+}
+#endif
+
 static void
 wasm_interp_call_func_native(WASMModuleInstance *module_inst,
                              WASMExecEnv *exec_env,
@@ -1400,10 +1419,18 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     else
 #endif
         if (func_import->call_conv_wasm_c_api) {
-        ret = wasm_runtime_invoke_c_api_native(
-            (WASMModuleInstanceCommon *)module_inst, native_func_pointer,
-            func_import->func_type, cur_func->param_cell_num, frame->lp,
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        ret = wasm_runtime_invoke_c_api_native_with_pre_entry(
+            exec_env, (WASMModuleInstanceCommon *)module_inst,
+            native_func_pointer, func_import->func_type,
+            cur_func->param_cell_num, frame->lp,
             c_api_func_import->with_env_arg, c_api_func_import->env_arg);
+#else
+            ret = wasm_runtime_invoke_c_api_native(
+                (WASMModuleInstanceCommon *)module_inst, native_func_pointer,
+                func_import->func_type, cur_func->param_cell_num, frame->lp,
+                c_api_func_import->with_env_arg, c_api_func_import->env_arg);
+#endif
         if (ret) {
             argv_ret[0] = frame->lp[0];
             argv_ret[1] = frame->lp[1];
@@ -1471,6 +1498,37 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                WASMExecEnv *exec_env,
                                WASMFunctionInstance *cur_func,
                                WASMInterpFrame *prev_frame);
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+typedef struct CanonicalParamTransferCommit {
+    CanonicalResourceTransferScope *lower_scope;
+    CanonicalResourceTransferScope *lift_scope;
+    WASMModuleInstance *caller_module_inst;
+    WASMModuleInstance *callee_module_inst;
+} CanonicalParamTransferCommit;
+
+static bool
+canonical_param_transfer_pre_entry(void *attachment)
+{
+    CanonicalParamTransferCommit *commit = attachment;
+
+    if (!commit || !commit->lower_scope || !commit->lift_scope
+        || !canonical_resource_transfer_scope_can_commit(commit->lower_scope)
+        || !canonical_resource_transfer_scope_can_commit(commit->lift_scope)
+        || !canonical_resource_transfer_scope_leave(commit->lower_scope, true)
+        || !canonical_resource_transfer_scope_leave(commit->lift_scope, true)) {
+        if (commit && commit->caller_module_inst)
+            wasm_set_exception(commit->caller_module_inst,
+                               "component: failed to transfer parameters");
+        if (commit && commit->callee_module_inst
+            && commit->callee_module_inst != commit->caller_module_inst)
+            wasm_set_exception(commit->callee_module_inst,
+                               "component: failed to transfer parameters");
+        return false;
+    }
+    return true;
+}
+#endif
 
 static void
 wasm_interp_call_func_import(WASMModuleInstance *module_inst,
@@ -1550,6 +1608,10 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
 
         wit_value_t args = NULL;
         wit_value_t results = NULL;
+        CanonicalResourceTransferScope param_lift_scope = { 0 };
+        CanonicalResourceTransferScope param_lower_scope = { 0 };
+        CanonicalResourceTransferScope result_lift_scope = { 0 };
+        CanonicalResourceTransferScope result_lower_scope = { 0 };
 
         FlatTypes flat_param_types;
         flat_types_init(&flat_param_types);
@@ -1625,6 +1687,13 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         vi_init(&vi, core_args, total_flat_params);
 
         // 1. CANON LOWER — lift Caller's flat params to WIT values
+        if (!canonical_resource_transfer_scope_enter(
+                &param_lift_scope, &cx_lower,
+                WASM_COMPONENT_TABLE_TRANSACTION_LIFT)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to begin parameter lift");
+            goto canon_cleanup;
+        }
         if (!lift_flat_values(&cx_lower, MAX_FLAT_PARAMS, &vi, ft->params, NULL,
                               &args)) {
             wasm_set_exception(module_inst,
@@ -1635,17 +1704,35 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         // 2. CANON LIFT — lower WIT params to Callee's flat representation
         CoreValueList flat_args_callee;
         cvl_init(&flat_args_callee);
+        if (!canonical_resource_transfer_scope_enter(
+                &param_lower_scope, &cx_lift,
+                WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to begin parameter lower");
+            goto canon_cleanup;
+        }
         if (!lower_flat_values(&cx_lift, MAX_FLAT_PARAMS, args, ft->params,
                                NULL, NULL, &flat_args_callee)) {
             wasm_set_exception(module_inst,
                                "component: failed to lower parameters");
             goto canon_cleanup;
         }
-
         // 3. Convert CoreValueList -> wasm_val_t[] and call Callee
         WASMFunctionInstance *callee_core_func = callee_comp_func->core_func;
         WASMExecEnv *callee_exec_env = wasm_runtime_get_exec_env_singleton(
             (WASMModuleInstanceCommon *)callee_core_func->module_instance);
+        CanonicalParamTransferCommit param_commit = {
+            &param_lower_scope,
+            &param_lift_scope,
+            module_inst,
+            callee_core_func->module_instance,
+        };
+
+        if (!callee_exec_env) {
+            wasm_set_exception(module_inst,
+                               "component: failed to create callee exec env");
+            goto canon_cleanup;
+        }
 
         // Convert flat_args_callee to wasm_val_t array
         wasm_val_t wasm_args[MAX_FLAT_TYPES];
@@ -1715,10 +1802,10 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         WASMExecEnv *saved_tls = wasm_runtime_get_exec_env_tls();
         wasm_runtime_set_exec_env_tls(NULL);
 #endif
-        if (!wasm_runtime_call_wasm_a(
+        if (!wasm_runtime_call_wasm_a_with_pre_entry(
                 callee_exec_env, (WASMFunctionInstanceCommon *)callee_core_func,
                 num_wasm_results, wasm_results, flat_args_callee.count,
-                wasm_args)) {
+                wasm_args, canonical_param_transfer_pre_entry, &param_commit)) {
             // Propagate Callee's trap to Caller's module instance
             const char *ex = wasm_runtime_get_exception(
                 (WASMModuleInstanceCommon *)callee_core_func->module_instance);
@@ -1777,6 +1864,13 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         CoreValueIter result_vi;
         vi_init(&result_vi, core_results, num_wasm_results);
 
+        if (!canonical_resource_transfer_scope_enter(
+                &result_lift_scope, &cx_lift,
+                WASM_COMPONENT_TABLE_TRANSACTION_LIFT)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to begin result lift");
+            goto canon_cleanup;
+        }
         if (!lift_flat_values(&cx_lift, MAX_FLAT_RESULTS, &result_vi, NULL,
                               ft->results, &results)) {
             wasm_set_exception(module_inst,
@@ -1787,6 +1881,13 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         // 5. CANON LOWER — lower WIT results into Caller's flat representation
         CoreValueList flat_results_caller;
         cvl_init(&flat_results_caller);
+        if (!canonical_resource_transfer_scope_enter(
+                &result_lower_scope, &cx_lower,
+                WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to begin result lower");
+            goto canon_cleanup;
+        }
         if (!lower_flat_values(&cx_lower, MAX_FLAT_RESULTS, results, NULL,
                                ft->results, &vi, &flat_results_caller)) {
             wasm_set_exception(module_inst,
@@ -1886,8 +1987,31 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
                 }
             }
         }
+        if (!canonical_resource_transfer_scope_can_commit(&result_lower_scope)
+            || !canonical_resource_transfer_scope_can_commit(&result_lift_scope)
+            || !canonical_resource_transfer_scope_leave(&result_lower_scope,
+                                                        true)
+            || !canonical_resource_transfer_scope_leave(&result_lift_scope,
+                                                        true)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to publish results");
+            goto canon_cleanup;
+        }
 
     canon_cleanup:
+        if (result_lower_scope.active)
+            (void)canonical_resource_transfer_scope_leave(&result_lower_scope,
+                                                          false);
+        if (result_lift_scope.active
+            && !canonical_resource_transfer_scope_discard(&result_lift_scope))
+            (void)canonical_resource_transfer_scope_leave(&result_lift_scope,
+                                                          false);
+        if (param_lower_scope.active)
+            (void)canonical_resource_transfer_scope_leave(&param_lower_scope,
+                                                          false);
+        if (param_lift_scope.active)
+            (void)canonical_resource_transfer_scope_leave(&param_lift_scope,
+                                                          false);
         free_wit_value(args);
         free_wit_value(results);
         task_destroy(task);
@@ -2194,6 +2318,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #endif
 #if WASM_ENABLE_TAIL_CALL != 0 || WASM_ENABLE_GC != 0
     bool is_return_call = false;
+#endif
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    bool call_pre_entry_ready = false;
 #endif
 #if WASM_ENABLE_SHARED_HEAP != 0
     /* TODO: currently flowing two variables are only dummy for shared heap
@@ -9140,6 +9267,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
     call_func_from_entry:
     {
 #if WASM_ENABLE_COMPONENT_MODEL != 0
+        call_pre_entry_ready = false;
+#endif
+#if WASM_ENABLE_COMPONENT_MODEL != 0
         if (cur_func->is_import_func && cur_func->import_func_inst
             && cur_func->import_func_inst->is_canon_func) {
             WASMInterpFrame *canon_outs_area =
@@ -9147,6 +9277,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             WASMComponentInstance *comp_inst = module->comp_instance;
             WASMFunctionInstance *canon_func =
                 cur_func->is_canon_func ? cur_func : cur_func->import_func_inst;
+
+#if WASM_ENABLE_THREAD_MGR != 0
+            /* Canon builtins execute directly in this branch, so the shared
+               post-branch suspension check would be too late. */
+            CHECK_SUSPEND_FLAGS();
+#endif
+            if (!wasm_interp_consume_call_pre_entry(exec_env, module))
+                goto got_exception;
 
             switch (canon_func->canon_type) {
                 case WASM_COMP_CANON_RESOURCE_NEW:
@@ -9346,9 +9484,17 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #endif
 
             wasm_exec_env_set_cur_frame(exec_env, (WASMRuntimeFrame *)frame);
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+            call_pre_entry_ready = true;
+#endif
         }
 #if WASM_ENABLE_THREAD_MGR != 0
         CHECK_SUSPEND_FLAGS();
+#endif
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (call_pre_entry_ready
+            && !wasm_interp_consume_call_pre_entry(exec_env, module))
+            goto got_exception;
 #endif
         HANDLE_OP_END();
     }
@@ -9540,6 +9686,7 @@ wasm_interp_call_wasm(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
         > exec_env->wasm_stack.top_boundary) {
         wasm_set_exception((WASMModuleInstance *)exec_env->module_inst,
                            "wasm operand stack overflow");
+        FREE_FRAME(exec_env, frame);
         return;
     }
 

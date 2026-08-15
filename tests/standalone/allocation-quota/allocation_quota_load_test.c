@@ -13,6 +13,7 @@
 #include "wasm_allocation_quota.h"
 #include "wasm.h"
 #include "wasm_c_api.h"
+#include "wasm_c_api_internal.h"
 #include "wasm_export.h"
 #include "wasm_runtime_common.h"
 
@@ -46,6 +47,28 @@ typedef struct QuotaState {
 
 static const uint8_t empty_module[] = { 0x00, 0x61, 0x73, 0x6d,
                                         0x01, 0x00, 0x00, 0x00 };
+
+/* (module (import "m" "f" (func)) (func (export "g"))) */
+static const uint8_t c_api_reflection_module[] = {
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04,
+    0x01, 0x60, 0x00, 0x00, 0x02, 0x07, 0x01, 0x01, 0x6d, 0x01,
+    0x66, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01,
+    0x01, 0x67, 0x00, 0x01, 0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b
+};
+
+static wasm_trap_t *
+c_api_noop_callback(const wasm_val_vec_t *args, wasm_val_vec_t *results)
+{
+    (void)args;
+    (void)results;
+    return NULL;
+}
+
+static void
+count_finalizer(void *data)
+{
+    (*(uint32_t *)data)++;
+}
 
 #if WASM_ENABLE_MULTI_MODULE != 0
 static const uint8_t function_dependency_module[] = {
@@ -590,11 +613,203 @@ test_c_api_versioned_load_owns_wrapper_graph(void)
 
     wasm_byte_vec_delete(&binary);
     wasm_store_delete(store);
-    CHECK(quota.attachment_release_calls == 0);
+    CHECK(quota.attachment_release_calls == 1);
+    check_balanced(&quota);
     wasm_engine_delete(engine);
     CHECK(quota.attachment_release_calls == 1);
     check_balanced(&quota);
     quota_destroy(&quota);
+}
+
+static void
+test_c_api_owner_scopes_and_shared_module_use(void)
+{
+    wasm_engine_t *engine;
+    wasm_store_t *first_store;
+    wasm_store_t *second_store;
+    wasm_byte_vec_t binary = { 0 };
+    wasm_importtype_vec_t imports = { 0 };
+    wasm_exporttype_vec_t exports = { 0 };
+    wasm_module_t *module;
+    wasm_shared_module_t *shared;
+    wasm_functype_t *owned_func_type;
+    wasm_globaltype_t *owned_global_type;
+    wasm_tabletype_t *owned_table_type;
+    wasm_memorytype_t *owned_memory_type;
+    wasm_func_t *owned_func;
+    wasm_global_t *owned_global;
+    wasm_table_t *owned_table;
+    wasm_memory_t *owned_memory;
+    wasm_valtype_vec_t func_params = { 0 };
+    wasm_valtype_vec_t func_results = { 0 };
+    wasm_val_t global_init = WASM_I32_VAL(7);
+    wasm_limits_t table_limits = { 0, 1 };
+    wasm_limits_t memory_limits = { 1, 1 };
+    WASMAllocationQuotaScope object_scope;
+    QuotaState first_quota;
+    QuotaState second_quota;
+    LoadArgs2 first_args;
+    LoadArgs2 second_args;
+    WASMAllocationQuotaToken *second_token;
+    uint64_t live_bytes;
+    uint32_t live_allocations;
+    uint64_t object_baseline_bytes;
+    uint32_t object_baseline_allocations;
+    uint32_t second_reserve_calls;
+    uint32_t finalizer_counts[4] = { 0 };
+
+    engine = wasm_engine_new();
+    CHECK(engine != NULL);
+    first_store = wasm_store_new(engine);
+    second_store = wasm_store_new(engine);
+    CHECK(first_store != NULL);
+    CHECK(second_store != NULL);
+    wasm_byte_vec_new(&binary, sizeof(c_api_reflection_module),
+                      (const byte_t *)c_api_reflection_module);
+    CHECK(binary.data != NULL);
+
+    quota_init(&first_quota);
+    first_args = quota_load_args(&first_quota);
+    first_args.clone_wasm_binary = 1;
+    first_args.no_resolve = 1;
+    module = wasm_module_new_ex2(first_store, &binary, &first_args);
+    CHECK(module != NULL);
+    live_bytes = first_quota.live_bytes;
+    live_allocations = first_quota.live_allocations;
+
+    /* Derived C-API vectors are charged to their module owner and refund
+       exactly when a neutral embedder releases them. */
+    wasm_module_imports(module, &imports);
+    CHECK(imports.data != NULL);
+    CHECK(first_quota.live_allocations > live_allocations);
+    wasm_importtype_vec_delete(&imports);
+    CHECK(first_quota.live_bytes == live_bytes);
+    CHECK(first_quota.live_allocations == live_allocations);
+
+    wasm_module_exports(module, &exports);
+    CHECK(exports.data != NULL);
+    CHECK(first_quota.live_allocations > live_allocations);
+    wasm_exporttype_vec_delete(&exports);
+    CHECK(first_quota.live_bytes == live_bytes);
+    CHECK(first_quota.live_allocations == live_allocations);
+
+    CHECK(wasm_module_set_name(module, "quota-c-api-owner"));
+    CHECK(strcmp(wasm_module_get_name(module), "quota-c-api-owner") == 0);
+    shared = wasm_module_share(module);
+    CHECK(shared != NULL);
+    object_baseline_bytes = first_quota.live_bytes;
+    object_baseline_allocations = first_quota.live_allocations;
+
+    /* Public C-API object and type roots must reject a wrong-owner delete
+       before mutating children or invoking embedder finalizers. */
+    CHECK(wasm_allocation_quota_scope_enter_for_allocation(&object_scope,
+                                                           module));
+    wasm_valtype_vec_new_empty(&func_params);
+    wasm_valtype_vec_new_empty(&func_results);
+    owned_func_type = wasm_functype_new(&func_params, &func_results);
+    owned_global_type =
+        wasm_globaltype_new(wasm_valtype_new(WASM_I32), WASM_VAR);
+    owned_table_type =
+        wasm_tabletype_new(wasm_valtype_new(WASM_FUNCREF), &table_limits);
+    owned_memory_type = wasm_memorytype_new(&memory_limits);
+    CHECK(owned_func_type != NULL);
+    CHECK(owned_global_type != NULL);
+    CHECK(owned_table_type != NULL);
+    CHECK(owned_memory_type != NULL);
+    owned_func =
+        wasm_func_new(first_store, owned_func_type, c_api_noop_callback);
+    owned_global =
+        wasm_global_new(first_store, owned_global_type, &global_init);
+    owned_table = wasm_table_new(first_store, owned_table_type, NULL);
+    owned_memory = wasm_memory_new(first_store, owned_memory_type);
+    CHECK(owned_func != NULL);
+    CHECK(owned_global != NULL);
+    CHECK(owned_table != NULL);
+    CHECK(owned_memory != NULL);
+    wasm_func_set_host_info_with_finalizer(owned_func, &finalizer_counts[0],
+                                           count_finalizer);
+    wasm_global_set_host_info_with_finalizer(owned_global, &finalizer_counts[1],
+                                             count_finalizer);
+    wasm_table_set_host_info_with_finalizer(owned_table, &finalizer_counts[2],
+                                            count_finalizer);
+    wasm_memory_set_host_info_with_finalizer(owned_memory, &finalizer_counts[3],
+                                             count_finalizer);
+    wasm_allocation_quota_scope_leave(&object_scope);
+
+    quota_init(&second_quota);
+    second_args = quota_load_args(&second_quota);
+    second_token = wasm_allocation_quota_token_create(&second_args);
+    CHECK(second_token != NULL);
+    second_reserve_calls = second_quota.reserve_calls;
+    CHECK(wasm_allocation_quota_set_current(second_token) == NULL);
+
+    memset(&imports, 0, sizeof(imports));
+    wasm_module_imports(module, &imports);
+    CHECK(imports.data == NULL);
+    CHECK(imports.size == 0);
+    CHECK(!wasm_module_set_name(module, "wrong-owner"));
+    CHECK(wasm_module_get_name(module)[0] == '\0');
+    CHECK(wasm_module_obtain(second_store, shared) == NULL);
+    CHECK(wasm_engine_new() == NULL);
+    CHECK(wasm_store_new(engine) == NULL);
+    CHECK(wasm_foreign_new(first_store) == NULL);
+    CHECK(!wasm_module_validate(first_store, &binary));
+    CHECK(wasm_module_new(first_store, &binary) == NULL);
+    wasm_func_delete(owned_func);
+    wasm_global_delete(owned_global);
+    wasm_table_delete(owned_table);
+    wasm_memory_delete(owned_memory);
+    wasm_functype_delete(owned_func_type);
+    wasm_globaltype_delete(owned_global_type);
+    wasm_tabletype_delete(owned_table_type);
+    wasm_memorytype_delete(owned_memory_type);
+    CHECK(finalizer_counts[0] == 0);
+    CHECK(finalizer_counts[1] == 0);
+    CHECK(finalizer_counts[2] == 0);
+    CHECK(finalizer_counts[3] == 0);
+    CHECK(second_quota.reserve_calls == second_reserve_calls);
+
+    CHECK(wasm_allocation_quota_set_current(NULL) == second_token);
+    wasm_allocation_quota_token_release(second_token);
+    CHECK(second_quota.attachment_retain_calls == 1);
+    CHECK(second_quota.attachment_release_calls == 1);
+    check_balanced(&second_quota);
+    quota_destroy(&second_quota);
+
+    CHECK(owned_func->type != NULL);
+    CHECK(owned_global->type != NULL && owned_global->init != NULL);
+    CHECK(owned_table->type != NULL);
+    CHECK(owned_memory->type != NULL);
+    CHECK(owned_func_type->params != NULL && owned_func_type->results != NULL);
+    CHECK(owned_global_type->val_type != NULL);
+    CHECK(owned_table_type->val_type != NULL);
+    wasm_func_delete(owned_func);
+    wasm_global_delete(owned_global);
+    wasm_table_delete(owned_table);
+    wasm_memory_delete(owned_memory);
+    wasm_functype_delete(owned_func_type);
+    wasm_globaltype_delete(owned_global_type);
+    wasm_tabletype_delete(owned_table_type);
+    wasm_memorytype_delete(owned_memory_type);
+    CHECK(finalizer_counts[0] == 1);
+    CHECK(finalizer_counts[1] == 1);
+    CHECK(finalizer_counts[2] == 1);
+    CHECK(finalizer_counts[3] == 1);
+    CHECK(first_quota.live_bytes == object_baseline_bytes);
+    CHECK(first_quota.live_allocations == object_baseline_allocations);
+
+    CHECK(strcmp(wasm_module_get_name(module), "quota-c-api-owner") == 0);
+    CHECK(wasm_module_obtain(second_store, shared) == module);
+    wasm_shared_module_delete(shared);
+
+    wasm_byte_vec_delete(&binary);
+    wasm_store_delete(second_store);
+    CHECK(first_quota.attachment_release_calls == 0);
+    wasm_store_delete(first_store);
+    CHECK(first_quota.attachment_release_calls == 1);
+    check_balanced(&first_quota);
+    wasm_engine_delete(engine);
+    quota_destroy(&first_quota);
 }
 
 #if WASM_ENABLE_WASM_CACHE != 0
@@ -617,6 +832,7 @@ test_c_api_cache_reuses_only_the_current_owner(void)
     LoadArgs2 second_args;
     WASMAllocationQuotaToken *first_token;
     WASMAllocationQuotaToken *second_token;
+    uint32_t i;
 
     engine = wasm_engine_new();
     CHECK(engine != NULL);
@@ -642,9 +858,16 @@ test_c_api_cache_reuses_only_the_current_owner(void)
     second_module = wasm_module_new_ex2(second_store, &binary, &first_args);
     CHECK(first_module != NULL);
     CHECK(second_module == first_module);
+    for (i = 0; i < DEFAULT_VECTOR_INIT_LENGTH; i++) {
+        CHECK(wasm_module_new_ex2(first_store, &binary, &first_args)
+              == first_module);
+    }
     CHECK(wasm_allocation_quota_set_current(NULL) == first_token);
     wasm_allocation_quota_token_release(first_token);
     CHECK(first_quota.attachment_retain_calls == 1);
+    CHECK(first_store->modules->size > DEFAULT_VECTOR_INIT_LENGTH);
+    CHECK(wasm_allocation_quota_allocation_matches_current(
+        first_store->modules->data));
 
     quota_init(&second_quota);
     second_args = quota_load_args(&second_quota);
@@ -657,17 +880,26 @@ test_c_api_cache_reuses_only_the_current_owner(void)
     CHECK(third_module != NULL);
     CHECK(third_module != first_module);
     CHECK(fourth_module == third_module);
+    for (i = 0; i < DEFAULT_VECTOR_INIT_LENGTH; i++) {
+        CHECK(wasm_module_new_ex2(third_store, &binary, &second_args)
+              == third_module);
+    }
     CHECK(wasm_allocation_quota_set_current(NULL) == second_token);
     wasm_allocation_quota_token_release(second_token);
     CHECK(second_quota.attachment_retain_calls == 1);
+    CHECK(third_store->modules->size > DEFAULT_VECTOR_INIT_LENGTH);
+    CHECK(wasm_allocation_quota_allocation_matches_current(
+        third_store->modules->data));
 
     wasm_byte_vec_delete(&binary);
     wasm_store_delete(fourth_store);
     wasm_store_delete(third_store);
     wasm_store_delete(second_store);
     wasm_store_delete(first_store);
-    CHECK(first_quota.attachment_release_calls == 0);
-    CHECK(second_quota.attachment_release_calls == 0);
+    CHECK(first_quota.attachment_release_calls == 1);
+    CHECK(second_quota.attachment_release_calls == 1);
+    check_balanced(&first_quota);
+    check_balanced(&second_quota);
     wasm_engine_delete(engine);
     CHECK(first_quota.attachment_release_calls == 1);
     CHECK(second_quota.attachment_release_calls == 1);
@@ -694,6 +926,7 @@ main(void)
 #endif
     wasm_runtime_destroy();
     test_c_api_versioned_load_owns_wrapper_graph();
+    test_c_api_owner_scopes_and_shared_module_use();
 #if WASM_ENABLE_WASM_CACHE != 0
     test_c_api_cache_reuses_only_the_current_owner();
 #endif

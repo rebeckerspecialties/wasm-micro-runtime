@@ -11,6 +11,19 @@
 #include "component-model/wasm_canonical_abi.h"
 #include "wasi_p2_common.h"
 #include "component-model/wasm_component_canonical.h"
+
+static void
+store_clock_result(wasm_exec_env_t exec_env, uint32_t offset_addr,
+                   WASMComponentTypeInstance *result_type, wit_value_t result)
+{
+    if (!result) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "Could not allocate clock result");
+        return;
+    }
+    (void)store(exec_env->cx, offset_addr, result_type, result);
+}
+
 /**
  * @brief Wrapper for the `now` function of the `wasi:clocks/wall-clock`
  * interface.
@@ -31,7 +44,8 @@ wasi_wall_clock_now_wrapper(wasm_exec_env_t exec_env, uint32_t offset_addr)
 
     wit_value_t result = NULL;
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         result = get_datetime(0, 0);
         goto end;
     }
@@ -41,7 +55,8 @@ wasi_wall_clock_now_wrapper(wasm_exec_env_t exec_env, uint32_t offset_addr)
     result = get_datetime(now.seconds, now.nanoseconds);
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    store_clock_result(exec_env, offset_addr, func_type->results->result,
+                       result);
     free_wit_value(result);
 }
 
@@ -64,7 +79,8 @@ wasi_wall_clock_resolution_wrapper(wasm_exec_env_t exec_env,
         wasm_get_component_func_type(exec_env);
     wit_value_t result = NULL;
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         result = get_datetime(0, 0);
         goto end;
     }
@@ -74,7 +90,8 @@ wasi_wall_clock_resolution_wrapper(wasm_exec_env_t exec_env,
     result = get_datetime(resolution.seconds, resolution.nanoseconds);
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    store_clock_result(exec_env, offset_addr, func_type->results->result,
+                       result);
     free_wit_value(result);
 }
 
@@ -87,6 +104,14 @@ end:
 uint64_t
 wasi_monotonic_clock_now_wrapper(wasm_exec_env_t exec_env)
 {
+    wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
+    const WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(module_inst);
+
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
+        return 0;
+    }
+
     return wasi_monotonic_clock_now();
 }
 
@@ -102,7 +127,8 @@ wasi_monotonic_clock_resolution_wrapper(wasm_exec_env_t exec_env)
     wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
     const WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(module_inst);
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         return 0;
     }
 
@@ -126,13 +152,22 @@ wasi_monotonic_clock_subscribe_instant_wrapper(wasm_exec_env_t exec_env,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
+        return 0;
+    }
+
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "native file descriptor quota exceeded");
         return 0;
     }
 
     wasi_pollable_context_t pollable =
         wasi_monotonic_clock_subscribe_instant(when);
     if (pollable.fd < 0) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not create pollable timer");
         return 0;
@@ -145,6 +180,7 @@ wasi_monotonic_clock_subscribe_instant_wrapper(wasm_exec_env_t exec_env,
     if (!hr) {
         if (pollable.own_fd)
             close(pollable.fd);
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get pollable resource");
         return 0;
@@ -152,6 +188,7 @@ wasi_monotonic_clock_subscribe_instant_wrapper(wasm_exec_env_t exec_env,
 
     *((wasi_pollable_context_t *)hr->data) = pollable;
     host_resource_set_dtor(hr, pollable_dtor);
+    wasi_p2_native_fd_quota_transfer_to_host_resource(hr, &fd_lease);
 
     uint32_t out = host_resource_table_add(hr_table, hr);
     if (out < 1) {
@@ -186,13 +223,22 @@ wasi_monotonic_clock_subscribe_duration_wrapper(wasm_exec_env_t exec_env,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
+        return 0;
+    }
+
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "native file descriptor quota exceeded");
         return 0;
     }
 
     wasi_pollable_context_t pollable =
         wasi_monotonic_clock_subscribe_duration(when);
     if (pollable.fd < 0) {
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not create pollable timer");
         return 0;
@@ -205,6 +251,7 @@ wasi_monotonic_clock_subscribe_duration_wrapper(wasm_exec_env_t exec_env,
     if (!hr) {
         if (pollable.own_fd)
             close(pollable.fd);
+        wasi_p2_native_fd_quota_release(&fd_lease);
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get pollable resource");
         return 0;
@@ -212,6 +259,7 @@ wasi_monotonic_clock_subscribe_duration_wrapper(wasm_exec_env_t exec_env,
 
     *((wasi_pollable_context_t *)hr->data) = pollable;
     host_resource_set_dtor(hr, pollable_dtor);
+    wasi_p2_native_fd_quota_transfer_to_host_resource(hr, &fd_lease);
 
     uint32_t out = host_resource_table_add(hr_table, hr);
     if (out < 1) {

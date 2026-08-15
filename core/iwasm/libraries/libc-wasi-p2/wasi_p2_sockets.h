@@ -23,6 +23,13 @@ typedef int32_t wasi_udp_socket_t;
 typedef int32_t wasi_resolve_address_stream_t;
 typedef int32_t wasi_incoming_datagram_stream_t;
 typedef int32_t wasi_outgoing_datagram_stream_t;
+struct WasiP2NativeFdQuotaLease;
+
+/* Process-wide bounds for the legacy native resolver path. Quota-owned
+   execution is rejected before reaching this path. */
+#define WASI_SOCKETS_MAX_RESOLVE_NAME_LENGTH 253
+#define WASI_SOCKETS_MAX_RESOLVE_STREAMS 8
+#define WASI_SOCKETS_MAX_RESOLVE_WORKERS 8
 typedef enum wasi_ip_address_family_t {
     WASI_IP_ADDRESS_FAMILY_IPV4,
     WASI_IP_ADDRESS_FAMILY_IPV6,
@@ -68,6 +75,10 @@ typedef struct wasi_ip_socket_address_t {
         wasi_ipv6_socket_address_t ipv6;
     } val;
 } wasi_ip_socket_address_t;
+typedef struct wasi_udp_peer_state_t {
+    bool connected;
+    wasi_ip_socket_address_t address;
+} wasi_udp_peer_state_t;
 typedef enum wasi_shutdown_type_t {
     WASI_SHUTDOWN_TYPE_RECEIVE,
     WASI_SHUTDOWN_TYPE_SEND,
@@ -88,6 +99,12 @@ wasi_sockets_instance_network(void);
 void
 wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
                                wasi_resolve_address_stream_t *ret, int *err);
+void
+wasi_sockets_resolve_addresses_with_fd_quota(
+    wasi_network_t network, const char *name,
+    wasi_resolve_address_stream_t *ret, int *err,
+    struct WasiP2NativeFdQuotaLease *read_fd_lease,
+    struct WasiP2NativeFdQuotaLease *write_fd_lease);
 void
 wasi_sockets_resolve_next_address(wasi_resolve_address_stream_t stream,
                                   wasi_ip_address_t *ret, bool *is_some,
@@ -110,6 +127,12 @@ void
 wasi_sockets_tcp_finish_connect(wasi_tcp_socket_t socket,
                                 wasi_input_stream_t *input_stream,
                                 wasi_output_stream_t *output_stream, int *err);
+int
+wasi_sockets_tcp_finish_connect_status(wasi_tcp_socket_t socket);
+int
+wasi_sockets_duplicate_socket_streams(int socket_fd,
+                                      wasi_input_stream_t *input_stream,
+                                      wasi_output_stream_t *output_stream);
 int
 wasi_sockets_tcp_start_listen(wasi_tcp_socket_t socket, uint64_t backlog);
 int
@@ -181,6 +204,12 @@ wasi_sockets_udp_stream(wasi_udp_socket_t socket,
                         wasi_incoming_datagram_stream_t *input_stream,
                         wasi_outgoing_datagram_stream_t *output_stream,
                         int *err);
+int
+wasi_sockets_udp_capture_peer(wasi_udp_socket_t socket,
+                              wasi_udp_peer_state_t *state);
+int
+wasi_sockets_udp_restore_peer(wasi_udp_socket_t socket,
+                              const wasi_udp_peer_state_t *state);
 void
 wasi_sockets_udp_local_address(wasi_udp_socket_t socket,
                                wasi_ip_socket_address_t *ret, int *err);
@@ -208,6 +237,12 @@ void
 wasi_sockets_udp_receive(wasi_incoming_datagram_stream_t stream,
                          uint64_t max_results, wasi_incoming_datagram_t **ret,
                          uint64_t *ret_len, int *err);
+void
+wasi_sockets_udp_peek_receive(wasi_incoming_datagram_stream_t stream,
+                              wasi_incoming_datagram_t *ret, bool *present,
+                              int *err);
+int
+wasi_sockets_udp_consume_peeked(wasi_incoming_datagram_stream_t stream);
 void
 wasi_sockets_udp_check_send(wasi_outgoing_datagram_stream_t stream,
                             uint64_t *ret, int *err);

@@ -368,6 +368,18 @@ typedef bool (*wasm_memory_page_quota_reserve_callback_t)(void *attachment,
 typedef void (*wasm_memory_page_quota_release_callback_t)(void *attachment,
                                                           uint32_t pages);
 
+/**
+ * Optional aggregate native file-descriptor quota callbacks.
+ *
+ * The reserve callback runs before quota-aware WASI Preview 2 operations
+ * create descriptors owned by the component. The release callback runs after
+ * close or reservation rollback. Shared callbacks must be thread-safe.
+ */
+typedef bool (*wasm_native_fd_quota_reserve_callback_t)(void *attachment,
+                                                        uint32_t fd_count);
+typedef void (*wasm_native_fd_quota_release_callback_t)(void *attachment,
+                                                        uint32_t fd_count);
+
 #ifndef WASM_VALKIND_T_DEFINED
 #define WASM_VALKIND_T_DEFINED
 typedef uint8_t wasm_valkind_t;
@@ -957,6 +969,19 @@ wasm_runtime_instantiation_args_set_memory_page_quota(
     struct InstantiationArgs2 *p, void *attachment,
     wasm_memory_page_quota_reserve_callback_t reserve_callback,
     wasm_memory_page_quota_release_callback_t release_callback);
+
+/**
+ * Set an aggregate native-descriptor quota for WASI Preview 2 resources.
+ *
+ * Passing NULL callbacks disables accounting. Otherwise both callbacks must
+ * be non-NULL. The attachment must remain live until every reservation is
+ * released; asynchronous work may release after component deinstantiation.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_instantiation_args_set_native_fd_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_native_fd_quota_reserve_callback_t reserve_callback,
+    wasm_native_fd_quota_release_callback_t release_callback);
 
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_custom_data(struct InstantiationArgs2 *p,
