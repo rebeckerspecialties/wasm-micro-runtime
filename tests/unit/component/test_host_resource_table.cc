@@ -169,7 +169,6 @@ class HostResourceTableTest : public testing::Test
         std::memset(hr, 0, sizeof(*hr));
         hr->type = type;
         hr->data = data;
-        hr->dtor = NULL;
         return hr;
     }
 
