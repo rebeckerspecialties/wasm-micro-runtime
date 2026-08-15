@@ -7,6 +7,7 @@
 #include "../interpreter/wasm_runtime.h"
 #include "../aot/aot_runtime.h"
 #include "mem_alloc.h"
+#include "wasm_allocation_quota.h"
 #include "wasm_memory.h"
 
 #if WASM_ENABLE_SHARED_MEMORY != 0
@@ -27,6 +28,26 @@ typedef enum Memory_Mode {
 static Memory_Mode memory_mode = MEMORY_MODE_UNKNOWN;
 
 static mem_allocator_t pool_allocator = NULL;
+
+struct WASMAllocationQuotaToken {
+    korp_mutex lock;
+    uint32 ref_count;
+    void *attachment;
+    wasm_allocation_quota_reserve_callback_t reserve;
+    wasm_allocation_quota_release_callback_t release;
+    wasm_allocation_quota_attachment_release_callback_t attachment_release;
+};
+
+#if defined(os_thread_local_attribute)
+static os_thread_local_attribute WASMAllocationQuotaToken
+    *current_allocation_quota;
+#elif defined(_MSC_VER)
+static __declspec(thread) WASMAllocationQuotaToken *current_allocation_quota;
+#elif defined(__GNUC__) || defined(__clang__)
+static __thread WASMAllocationQuotaToken *current_allocation_quota;
+#else
+static _Thread_local WASMAllocationQuotaToken *current_allocation_quota;
+#endif
 
 #if WASM_ENABLE_SHARED_HEAP != 0
 static WASMSharedHeap *shared_heap_list = NULL;
@@ -991,7 +1012,7 @@ wasm_runtime_memory_pool_size(void)
 }
 
 static inline void *
-wasm_runtime_malloc_internal(unsigned int size)
+wasm_runtime_malloc_direct(unsigned int size)
 {
     if (memory_mode == MEMORY_MODE_UNKNOWN) {
         LOG_WARNING(
@@ -1017,7 +1038,7 @@ wasm_runtime_malloc_internal(unsigned int size)
 }
 
 static inline void *
-wasm_runtime_realloc_internal(void *ptr, unsigned int size)
+wasm_runtime_realloc_direct(void *ptr, unsigned int size)
 {
     if (memory_mode == MEMORY_MODE_UNKNOWN) {
         LOG_WARNING(
@@ -1046,15 +1067,10 @@ wasm_runtime_realloc_internal(void *ptr, unsigned int size)
 }
 
 static inline void
-wasm_runtime_free_internal(void *ptr)
+wasm_runtime_free_direct(void *ptr)
 {
-    if (!ptr) {
-        LOG_WARNING("warning: wasm_runtime_free with NULL pointer\n");
-#if BH_ENABLE_GC_VERIFY != 0
-        exit(-1);
-#endif
+    if (!ptr)
         return;
-    }
 
     if (memory_mode == MEMORY_MODE_UNKNOWN) {
         LOG_WARNING("warning: wasm_runtime_free failed: "
@@ -1078,22 +1094,226 @@ wasm_runtime_free_internal(void *ptr)
     }
 }
 
-static inline void *
-wasm_runtime_aligned_alloc_internal(unsigned int size, unsigned int alignment)
+WASMAllocationQuotaToken *
+wasm_allocation_quota_token_create(const LoadArgs *args)
 {
-    if (memory_mode == MEMORY_MODE_UNKNOWN) {
-        LOG_ERROR("wasm_runtime_aligned_alloc failed: memory hasn't been "
-                  "initialized.\n");
+    WASMAllocationQuotaToken *token;
+
+    if (!args || !args->allocation_quota_attachment
+        || !args->allocation_quota_reserve || !args->allocation_quota_release
+        || !args->allocation_quota_attachment_retain
+        || !args->allocation_quota_attachment_release)
+        return NULL;
+
+    token = wasm_runtime_malloc_direct(sizeof(*token));
+    if (!token)
+        return NULL;
+
+    memset(token, 0, sizeof(*token));
+    if (os_mutex_init(&token->lock) != BHT_OK) {
+        wasm_runtime_free_direct(token);
         return NULL;
     }
 
-    if (memory_mode != MEMORY_MODE_POOL) {
-        LOG_ERROR("wasm_runtime_aligned_alloc failed: only supported in POOL "
-                  "memory mode.\n");
+    if (!args->allocation_quota_attachment_retain(
+            args->allocation_quota_attachment)) {
+        os_mutex_destroy(&token->lock);
+        wasm_runtime_free_direct(token);
         return NULL;
     }
 
-    return mem_allocator_malloc_aligned(pool_allocator, size, alignment);
+    token->ref_count = 1;
+    token->attachment = args->allocation_quota_attachment;
+    token->reserve = args->allocation_quota_reserve;
+    token->release = args->allocation_quota_release;
+    token->attachment_release = args->allocation_quota_attachment_release;
+    return token;
+}
+
+bool
+wasm_allocation_quota_token_retain(WASMAllocationQuotaToken *token)
+{
+    bool retained = false;
+
+    if (!token)
+        return false;
+
+    os_mutex_lock(&token->lock);
+    if (token->ref_count > 0 && token->ref_count < UINT32_MAX) {
+        token->ref_count++;
+        retained = true;
+    }
+    os_mutex_unlock(&token->lock);
+    return retained;
+}
+
+void
+wasm_allocation_quota_token_release(WASMAllocationQuotaToken *token)
+{
+    bool destroy = false;
+
+    if (!token)
+        return;
+
+    os_mutex_lock(&token->lock);
+    bh_assert(token->ref_count > 0);
+    if (token->ref_count > 0) {
+        token->ref_count--;
+        destroy = token->ref_count == 0;
+    }
+    os_mutex_unlock(&token->lock);
+
+    if (destroy) {
+        os_mutex_destroy(&token->lock);
+        token->attachment_release(token->attachment);
+        wasm_runtime_free_direct(token);
+    }
+}
+
+bool
+wasm_allocation_quota_token_reserve(WASMAllocationQuotaToken *token,
+                                    uint64_t bytes, uint32_t allocations)
+{
+    if (!token || (bytes == 0 && allocations == 0))
+        return true;
+    return token->reserve(token->attachment, bytes, allocations);
+}
+
+void
+wasm_allocation_quota_token_refund(WASMAllocationQuotaToken *token,
+                                   uint64_t bytes, uint32_t allocations)
+{
+    if (token && (bytes != 0 || allocations != 0))
+        token->release(token->attachment, bytes, allocations);
+}
+
+WASMAllocationQuotaToken *
+wasm_allocation_quota_get_current(void)
+{
+    return current_allocation_quota;
+}
+
+WASMAllocationQuotaToken *
+wasm_allocation_quota_set_current(WASMAllocationQuotaToken *token)
+{
+    WASMAllocationQuotaToken *previous = current_allocation_quota;
+
+    current_allocation_quota = token;
+    return previous;
+}
+
+bool
+wasm_allocation_header_calculate_size(uint32_t user_size, uint32_t alignment,
+                                      uint32_t *raw_size)
+{
+    uint64_t size;
+
+    if (!raw_size || alignment < WASM_ALLOCATION_MAX_ALIGNMENT
+        || (alignment & (alignment - 1)) != 0)
+        return false;
+
+    size = (uint64_t)sizeof(WASMAllocationHeader) + user_size + alignment - 1;
+    size = (size + alignment - 1) & ~((uint64_t)alignment - 1);
+    if (size > UINT32_MAX)
+        return false;
+
+    *raw_size = (uint32_t)size;
+    return true;
+}
+
+static uint32
+wasm_allocation_user_offset(void *raw_ptr, uint32 alignment)
+{
+    uintptr_t mask = (uintptr_t)alignment - 1;
+    uintptr_t header_end_mod =
+        (((uintptr_t)raw_ptr & mask) + (sizeof(WASMAllocationHeader) & mask))
+        & mask;
+    uint32 padding = (uint32)((alignment - header_end_mod) & mask);
+
+    return (uint32)sizeof(WASMAllocationHeader) + padding;
+}
+
+void *
+wasm_allocation_header_initialize(void *raw_ptr, uint32_t raw_size,
+                                  uint32_t user_size, uint32_t alignment,
+                                  bool explicitly_aligned,
+                                  WASMAllocationQuotaToken *owner)
+{
+    uint32 user_offset;
+    uint8 *user_ptr;
+    WASMAllocationHeader *header;
+
+    if (!raw_ptr || alignment < WASM_ALLOCATION_MAX_ALIGNMENT
+        || (alignment & (alignment - 1)) != 0)
+        return NULL;
+
+    user_offset = wasm_allocation_user_offset(raw_ptr, alignment);
+    if (user_offset > raw_size || user_size > raw_size - user_offset)
+        return NULL;
+
+    user_ptr = (uint8 *)raw_ptr + user_offset;
+    header = (WASMAllocationHeader *)(user_ptr - sizeof(*header));
+    memset(header, 0, sizeof(*header));
+    header->data.magic = WASM_ALLOCATION_HEADER_MAGIC;
+    header->data.raw_ptr = raw_ptr;
+    header->data.owner = owner;
+    header->data.user_size = user_size;
+    header->data.raw_size = raw_size;
+    header->data.alignment = alignment;
+    header->data.explicitly_aligned = explicitly_aligned;
+    return user_ptr;
+}
+
+WASMAllocationHeader *
+wasm_allocation_header_from_user(void *user_ptr)
+{
+    WASMAllocationHeader *header;
+
+    if (!user_ptr)
+        return NULL;
+
+    header = (WASMAllocationHeader *)((uint8 *)user_ptr - sizeof(*header));
+    if (header->data.magic != WASM_ALLOCATION_HEADER_MAGIC)
+        return NULL;
+    return header;
+}
+
+static void *
+wasm_runtime_allocate_owned(unsigned int size, unsigned int alignment,
+                            bool explicitly_aligned)
+{
+    WASMAllocationQuotaToken *owner = wasm_allocation_quota_get_current();
+    uint32 raw_size;
+    void *raw_ptr;
+    void *user_ptr;
+
+    if (!wasm_allocation_header_calculate_size(size, alignment, &raw_size))
+        return NULL;
+
+    if (owner) {
+        if (!wasm_allocation_quota_token_retain(owner))
+            return NULL;
+        if (!wasm_allocation_quota_token_reserve(owner, raw_size, 1)) {
+            wasm_allocation_quota_token_release(owner);
+            return NULL;
+        }
+    }
+
+    raw_ptr = wasm_runtime_malloc_direct(raw_size);
+    if (!raw_ptr) {
+        wasm_allocation_quota_token_refund(owner, raw_size, 1);
+        wasm_allocation_quota_token_release(owner);
+        return NULL;
+    }
+
+    user_ptr = wasm_allocation_header_initialize(
+        raw_ptr, raw_size, size, alignment, explicitly_aligned, owner);
+    if (!user_ptr) {
+        wasm_runtime_free_direct(raw_ptr);
+        wasm_allocation_quota_token_refund(owner, raw_size, 1);
+        wasm_allocation_quota_token_release(owner);
+    }
+    return user_ptr;
 }
 
 void *
@@ -1115,17 +1335,24 @@ wasm_runtime_malloc(unsigned int size)
     }
 #endif
 
-    return wasm_runtime_malloc_internal(size);
+    return wasm_runtime_allocate_owned(size, WASM_ALLOCATION_MAX_ALIGNMENT,
+                                       false);
 }
 
 void *
 wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment)
 {
+    unsigned int allocator_alignment;
+    unsigned int effective_alignment;
+
     if (alignment == 0) {
         LOG_WARNING(
             "warning: wasm_runtime_aligned_alloc with zero alignment\n");
         return NULL;
     }
+
+    if ((alignment & (alignment - 1)) != 0)
+        return NULL;
 
     if (size == 0) {
         LOG_WARNING("warning: wasm_runtime_aligned_alloc with size zero\n");
@@ -1136,6 +1363,26 @@ wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment)
 #endif
     }
 
+    allocator_alignment = alignment < 8 ? 8 : alignment;
+    if (allocator_alignment > (unsigned int)os_getpagesize()
+        || size % allocator_alignment != 0)
+        return NULL;
+    effective_alignment = allocator_alignment < WASM_ALLOCATION_MAX_ALIGNMENT
+                              ? WASM_ALLOCATION_MAX_ALIGNMENT
+                              : allocator_alignment;
+
+    if (memory_mode == MEMORY_MODE_UNKNOWN) {
+        LOG_ERROR("wasm_runtime_aligned_alloc failed: memory hasn't been "
+                  "initialized.\n");
+        return NULL;
+    }
+
+    if (memory_mode != MEMORY_MODE_POOL) {
+        LOG_ERROR("wasm_runtime_aligned_alloc failed: only supported in POOL "
+                  "memory mode.\n");
+        return NULL;
+    }
+
 #if WASM_ENABLE_FUZZ_TEST != 0
     if (size >= WASM_MEM_ALLOC_MAX_SIZE) {
         LOG_WARNING(
@@ -1144,29 +1391,127 @@ wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment)
     }
 #endif
 
-    return wasm_runtime_aligned_alloc_internal(size, alignment);
+    return wasm_runtime_allocate_owned(size, effective_alignment, true);
 }
 
 void *
 wasm_runtime_realloc(void *ptr, unsigned int size)
 {
-    return wasm_runtime_realloc_internal(ptr, size);
+    WASMAllocationHeader old_header;
+    WASMAllocationHeader *header;
+    WASMAllocationQuotaToken *owner;
+    void *new_raw_ptr;
+    void *new_user_ptr;
+    uint32 new_raw_size;
+    uint32 old_user_offset;
+    uint32 new_user_offset;
+    uint32 copy_size;
+    uint64 reserved_growth = 0;
+
+    if (!ptr)
+        return wasm_runtime_malloc(size);
+
+    header = wasm_allocation_header_from_user(ptr);
+    if (!header) {
+        LOG_ERROR("wasm_runtime_realloc failed: invalid allocation header\n");
+        return NULL;
+    }
+
+    old_header = *header;
+    if (old_header.data.explicitly_aligned)
+        return NULL;
+
+    if (size == 0) {
+        wasm_runtime_free(ptr);
+        return NULL;
+    }
+
+    if (!wasm_allocation_header_calculate_size(size, old_header.data.alignment,
+                                               &new_raw_size))
+        return NULL;
+
+    owner = old_header.data.owner;
+    if (new_raw_size > old_header.data.raw_size) {
+        reserved_growth = new_raw_size - old_header.data.raw_size;
+        if (!wasm_allocation_quota_token_reserve(owner, reserved_growth, 0))
+            return NULL;
+    }
+
+    old_user_offset = (uint32)((uint8 *)ptr - (uint8 *)old_header.data.raw_ptr);
+    if (new_raw_size == old_header.data.raw_size) {
+        header->data.user_size = size;
+        return ptr;
+    }
+
+    new_raw_ptr =
+        wasm_runtime_realloc_direct(old_header.data.raw_ptr, new_raw_size);
+    if (!new_raw_ptr) {
+        wasm_allocation_quota_token_refund(owner, reserved_growth, 0);
+        return NULL;
+    }
+
+    new_user_offset =
+        wasm_allocation_user_offset(new_raw_ptr, old_header.data.alignment);
+    new_user_ptr = (uint8 *)new_raw_ptr + new_user_offset;
+    copy_size =
+        old_header.data.user_size < size ? old_header.data.user_size : size;
+    if (new_user_offset != old_user_offset)
+        memmove(new_user_ptr, (uint8 *)new_raw_ptr + old_user_offset,
+                copy_size);
+
+    new_user_ptr = wasm_allocation_header_initialize(
+        new_raw_ptr, new_raw_size, size, old_header.data.alignment, false,
+        owner);
+    bh_assert(new_user_ptr);
+
+    if (new_raw_size < old_header.data.raw_size) {
+        wasm_allocation_quota_token_refund(
+            owner, old_header.data.raw_size - new_raw_size, 0);
+    }
+    return new_user_ptr;
 }
 
 void *
 wasm_runtime_calloc(uint64_t count, unsigned int size)
 {
-    void *ptr = wasm_runtime_malloc(count * size);
+    uint64 total_size;
+    void *ptr;
+
+    if (size != 0 && count > UINT32_MAX / size)
+        return NULL;
+
+    total_size = count * size;
+    if (total_size > UINT32_MAX)
+        return NULL;
+
+    ptr = wasm_runtime_malloc((uint32)total_size);
     if (!ptr)
         return NULL;
-    memset(ptr, 0, count * size);
+    memset(ptr, 0, (uint32)total_size);
     return ptr;
 }
 
 void
 wasm_runtime_free(void *ptr)
 {
-    wasm_runtime_free_internal(ptr);
+    WASMAllocationHeader header_copy;
+    WASMAllocationHeader *header;
+
+    if (!ptr)
+        return;
+
+    header = wasm_allocation_header_from_user(ptr);
+    if (!header) {
+        LOG_ERROR("wasm_runtime_free failed: invalid allocation header\n");
+        return;
+    }
+
+    header_copy = *header;
+    header->data.magic = 0;
+    wasm_runtime_free_direct(header_copy.data.raw_ptr);
+    wasm_allocation_quota_token_refund(header_copy.data.owner,
+                                       header_copy.data.raw_size, 1);
+    wasm_allocation_quota_token_release(header_copy.data.owner);
 }
 
 bool

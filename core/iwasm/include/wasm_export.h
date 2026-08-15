@@ -507,6 +507,7 @@ wasm_runtime_destroy(void);
 
 /**
  * Allocate memory from runtime memory environment.
+ * The returned pointer is aligned for any fundamental C object type.
  *
  * @param size bytes need to allocate
  *
@@ -533,6 +534,9 @@ wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment);
 
 /**
  * Reallocate memory from runtime memory environment
+ * A null pointer is handled as wasm_runtime_malloc(). A zero size frees a
+ * non-aligned allocation and returns NULL. Explicitly aligned allocations
+ * cannot be reallocated and remain owned by the caller when NULL is returned.
  *
  * @param ptr the original memory
  * @param size bytes need to reallocate
@@ -553,9 +557,7 @@ wasm_runtime_realloc(void *ptr, unsigned int size);
 WASM_RUNTIME_API_EXTERN void *
 wasm_runtime_calloc(uint64_t count, unsigned int size);
 
-/*
- * Free memory to runtime memory environment.
- */
+/* Free memory to runtime memory environment. A null pointer is a no-op. */
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_free(void *ptr);
 
