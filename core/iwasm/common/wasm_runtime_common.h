@@ -691,6 +691,9 @@ WASM_RUNTIME_API_EXTERN WASMModuleCommon *
 wasm_runtime_load(uint8 *buf, uint32 size, char *error_buf,
                   uint32 error_buf_size);
 
+bool
+wasm_runtime_load_args_has_valid_allocation_quota(const LoadArgs *args);
+
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN WASMModuleCommon *
 wasm_runtime_load_from_sections(WASMSection *section_list, bool is_aot,

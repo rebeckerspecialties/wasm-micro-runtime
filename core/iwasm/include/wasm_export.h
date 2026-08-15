@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "lib_export.h"
+#include "wasm_load_args.h"
 
 #ifndef WASM_RUNTIME_API_EXTERN
 #if defined(_MSC_BUILD)
@@ -340,29 +341,6 @@ typedef struct RuntimeInitArgs {
      */
     bool enable_linux_perf;
 } RuntimeInitArgs;
-
-#ifndef LOAD_ARGS_OPTION_DEFINED
-#define LOAD_ARGS_OPTION_DEFINED
-typedef struct LoadArgs {
-    char *name;
-    /* This option is only used by the Wasm C API (see wasm_c_api.h) */
-    bool clone_wasm_binary;
-    /* False by default, used by AOT/wasm loader only.
-    If true, the AOT/wasm loader creates a copy of some module fields (e.g.
-    const strings), making it possible to free the wasm binary buffer after
-    loading. */
-    bool wasm_binary_freeable;
-
-    /* false by default, if true, don't resolve the symbols yet. The
-       wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
-       call */
-    bool no_resolve;
-#if WASM_ENABLE_COMPONENT_MODEL != 0
-    bool is_component;
-#endif
-    /* TODO: more fields? */
-} LoadArgs;
-#endif /* LOAD_ARGS_OPTION_DEFINED */
 
 #ifndef INSTANTIATION_ARGS_OPTION_DEFINED
 #define INSTANTIATION_ARGS_OPTION_DEFINED
@@ -763,6 +741,26 @@ wasm_runtime_load(uint8_t *buf, uint32_t size, char *error_buf,
 WASM_RUNTIME_API_EXTERN wasm_module_t
 wasm_runtime_load_ex(uint8_t *buf, uint32_t size, const LoadArgs *args,
                      char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Attach a native-allocation quota to a load and to module/component instances
+ * derived from it.
+ *
+ * Passing five NULL attachment/callback values disables accounting. Any
+ * partially specified callback set is rejected by wasm_runtime_load_ex() and
+ * wasm_component_load().
+ */
+#ifndef WASM_LOAD_ARGS_SET_ALLOCATION_QUOTA_DECLARED
+#define WASM_LOAD_ARGS_SET_ALLOCATION_QUOTA_DECLARED
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_load_args_set_allocation_quota(
+    LoadArgs *args, void *attachment,
+    wasm_allocation_quota_reserve_callback_t reserve_callback,
+    wasm_allocation_quota_release_callback_t release_callback,
+    wasm_allocation_quota_attachment_retain_callback_t retain_callback,
+    wasm_allocation_quota_attachment_release_callback_t
+        attachment_release_callback);
+#endif
 
 /**
  * Resolve symbols for a previously loaded WASM module. Only useful when the

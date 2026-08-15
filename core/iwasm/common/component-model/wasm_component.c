@@ -302,6 +302,12 @@ wasm_component_load(uint8_t *buf, uint32_t size, const LoadArgs *load_args,
         set_error_buf_ex(error_buf, error_buf_size, "Invalid component buffer");
         return NULL;
     }
+    if (load_args
+        && !wasm_runtime_load_args_has_valid_allocation_quota(load_args)) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Incomplete allocation quota callbacks");
+        return NULL;
+    }
 
     if (load_args) {
         args = *load_args;

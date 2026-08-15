@@ -1561,6 +1561,49 @@ register_module_with_null_name(WASMModuleCommon *module_common, char *error_buf,
 #endif
 }
 
+void
+wasm_runtime_load_args_set_allocation_quota(
+    LoadArgs *args, void *attachment,
+    wasm_allocation_quota_reserve_callback_t reserve_callback,
+    wasm_allocation_quota_release_callback_t release_callback,
+    wasm_allocation_quota_attachment_retain_callback_t retain_callback,
+    wasm_allocation_quota_attachment_release_callback_t
+        attachment_release_callback)
+{
+    if (!args) {
+        return;
+    }
+
+    args->allocation_quota_attachment = attachment;
+    args->allocation_quota_reserve = reserve_callback;
+    args->allocation_quota_release = release_callback;
+    args->allocation_quota_attachment_retain = retain_callback;
+    args->allocation_quota_attachment_release = attachment_release_callback;
+}
+
+bool
+wasm_runtime_load_args_has_valid_allocation_quota(const LoadArgs *args)
+{
+    bool any_callback;
+    bool all_callbacks;
+
+    if (!args) {
+        return false;
+    }
+
+    any_callback = args->allocation_quota_reserve
+                   || args->allocation_quota_release
+                   || args->allocation_quota_attachment_retain
+                   || args->allocation_quota_attachment_release;
+    all_callbacks = args->allocation_quota_reserve
+                    && args->allocation_quota_release
+                    && args->allocation_quota_attachment_retain
+                    && args->allocation_quota_attachment_release;
+
+    return (!args->allocation_quota_attachment && !any_callback)
+           || (args->allocation_quota_attachment && all_callbacks);
+}
+
 WASMModuleCommon *
 wasm_runtime_load_ex(uint8 *buf, uint32 size, const LoadArgs *args,
                      char *error_buf, uint32 error_buf_size)
@@ -1572,6 +1615,12 @@ wasm_runtime_load_ex(uint8 *buf, uint32 size, const LoadArgs *args,
     if (!args) {
         set_error_buf(error_buf, error_buf_size,
                       "WASM module load failed: null load arguments");
+        return NULL;
+    }
+    if (!wasm_runtime_load_args_has_valid_allocation_quota(args)) {
+        set_error_buf(error_buf, error_buf_size,
+                      "WASM module load failed: incomplete allocation quota "
+                      "callbacks");
         return NULL;
     }
 
