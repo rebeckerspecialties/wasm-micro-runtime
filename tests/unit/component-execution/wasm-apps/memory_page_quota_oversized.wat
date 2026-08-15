@@ -3,6 +3,6 @@
 
 (component
   (core module $guest
-    (memory 3 8))
+    (memory 3 3))
   (core instance $guest-instance
     (instantiate $guest)))

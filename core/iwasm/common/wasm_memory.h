@@ -146,6 +146,9 @@ wasm_memory_set_page_quota(WASMMemoryInstance *memory_inst,
                            const struct InstantiationArgs2 *args);
 
 bool
+wasm_memory_get_page_quota_units(uint64 byte_size, uint32 *page_count);
+
+bool
 wasm_memory_reserve_page_quota(WASMMemoryInstance *memory_inst, uint32 pages);
 
 void

@@ -985,11 +985,14 @@ memory_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
     void *heap_handle;
     uint32 num_bytes_per_page = memory->num_bytes_per_page;
     uint32 init_page_count = memory->init_page_count;
-    uint32 max_page_count = wasm_runtime_get_max_mem(args->v1.max_memory_pages,
-                                                     memory->init_page_count,
-                                                     memory->max_page_count);
+    uint32 max_page_count = wasm_runtime_get_max_mem(
+        num_bytes_per_page == DEFAULT_NUM_BYTES_PER_PAGE
+            ? args->v1.max_memory_pages
+            : 0,
+        memory->init_page_count, memory->max_page_count);
     uint32 default_max_pages;
     uint32 inc_page_count, global_idx;
+    uint32 initial_quota_pages;
     uint32 bytes_of_last_page, bytes_to_page_end;
     uint64 aux_heap_base,
         heap_offset = (uint64)num_bytes_per_page * init_page_count;
@@ -1010,14 +1013,6 @@ memory_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
         return shared_memory_instance;
     }
 #endif
-
-    if (args->v1.max_memory_pages != 0
-        && init_page_count > args->v1.max_memory_pages) {
-        set_error_buf_v(error_buf, error_buf_size,
-                        "initial memory pages %u exceed configured limit %u",
-                        init_page_count, args->v1.max_memory_pages);
-        return NULL;
-    }
 
     wasm_memory_set_page_quota(memory_inst, args);
 
@@ -1133,21 +1128,28 @@ memory_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
     bh_assert(max_memory_data_size <= GET_MAX_LINEAR_MEMORY_SIZE(is_memory64));
     (void)max_memory_data_size;
 
+    if (!wasm_memory_get_page_quota_units((uint64)num_bytes_per_page
+                                              * init_page_count,
+                                          &initial_quota_pages)) {
+        set_error_buf(error_buf, error_buf_size,
+                      "initial memory page accounting overflow");
+        return NULL;
+    }
     if (args->v1.max_memory_pages != 0
-        && init_page_count > args->v1.max_memory_pages) {
+        && initial_quota_pages > args->v1.max_memory_pages) {
         set_error_buf_v(error_buf, error_buf_size,
                         "effective initial memory pages %u exceed configured "
                         "limit %u",
-                        init_page_count, args->v1.max_memory_pages);
+                        initial_quota_pages, args->v1.max_memory_pages);
         return NULL;
     }
     if (args->v1.max_memory_pages != 0
         && max_page_count > args->v1.max_memory_pages)
         max_page_count = args->v1.max_memory_pages;
-    if (!wasm_memory_reserve_page_quota(memory_inst, init_page_count)) {
+    if (!wasm_memory_reserve_page_quota(memory_inst, initial_quota_pages)) {
         set_error_buf_v(error_buf, error_buf_size,
                         "aggregate memory page quota denied %u initial pages",
-                        init_page_count);
+                        initial_quota_pages);
         return NULL;
     }
 
@@ -1156,7 +1158,7 @@ memory_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
                                     num_bytes_per_page, init_page_count,
                                     max_page_count, &memory_data_size)
         != BHT_OK) {
-        wasm_memory_release_page_quota(memory_inst, init_page_count);
+        wasm_memory_release_page_quota(memory_inst, initial_quota_pages);
         set_error_buf(error_buf, error_buf_size,
                       "allocate linear memory failed");
         return NULL;

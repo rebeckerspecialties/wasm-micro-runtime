@@ -874,9 +874,10 @@ wasm_runtime_instantiation_args_set_max_memory_pages(
  * Set an aggregate committed-page quota shared by this instantiation and any
  * nested core instances which inherit its InstantiationArgs2.
  *
- * Passing NULL callbacks disables aggregate quota accounting.  Otherwise both
- * callbacks must be non-NULL and attachment remains owned by the caller for
- * the lifetime of every resulting module/component instance.
+ * Passing two NULL callbacks disables aggregate quota accounting. Supplying
+ * only one callback makes instantiation fail before allocating an instance.
+ * The attachment remains owned by the caller for the lifetime of every
+ * resulting module/component instance.
  */
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_memory_page_quota(

@@ -99,14 +99,15 @@ class ComponentMemoryPageQuotaTest : public testing::Test
 };
 
 TEST_F(ComponentMemoryPageQuotaTest,
-       RejectsOversizedNestedCoreMemoryBeforeReservation)
+       RejectsShrunkFixedNestedCoreMemoryBeforeReservation)
 {
     PageQuotaState quota{ 2 };
 
     Load("memory_page_quota_oversized.wasm");
     EXPECT_EQ(Instantiate(2, &quota), nullptr);
-    EXPECT_NE(std::strstr(helper->error_buf,
-                          "initial memory pages 3 exceed configured limit 2"),
+    EXPECT_NE(std::strstr(
+                  helper->error_buf,
+                  "effective initial memory pages 3 exceed configured limit 2"),
               nullptr)
         << helper->error_buf;
     EXPECT_EQ(quota.reserve_calls, 0U);

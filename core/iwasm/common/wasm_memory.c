@@ -52,6 +52,20 @@ wasm_memory_set_page_quota(WASMMemoryInstance *memory_inst,
 }
 
 bool
+wasm_memory_get_page_quota_units(uint64 byte_size, uint32 *page_count)
+{
+    uint64 pages;
+
+    bh_assert(page_count);
+    pages = byte_size / DEFAULT_NUM_BYTES_PER_PAGE
+            + (byte_size % DEFAULT_NUM_BYTES_PER_PAGE != 0);
+    if (pages > UINT32_MAX)
+        return false;
+    *page_count = (uint32)pages;
+    return true;
+}
+
+bool
 wasm_memory_reserve_page_quota(WASMMemoryInstance *memory_inst, uint32 pages)
 {
     bh_assert(memory_inst);
@@ -1721,6 +1735,7 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
     uint8 *memory_data_old, *memory_data_new, *heap_data_old;
     uint32 num_bytes_per_page, heap_size;
     uint32 cur_page_count, max_page_count, total_page_count;
+    uint32 new_quota_pages, quota_page_delta;
     uint64 total_size_old = 0, total_size_new;
     bool ret = true, full_size_mmaped;
     bool page_quota_reserved = false, page_quota_committed = false;
@@ -1766,7 +1781,14 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
         goto return_func;
     }
 
-    if (!wasm_memory_reserve_page_quota(memory, inc_page_count)) {
+    if (!wasm_memory_get_page_quota_units(total_size_new, &new_quota_pages)
+        || new_quota_pages < memory->page_quota_reserved_pages) {
+        failure_reason = MAX_SIZE_REACHED;
+        ret = false;
+        goto return_func;
+    }
+    quota_page_delta = new_quota_pages - memory->page_quota_reserved_pages;
+    if (!wasm_memory_reserve_page_quota(memory, quota_page_delta)) {
         failure_reason = MAX_SIZE_REACHED;
         ret = false;
         goto return_func;
@@ -1895,7 +1917,7 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
 
 return_func:
     if (page_quota_reserved && !page_quota_committed)
-        wasm_memory_release_page_quota(memory, inc_page_count);
+        wasm_memory_release_page_quota(memory, quota_page_delta);
 
     if (!ret && module && enlarge_memory_error_cb) {
         WASMExecEnv *exec_env = NULL;
