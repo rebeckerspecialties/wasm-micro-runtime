@@ -10,6 +10,7 @@ profile="$repo_root/tests/apple-app-store-interpreter/apple_wasip2_fast_interp.c
 library="$build_dir/libiwasm.a"
 fixture="$repo_root/tests/unit/component-execution/wasm-apps/add.wasm"
 host_fixture="$repo_root/tests/apple-app-store-interpreter/static_host_component.wasm"
+host_io_fixture="$repo_root/tests/apple-app-store-interpreter/component_host_wasi_io.wasm"
 wasip2_fixture="$repo_root/tests/apple-app-store-interpreter/wasip2_command.wasm"
 architecture=$(uname -m)
 bison_executable=${BISON_EXECUTABLE:-}
@@ -107,6 +108,11 @@ xcrun --sdk macosx clang "${common_flags[@]}" \
 
 xcrun --sdk macosx clang "${common_flags[@]}" \
   "${component_flags[@]}" \
+  "$repo_root/tests/apple-app-store-interpreter/component_host_wasi_io_smoke.c" \
+  "${link_flags[@]}" -o "$build_dir/component-host-wasi-io-smoke"
+
+xcrun --sdk macosx clang "${common_flags[@]}" \
+  "${component_flags[@]}" \
   "$repo_root/tests/apple-app-store-interpreter/component_wasip2_command_smoke.c" \
   "${link_flags[@]}" -o "$build_dir/component-wasip2-command-smoke"
 
@@ -133,6 +139,10 @@ xcrun --sdk macosx clang --analyze -Xanalyzer -analyzer-werror \
   -o "$build_dir/component-host-import-smoke.plist"
 xcrun --sdk macosx clang --analyze -Xanalyzer -analyzer-werror \
   "${common_flags[@]}" "${component_flags[@]}" \
+  "$repo_root/tests/apple-app-store-interpreter/component_host_wasi_io_smoke.c" \
+  -o "$build_dir/component-host-wasi-io-smoke.plist"
+xcrun --sdk macosx clang --analyze -Xanalyzer -analyzer-werror \
+  "${common_flags[@]}" "${component_flags[@]}" \
   "$repo_root/tests/apple-app-store-interpreter/component_wasip2_command_smoke.c" \
   -o "$build_dir/component-wasip2-command-smoke.plist"
 xcrun --sdk macosx clang --analyze -Xanalyzer -analyzer-werror \
@@ -147,6 +157,8 @@ codesign --force --sign - --options runtime \
 codesign --force --sign - --options runtime \
   "$build_dir/component-host-import-smoke"
 codesign --force --sign - --options runtime \
+  "$build_dir/component-host-wasi-io-smoke"
+codesign --force --sign - --options runtime \
   "$build_dir/component-wasip2-command-smoke"
 codesign --force --sign - --options runtime \
   "$build_dir/component-wasip2-defaults-smoke"
@@ -154,5 +166,6 @@ codesign --force --sign - --options runtime \
 "$build_dir/component-smoke" "$fixture"
 "$build_dir/component-termination-smoke"
 "$build_dir/component-host-import-smoke" "$host_fixture"
+"$build_dir/component-host-wasi-io-smoke" "$host_io_fixture"
 "$build_dir/component-wasip2-command-smoke" "$wasip2_fixture"
 "$build_dir/component-wasip2-defaults-smoke" "$wasip2_fixture"

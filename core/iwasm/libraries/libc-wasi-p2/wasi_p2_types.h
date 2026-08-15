@@ -29,13 +29,16 @@ typedef uint64_t wasi_duration_t;
 typedef enum wasi_pollable_type {
     WASI_POLLABLE_IN,
     WASI_POLLABLE_OUT,
-    WASI_POLLABLE_SOCK
+    WASI_POLLABLE_SOCK,
+    WASI_POLLABLE_ALWAYS_READY,
+    WASI_POLLABLE_HOST_CALLBACK
 } wasi_pollable_type_t;
 
 typedef struct wasi_pollable_context {
     int fd;
     bool own_fd;
     wasi_pollable_type_t type;
+    void *host_context;
 } wasi_pollable_context_t;
 
 #define SET_POLLABLE_CTX(pollable, f, own, t) \
@@ -43,11 +46,20 @@ typedef struct wasi_pollable_context {
         (pollable)->fd = f;                   \
         (pollable)->own_fd = own;             \
         (pollable)->type = t;                 \
+        (pollable)->host_context = NULL;      \
     } while (0)
 #define SET_INPUT_POLLABLE(pollable, fd, own) \
     SET_POLLABLE_CTX(pollable, fd, own, WASI_POLLABLE_IN)
 #define SET_OUTPUT_POLLABLE(pollable, fd, own) \
     SET_POLLABLE_CTX(pollable, fd, own, WASI_POLLABLE_OUT)
+#define SET_ALWAYS_READY_POLLABLE(pollable) \
+    SET_POLLABLE_CTX(pollable, -1, false, WASI_POLLABLE_ALWAYS_READY)
+#define SET_HOST_CALLBACK_POLLABLE(pollable, signal_fd, context) \
+    do {                                                         \
+        SET_POLLABLE_CTX(pollable, signal_fd, false,             \
+                         WASI_POLLABLE_HOST_CALLBACK);           \
+        (pollable)->host_context = context;                      \
+    } while (0)
 
 typedef int32_t wasi_error_t;
 typedef int32_t wasi_input_stream_t;

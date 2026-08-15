@@ -756,6 +756,11 @@ wasm_component_host_resource_take(wasm_exec_env_t exec_env,
                                   uint32_t *out_representation);
 
 bool
+wasm_component_cabi_realloc(wasm_exec_env_t exec_env, uint32_t old_offset,
+                            uint32_t old_size, uint32_t alignment,
+                            uint32_t new_size, uint32_t *out_offset);
+
+bool
 wasm_component_set_host_resource_drop_callback(
     WASMComponentInstance *comp_instance, const char *interface_name,
     const char *resource_name,

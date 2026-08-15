@@ -9,11 +9,13 @@
 #define _GNU_SOURCE
 #endif
 
+#include <stdint.h>
 #include <string.h>
 
 #include "wasi_p2_io_wrapper.h"
 #include "wasi_p2_io.h"
 #include "wasi_p2_error.h"
+#include "wasi_p2_host_io.h"
 #include "wasm_runtime_common.h"
 #include "component-model/wasm_component_host_resource.h"
 #include "component-model/wasm_component_canonical.h"
@@ -21,6 +23,86 @@
 #include "bh_common.h"
 #include "wasm_component_runtime.h"
 #include "../../../product-mini/platforms/common/libc_wasi.h"
+
+static bool
+array_allocation_fits(uint64_t count, size_t element_size)
+{
+    return element_size != 0 && count <= SIZE_MAX / element_size;
+}
+
+static void
+free_wit_value_array(wit_value_t *elems, uint32_t count)
+{
+    if (!elems) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        free_wit_value(elems[i]);
+    }
+    wasm_runtime_free(elems);
+}
+
+/* Consume bytes->buf and construct result<list<u8>, stream-error>. */
+static wit_value_t
+u8_list_result_ctor(wasm_module_inst_t module_inst, wasi_list_u8_t *bytes)
+{
+    wit_value_t *elems = NULL;
+    wit_value_t list = NULL;
+    wit_value_t result = NULL;
+    uint32_t constructed = 0;
+
+    if ((bytes->buf_len > 0 && !bytes->buf) || bytes->buf_len > UINT32_MAX
+        || !array_allocation_fits(bytes->buf_len, sizeof(wit_value_t))) {
+        goto oom;
+    }
+
+    uint32_t count = (uint32_t)bytes->buf_len;
+    if (count > 0) {
+        elems = wasm_runtime_malloc(sizeof(wit_value_t) * count);
+        if (!elems) {
+            goto oom;
+        }
+
+        for (; constructed < count; constructed++) {
+            elems[constructed] = wit_u8_ctor(bytes->buf[constructed]);
+            if (!elems[constructed]) {
+                goto oom;
+            }
+        }
+    }
+
+    list = wit_list_ctor(elems, count);
+    if (!list) {
+        goto oom;
+    }
+    elems = NULL;
+
+    result = wit_result_ctor(false, list);
+    if (!result) {
+        goto oom;
+    }
+    list = NULL;
+
+    if (bytes->buf) {
+        wasm_runtime_free(bytes->buf);
+    }
+    bytes->buf = NULL;
+    bytes->buf_len = 0;
+    return result;
+
+oom:
+    free_wit_value(list);
+    free_wit_value_array(elems, constructed);
+    if (bytes->buf) {
+        wasm_runtime_free(bytes->buf);
+    }
+    bytes->buf = NULL;
+    bytes->buf_len = 0;
+    wasm_runtime_set_exception(module_inst,
+                               "Could not allocate input stream result");
+    return NULL;
+}
 
 /* wasi:io/error */
 
@@ -111,29 +193,34 @@ wasi_io_poll_pollable_ready_wrapper(wasm_exec_env_t exec_env,
         wasm_get_component_func_type(exec_env);
 
     wit_value_t lifted_handle = NULL;
+    uint32_t result = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
-        return 0;
+        goto end;
     }
 
     if (!lift_borrow(
             exec_env->cx, pollable_handle,
             func_type->params->params[0].type->type_specific.resource_handle,
             &lifted_handle)) {
-        return 0;
+        goto end;
     }
 
     HostResourceTable *hr_table = get_global_host_resource_table();
     HostResource *hr = host_resource_table_get(
         hr_table, lifted_handle->value.resource_value.value);
 
-    if (!hr) {
+    if (!hr || hr->type != WASI_P2_POLLABLE) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get pollable resource");
-        return 0;
+        goto end;
     }
 
-    return wasi_pollable_ready((wasi_pollable_context_t *)hr->data);
+    result = wasi_pollable_ready((wasi_pollable_context_t *)hr->data);
+
+end:
+    free_wit_value(lifted_handle);
+    return result;
 }
 
 /**
@@ -154,29 +241,38 @@ wasi_io_poll_pollable_block_wrapper(wasm_exec_env_t exec_env,
         wasm_get_component_func_type(exec_env);
 
     wit_value_t lifted_handle = NULL;
+    wasi_p2_wait_status_t wait_status = WASI_P2_WAIT_FAILED;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
-        return;
+        goto end;
     }
 
     if (!lift_borrow(
             exec_env->cx, pollable_handle,
             func_type->params->params[0].type->type_specific.resource_handle,
             &lifted_handle)) {
-        return;
+        goto end;
     }
 
     HostResourceTable *hr_table = get_global_host_resource_table();
     HostResource *hr = host_resource_table_get(
         hr_table, lifted_handle->value.resource_value.value);
 
-    if (!hr) {
+    if (!hr || hr->type != WASI_P2_POLLABLE) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get pollable resource");
-        return;
+        goto end;
     }
 
-    wasi_pollable_block((wasi_pollable_context_t *)hr->data);
+    wait_status = wasi_pollable_block_interruptible(
+        exec_env, (wasi_pollable_context_t *)hr->data);
+    if (wait_status == WASI_P2_WAIT_FAILED) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "Could not wait on pollable resource");
+    }
+
+end:
+    free_wit_value(lifted_handle);
 }
 
 /**
@@ -200,17 +296,19 @@ wasi_io_poll_poll_wrapper(wasm_exec_env_t exec_env, uint32_t pollables,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    wit_value_t lifted_handle = NULL;
     wit_value_t result = NULL;
+    wit_value_t pollables_list = NULL;
+    wit_value_t *elems = NULL;
+    uint32_t constructed = 0;
+    const wasi_pollable_context_t **my_pollables = NULL;
+    wasi_list_u32_t wasi_ret = { 0 };
+    wasi_p2_wait_status_t wait_status = WASI_P2_WAIT_FAILED;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = wit_list_ctor(NULL, 0);
         goto end;
     }
 
-    wasi_list_u32_t wasi_ret;
-
-    wit_value_t pollables_list = NULL;
     uint32_t idx = 0, handle = 0;
 
     if (!load_list_from_range(
@@ -221,13 +319,21 @@ wasi_io_poll_poll_wrapper(wasm_exec_env_t exec_env, uint32_t pollables,
         goto end;
     }
 
-    const wasi_pollable_context_t **my_pollables =
-        (const wasi_pollable_context_t **)wasm_runtime_malloc(
+    if (!array_allocation_fits(pollables_len,
+                               sizeof(wasi_pollable_context_t *))) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "Pollable list is too large");
+        goto end;
+    }
+    if (pollables_len > 0) {
+        my_pollables = (const wasi_pollable_context_t **)wasm_runtime_malloc(
             sizeof(wasi_pollable_context_t *) * pollables_len);
-    WASMComponentResourceHandleInstance *handle_type =
-        func_type->params->params[0]
-            .type->type_specific.list->element_type->type_specific
-            .resource_handle;
+        if (!my_pollables) {
+            wasm_runtime_set_exception(exec_env->module_inst,
+                                       "Could not allocate pollable list");
+            goto end;
+        }
+    }
 
     HostResourceTable *hr_table = get_global_host_resource_table();
     HostResource *hr = NULL;
@@ -236,7 +342,7 @@ wasi_io_poll_poll_wrapper(wasm_exec_env_t exec_env, uint32_t pollables,
         handle = pollables_list->value.list_value.elems[idx]
                      ->value.resource_value.value;
         hr = host_resource_table_get(hr_table, handle);
-        if (!hr) {
+        if (!hr || hr->type != WASI_P2_POLLABLE) {
             wasm_runtime_set_exception(exec_env->module_inst,
                                        "Could not get pollable resource");
             result = wit_list_ctor(NULL, 0);
@@ -245,26 +351,63 @@ wasi_io_poll_poll_wrapper(wasm_exec_env_t exec_env, uint32_t pollables,
         my_pollables[idx] = (wasi_pollable_context_t *)hr->data;
     }
 
-    wasi_poll(my_pollables, pollables_len, &wasi_ret);
+    wait_status = wasi_poll_interruptible(exec_env, my_pollables, pollables_len,
+                                          &wasi_ret);
+    if (wait_status == WASI_P2_WAIT_INTERRUPTED) {
+        goto end;
+    }
+    if (wait_status == WASI_P2_WAIT_FAILED) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "Could not wait on pollable list");
+        goto end;
+    }
 
-    // Deallocate my_pollables
-    wasm_runtime_free(my_pollables);
-
-    wit_value_t *elems = NULL;
-    if (wasi_ret.len)
+    if (!array_allocation_fits(wasi_ret.len, sizeof(wit_value_t))) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "Poll result is too large");
+        goto end;
+    }
+    if (wasi_ret.len > 0) {
         elems = (wit_value_t *)wasm_runtime_malloc(sizeof(wit_value_t)
                                                    * wasi_ret.len);
+        if (!elems) {
+            wasm_runtime_set_exception(exec_env->module_inst,
+                                       "Could not allocate poll result");
+            goto end;
+        }
+    }
 
-    for (idx = 0; idx < wasi_ret.len; idx++) {
-        elems[idx] = wit_u32_ctor(wasi_ret.buf[idx]);
+    for (; constructed < wasi_ret.len; constructed++) {
+        elems[constructed] = wit_u32_ctor(wasi_ret.buf[constructed]);
+        if (!elems[constructed]) {
+            wasm_runtime_set_exception(exec_env->module_inst,
+                                       "Could not allocate poll result");
+            goto end;
+        }
     }
 
     result = wit_list_ctor(elems, wasi_ret.len);
+    if (!result) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "Could not allocate poll result");
+        goto end;
+    }
+    elems = NULL;
+    constructed = 0;
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    if (my_pollables) {
+        wasm_runtime_free(my_pollables);
+    }
+    if (wasi_ret.buf) {
+        wasm_runtime_free(wasi_ret.buf);
+    }
+    free_wit_value_array(elems, constructed);
+    free_wit_value(pollables_list);
+    if (result) {
+        store(exec_env->cx, offset_addr, func_type->results->result, result);
+    }
     free_wit_value(result);
-    free_wit_value(lifted_handle);
 }
 
 /* wasi:io/streams */
@@ -317,7 +460,7 @@ wasi_io_streams_input_stream_read_wrapper(wasm_exec_env_t exec_env,
     HostResource *hr = host_resource_table_get(
         hr_table, lifted_handle->value.resource_value.value);
 
-    if (!hr) {
+    if (!hr || hr->type != WASI_P2_IO_INPUT_STREAM) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get input stream resource");
         uint32_t new_err =
@@ -326,34 +469,26 @@ wasi_io_streams_input_stream_read_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
 
-    // Get the actual input stream fd from the host resource
-    wasi_input_stream_t input_stream_fd =
-        (wasi_input_stream_t)((StreamResourceType *)hr->data)->fd;
-    wasi_input_stream_read(input_stream_fd, len, &wasi_ret);
+    if (wasi_p2_is_callback_input_stream(hr)) {
+        wasi_p2_callback_input_stream_read(hr, (uint64_t)len, &wasi_ret);
+    }
+    else {
+        wasi_input_stream_t input_stream_fd =
+            (wasi_input_stream_t)((StreamResourceType *)hr->data)->fd;
+        wasi_input_stream_read(input_stream_fd, len, &wasi_ret);
+    }
 
     if (wasi_ret.is_err) {
         result = get_hr_stream_error_val(hr, &wasi_ret.u.err);
         goto end;
     }
 
-    uint32_t idx;
-
-    if (wasi_ret.u.ok.buf_len > 0) {
-        wit_value_t *elems = (wit_value_t *)wasm_runtime_malloc(
-            sizeof(wit_value_t) * wasi_ret.u.ok.buf_len);
-        for (idx = 0; idx < wasi_ret.u.ok.buf_len; idx++) {
-            elems[idx] = wit_u8_ctor(wasi_ret.u.ok.buf[idx]);
-        }
-        wit_value_t result_list = wit_list_ctor(elems, wasi_ret.u.ok.buf_len);
-        result = wit_result_ctor(false, result_list);
-    }
-    else {
-        wit_value_t result_list = wit_list_ctor(NULL, 0);
-        result = wit_result_ctor(false, result_list);
-    }
+    result = u8_list_result_ctor(module_inst, &wasi_ret.u.ok);
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    if (result) {
+        store(exec_env->cx, offset_addr, func_type->results->result, result);
+    }
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -406,7 +541,7 @@ wasi_io_streams_input_stream_blocking_read_wrapper(wasm_exec_env_t exec_env,
     HostResource *hr = host_resource_table_get(
         hr_table, lifted_handle->value.resource_value.value);
 
-    if (!hr) {
+    if (!hr || hr->type != WASI_P2_IO_INPUT_STREAM) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get input stream resource");
         uint32_t new_err =
@@ -415,31 +550,26 @@ wasi_io_streams_input_stream_blocking_read_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
 
-    // Get the actual input stream fd from the host resource
-    wasi_input_stream_t input_stream_fd =
-        (wasi_input_stream_t)((StreamResourceType *)hr->data)->fd;
-
-    wasi_input_stream_blocking_read(input_stream_fd, len, &wasi_ret);
+    if (wasi_p2_is_callback_input_stream(hr)) {
+        wasi_p2_callback_input_stream_read(hr, (uint64_t)len, &wasi_ret);
+    }
+    else {
+        wasi_input_stream_t input_stream_fd =
+            (wasi_input_stream_t)((StreamResourceType *)hr->data)->fd;
+        wasi_input_stream_blocking_read(input_stream_fd, len, &wasi_ret);
+    }
 
     if (wasi_ret.is_err) {
         result = get_hr_stream_error_val(hr, &wasi_ret.u.err);
         goto end;
     }
 
-    uint32_t idx;
-
-    if (wasi_ret.u.ok.buf_len > 0) {
-        wit_value_t *elems = (wit_value_t *)wasm_runtime_malloc(
-            sizeof(wit_value_t) * wasi_ret.u.ok.buf_len);
-        for (idx = 0; idx < wasi_ret.u.ok.buf_len; idx++) {
-            elems[idx] = wit_u8_ctor(wasi_ret.u.ok.buf[idx]);
-        }
-        wit_value_t result_list = wit_list_ctor(elems, wasi_ret.u.ok.buf_len);
-        result = wit_result_ctor(false, result_list);
-    }
+    result = u8_list_result_ctor(module_inst, &wasi_ret.u.ok);
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    if (result) {
+        store(exec_env->cx, offset_addr, func_type->results->result, result);
+    }
     free_wit_value(result);
     free_wit_value(lifted_handle);
 }
@@ -489,7 +619,7 @@ wasi_io_streams_input_stream_skip_wrapper(wasm_exec_env_t exec_env,
     HostResource *hr = host_resource_table_get(
         hr_table, lifted_handle->value.resource_value.value);
 
-    if (!hr) {
+    if (!hr || hr->type != WASI_P2_IO_INPUT_STREAM) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get input stream resource");
         uint32_t new_err =
@@ -498,11 +628,14 @@ wasi_io_streams_input_stream_skip_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
 
-    // Get the actual input stream fd from the host resource
-    wasi_input_stream_t input_stream_fd =
-        (wasi_input_stream_t)((StreamResourceType *)hr->data)->fd;
-
-    wasi_input_stream_skip(input_stream_fd, len, &wasi_ret);
+    if (wasi_p2_is_callback_input_stream(hr)) {
+        wasi_p2_callback_input_stream_skip(hr, (uint64_t)len, &wasi_ret);
+    }
+    else {
+        wasi_input_stream_t input_stream_fd =
+            (wasi_input_stream_t)((StreamResourceType *)hr->data)->fd;
+        wasi_input_stream_skip(input_stream_fd, len, &wasi_ret);
+    }
 
     if (wasi_ret.is_err) {
         result = get_hr_stream_error_val(hr, &wasi_ret.u.err);
@@ -563,7 +696,7 @@ wasi_io_streams_input_stream_blocking_skip_wrapper(wasm_exec_env_t exec_env,
     HostResource *hr = host_resource_table_get(
         hr_table, lifted_handle->value.resource_value.value);
 
-    if (!hr) {
+    if (!hr || hr->type != WASI_P2_IO_INPUT_STREAM) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get input stream resource");
         uint32_t new_err =
@@ -572,11 +705,14 @@ wasi_io_streams_input_stream_blocking_skip_wrapper(wasm_exec_env_t exec_env,
         goto end;
     }
 
-    // Get the actual input stream fd from the host resource
-    wasi_input_stream_t input_stream_fd =
-        (wasi_input_stream_t)((StreamResourceType *)hr->data)->fd;
-
-    wasi_input_stream_blocking_skip(input_stream_fd, len, &wasi_ret);
+    if (wasi_p2_is_callback_input_stream(hr)) {
+        wasi_p2_callback_input_stream_skip(hr, (uint64_t)len, &wasi_ret);
+    }
+    else {
+        wasi_input_stream_t input_stream_fd =
+            (wasi_input_stream_t)((StreamResourceType *)hr->data)->fd;
+        wasi_input_stream_blocking_skip(input_stream_fd, len, &wasi_ret);
+    }
 
     if (wasi_ret.is_err) {
         result = get_hr_stream_error_val(hr, &wasi_ret.u.err);
@@ -609,26 +745,27 @@ wasi_io_streams_input_stream_subscribe_wrapper(wasm_exec_env_t exec_env,
         wasm_get_component_func_type(exec_env);
 
     wit_value_t lifted_handle = NULL;
+    uint32_t result = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
-        return 0;
+        goto end;
     }
 
     if (!lift_borrow(
             exec_env->cx, input_stream_handle,
             func_type->params->params[0].type->type_specific.resource_handle,
             &lifted_handle)) {
-        return 0;
+        goto end;
     }
 
     HostResourceTable *hr_table = get_global_host_resource_table();
     HostResource *hr = host_resource_table_get(
         hr_table, lifted_handle->value.resource_value.value);
 
-    if (!hr) {
+    if (!hr || hr->type != WASI_P2_IO_INPUT_STREAM) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get input stream resource");
-        return 0;
+        goto end;
     }
 
     HostResource *hr_poll =
@@ -637,11 +774,16 @@ wasi_io_streams_input_stream_subscribe_wrapper(wasm_exec_env_t exec_env,
     if (!hr_poll) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not create pollable resource");
-        return 0;
+        goto end;
     }
 
-    SET_INPUT_POLLABLE((wasi_pollable_context_t *)hr_poll->data,
-                       ((StreamResourceType *)hr->data)->fd, false);
+    if (wasi_p2_is_callback_input_stream(hr)) {
+        SET_ALWAYS_READY_POLLABLE((wasi_pollable_context_t *)hr_poll->data);
+    }
+    else {
+        SET_INPUT_POLLABLE((wasi_pollable_context_t *)hr_poll->data,
+                           ((StreamResourceType *)hr->data)->fd, false);
+    }
     host_resource_set_dtor(hr_poll, pollable_dtor);
 
     uint32_t index_rep = host_resource_table_add(hr_table, hr_poll);
@@ -650,16 +792,20 @@ wasi_io_streams_input_stream_subscribe_wrapper(wasm_exec_env_t exec_env,
         wasm_runtime_set_exception(
             exec_env->module_inst,
             "Could not add pollable resource to HR table");
-        return 0;
+        goto end;
     }
 
     if (!lower_owned_host_resource(
             exec_env,
             func_type->results->result[0].type_specific.resource_handle,
             hr_table, index_rep, &index_rep)) {
-        return 0;
+        goto end;
     }
-    return index_rep;
+    result = index_rep;
+
+end:
+    free_wit_value(lifted_handle);
+    return result;
 }
 
 /**
@@ -1336,7 +1482,7 @@ wasi_io_streams_output_stream_splice_wrapper(wasm_exec_env_t exec_env,
     HostResource *hr_stream_out = host_resource_table_get(
         hr_table, lifted_output_handle->value.resource_value.value);
 
-    if (!hr_stream_out) {
+    if (!hr_stream_out || hr_stream_out->type != WASI_P2_IO_OUTPUT_STREAM) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get output stream resource");
         uint32_t new_err =
@@ -1348,7 +1494,7 @@ wasi_io_streams_output_stream_splice_wrapper(wasm_exec_env_t exec_env,
     HostResource *hr_input_stream = host_resource_table_get(
         hr_table, lifted_input_handle->value.resource_value.value);
 
-    if (!hr_input_stream) {
+    if (!hr_input_stream || hr_input_stream->type != WASI_P2_IO_INPUT_STREAM) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get input stream resource");
         uint32_t new_err =
@@ -1360,19 +1506,20 @@ wasi_io_streams_output_stream_splice_wrapper(wasm_exec_env_t exec_env,
     // Get the actual output stream fd from the host resource
     wasi_input_stream_t output_stream_fd =
         (wasi_input_stream_t)((StreamResourceType *)hr_stream_out->data)->fd;
-    wasi_input_stream_t in_stream_fd =
-        (wasi_input_stream_t)((StreamResourceType *)hr_input_stream->data)->fd;
-
-    wasi_output_stream_splice(output_stream_fd, in_stream_fd, len, &wasi_ret);
+    if (wasi_p2_is_callback_input_stream(hr_input_stream)) {
+        wasi_p2_callback_input_stream_splice(hr_input_stream, output_stream_fd,
+                                             (uint64_t)len, false, &wasi_ret);
+    }
+    else {
+        wasi_input_stream_t in_stream_fd =
+            (wasi_input_stream_t)((StreamResourceType *)hr_input_stream->data)
+                ->fd;
+        wasi_output_stream_splice(output_stream_fd, in_stream_fd, (uint64_t)len,
+                                  &wasi_ret);
+    }
 
     if (wasi_ret.is_err) {
-        uint32_t new_err =
-            wasi_error_new(((WasiErrorResource *)hr_input_stream->data)->type,
-                           wasi_ret.u.err.payload.error);
-        bool is_closed = (wasi_ret.u.err.kind == WASI_STREAM_ERROR_KIND_CLOSED)
-                             ? true
-                             : false;
-        result = get_stream_error_val(is_closed, new_err);
+        result = get_hr_stream_error_val(hr_input_stream, &wasi_ret.u.err);
         goto end;
     }
 
@@ -1442,7 +1589,7 @@ wasi_io_streams_output_stream_blocking_splice_wrapper(
     HostResource *hr_stream_out = host_resource_table_get(
         hr_table, lifted_output_handle->value.resource_value.value);
 
-    if (!hr_stream_out) {
+    if (!hr_stream_out || hr_stream_out->type != WASI_P2_IO_OUTPUT_STREAM) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get output stream resource");
         uint32_t new_err =
@@ -1454,7 +1601,7 @@ wasi_io_streams_output_stream_blocking_splice_wrapper(
     HostResource *hr_input_stream = host_resource_table_get(
         hr_table, lifted_input_handle->value.resource_value.value);
 
-    if (!hr_input_stream) {
+    if (!hr_input_stream || hr_input_stream->type != WASI_P2_IO_INPUT_STREAM) {
         wasm_runtime_set_exception(exec_env->module_inst,
                                    "Could not get input stream resource");
         uint32_t new_err =
@@ -1466,20 +1613,20 @@ wasi_io_streams_output_stream_blocking_splice_wrapper(
     // Get the actual output stream fd from the host resource
     wasi_input_stream_t output_stream_fd =
         (wasi_input_stream_t)((StreamResourceType *)hr_stream_out->data)->fd;
-    wasi_input_stream_t in_stream_fd =
-        (wasi_input_stream_t)((StreamResourceType *)hr_input_stream->data)->fd;
-
-    wasi_output_stream_blocking_splice(output_stream_fd, in_stream_fd, len,
-                                       &wasi_ret);
+    if (wasi_p2_is_callback_input_stream(hr_input_stream)) {
+        wasi_p2_callback_input_stream_splice(hr_input_stream, output_stream_fd,
+                                             (uint64_t)len, true, &wasi_ret);
+    }
+    else {
+        wasi_input_stream_t in_stream_fd =
+            (wasi_input_stream_t)((StreamResourceType *)hr_input_stream->data)
+                ->fd;
+        wasi_output_stream_blocking_splice(output_stream_fd, in_stream_fd,
+                                           (uint64_t)len, &wasi_ret);
+    }
 
     if (wasi_ret.is_err) {
-        uint32_t new_err =
-            wasi_error_new(((WasiErrorResource *)hr_stream_out->data)->type,
-                           wasi_ret.u.err.payload.error);
-        bool is_closed = (wasi_ret.u.err.kind == WASI_STREAM_ERROR_KIND_CLOSED)
-                             ? true
-                             : false;
-        result = get_stream_error_val(is_closed, new_err);
+        result = get_hr_stream_error_val(hr_input_stream, &wasi_ret.u.err);
         goto end;
     }
 

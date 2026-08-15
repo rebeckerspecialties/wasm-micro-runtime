@@ -11,6 +11,9 @@
 
 #include "wasi_p2_types.h"
 
+struct WASMExecEnv;
+typedef struct WASMExecEnv *wasm_exec_env_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -19,12 +22,33 @@ extern "C" {
 void
 wasi_pollable_block(wasi_pollable_context_t *pollable);
 
+typedef enum wasi_p2_wait_status {
+    WASI_P2_WAIT_READY,
+    WASI_P2_WAIT_INTERRUPTED,
+    WASI_P2_WAIT_FAILED,
+} wasi_p2_wait_status_t;
+
+wasi_p2_wait_status_t
+wasi_pollable_block_interruptible(wasm_exec_env_t exec_env,
+                                  wasi_pollable_context_t *pollable);
+
 bool
 wasi_pollable_ready(wasi_pollable_context_t *pollable);
 
 void
 wasi_poll(const wasi_pollable_context_t **pollables, uint32_t n_pollables,
           wasi_list_u32_t *ret);
+
+wasi_p2_wait_status_t
+wasi_poll_interruptible(wasm_exec_env_t exec_env,
+                        const wasi_pollable_context_t **pollables,
+                        uint32_t n_pollables, wasi_list_u32_t *ret);
+
+void
+wasi_p2_interrupt_wait_request(wasm_exec_env_t exec_env);
+
+void
+wasi_p2_interrupt_wait_destroy(wasm_exec_env_t exec_env);
 
 // wasi:io/streams
 void

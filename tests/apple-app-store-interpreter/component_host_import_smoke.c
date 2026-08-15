@@ -22,6 +22,7 @@ enum {
 typedef enum ProbeMode {
     PROBE_VALID,
     PROBE_INVALID_RANGES,
+    PROBE_REALLOC_TRAP,
 } ProbeMode;
 
 typedef struct MemoryProbeState {
@@ -37,6 +38,14 @@ typedef struct MemoryProbeState {
     bool overflow_rejected;
     bool failed_outputs_cleared;
     bool callback_kind;
+    bool realloc_succeeded;
+    bool realloc_freed;
+    bool realloc_invalid_alignment_rejected;
+    bool realloc_invalid_old_size_rejected;
+    bool realloc_outputs_cleared;
+    bool reacquired_after_realloc;
+    bool realloc_trap_rejected;
+    bool realloc_trap_context_preserved;
 } MemoryProbeState;
 
 static bool saw_custom_data;
@@ -57,9 +66,23 @@ bump_raw(wasm_exec_env_t exec_env, uint64_t *canonical_cells)
     memory_probe.callback_exec_env = exec_env;
     memory_probe.callback_kind = wasm_component_exec_env_is_callback(exec_env);
 
+    if (memory_probe.mode == PROBE_REALLOC_TRAP) {
+        uint32_t realloc_offset = UINT32_MAX;
+
+        memory_probe.realloc_trap_rejected = !wasm_component_cabi_realloc(
+            exec_env, 0, 0, 8, 13, &realloc_offset);
+        memory_probe.realloc_outputs_cleared = realloc_offset == 0;
+        memory_probe.realloc_trap_context_preserved =
+            wasm_component_exec_env_is_callback(exec_env)
+            && wasm_component_get_memory_range_const(exec_env, PROBE_OFFSET,
+                                                     PROBE_SIZE, &const_data);
+        return;
+    }
+
     if (memory_probe.mode == PROBE_INVALID_RANGES) {
         uint8_t *mutable_sentinel = (uint8_t *)(uintptr_t)1;
         const uint8_t *const_sentinel = (const uint8_t *)(uintptr_t)1;
+        uint32_t realloc_offset = UINT32_MAX;
 
         memory_probe.bounds_rejected =
             !wasm_component_validate_memory_range(exec_env, 0, UINT32_MAX)
@@ -70,7 +93,10 @@ bump_raw(wasm_exec_env_t exec_env, uint64_t *canonical_cells)
             && !wasm_component_get_memory_range_const(exec_env, UINT32_MAX, 2,
                                                       &const_sentinel);
         memory_probe.failed_outputs_cleared =
-            mutable_sentinel == NULL && const_sentinel == NULL;
+            mutable_sentinel == NULL && const_sentinel == NULL
+            && !wasm_component_cabi_realloc(exec_env, UINT32_MAX, 2, 1, 4,
+                                            &realloc_offset)
+            && realloc_offset == 0;
         return;
     }
 
@@ -87,6 +113,39 @@ bump_raw(wasm_exec_env_t exec_env, uint64_t *canonical_cells)
         memory_probe.mutable_round_trip = const_data[0] == 'W';
         mutable_data[0] = 'w';
     }
+    const_data = NULL;
+    mutable_data = NULL;
+    {
+        uint32_t realloc_offset = UINT32_MAX;
+        uint32_t freed_offset = UINT32_MAX;
+        uint32_t invalid_alignment_offset = UINT32_MAX;
+        uint32_t invalid_old_size_offset = UINT32_MAX;
+        uint8_t *allocation = NULL;
+
+        memory_probe.realloc_succeeded =
+            wasm_component_cabi_realloc(exec_env, 0, 0, 8, 16, &realloc_offset);
+        memory_probe.reacquired_after_realloc =
+            memory_probe.realloc_succeeded && realloc_offset == WASM_PAGE_SIZE
+            && wasm_component_get_memory_range_const(exec_env, PROBE_OFFSET,
+                                                     PROBE_SIZE, &const_data)
+            && memcmp(const_data, "wamr", PROBE_SIZE) == 0
+            && wasm_component_get_memory_range(exec_env, realloc_offset, 16,
+                                               &allocation);
+        if (memory_probe.reacquired_after_realloc) {
+            memcpy(allocation, "host", PROBE_SIZE);
+        }
+        memory_probe.realloc_freed = wasm_component_cabi_realloc(
+            exec_env, realloc_offset, 16, 8, 0, &freed_offset);
+        memory_probe.realloc_invalid_alignment_rejected =
+            !wasm_component_cabi_realloc(exec_env, 0, 0, 3, 8,
+                                         &invalid_alignment_offset);
+        memory_probe.realloc_invalid_old_size_rejected =
+            !wasm_component_cabi_realloc(exec_env, 0, 4, 4, 8,
+                                         &invalid_old_size_offset);
+        memory_probe.realloc_outputs_cleared = freed_offset == 0
+                                               && invalid_alignment_offset == 0
+                                               && invalid_old_size_offset == 0;
+    }
     memory_probe.empty_at_end =
         wasm_component_validate_memory_range(exec_env, WASM_PAGE_SIZE, 0);
     memory_probe.null_output_rejected = !wasm_component_get_memory_range(
@@ -100,6 +159,7 @@ rejects_non_callback_context(wasm_exec_env_t exec_env)
 {
     uint8_t *mutable_sentinel = (uint8_t *)(uintptr_t)1;
     const uint8_t *const_sentinel = (const uint8_t *)(uintptr_t)1;
+    uint32_t realloc_offset = UINT32_MAX;
 
     return !wasm_component_validate_memory_range(exec_env, 0, 0)
            && !wasm_component_exec_env_is_callback(exec_env)
@@ -107,7 +167,10 @@ rejects_non_callback_context(wasm_exec_env_t exec_env)
                                                &mutable_sentinel)
            && !wasm_component_get_memory_range_const(exec_env, 0, 0,
                                                      &const_sentinel)
-           && mutable_sentinel == NULL && const_sentinel == NULL;
+           && !wasm_component_cabi_realloc(exec_env, 0, 0, 1, 1,
+                                           &realloc_offset)
+           && mutable_sentinel == NULL && const_sentinel == NULL
+           && realloc_offset == 0;
 }
 
 static bool
@@ -266,13 +329,24 @@ main(int argc, char **argv)
     if (!memory_probe.callback_kind || !memory_probe.valid_const
         || !memory_probe.valid_mutable || !memory_probe.pointers_match
         || !memory_probe.mutable_round_trip || !memory_probe.empty_at_end
-        || !memory_probe.null_output_rejected) {
+        || !memory_probe.null_output_rejected || !memory_probe.realloc_succeeded
+        || !memory_probe.realloc_freed
+        || !memory_probe.realloc_invalid_alignment_rejected
+        || !memory_probe.realloc_invalid_old_size_rejected
+        || !memory_probe.realloc_outputs_cleared
+        || !memory_probe.reacquired_after_realloc) {
         fprintf(stderr,
                 "valid component callback memory probe failed: "
-                "const=%d mutable=%d match=%d round-trip=%d end=%d null=%d\n",
+                "const=%d mutable=%d match=%d round-trip=%d end=%d null=%d "
+                "realloc=%d free=%d align=%d old=%d cleared=%d reacquire=%d\n",
                 memory_probe.valid_const, memory_probe.valid_mutable,
                 memory_probe.pointers_match, memory_probe.mutable_round_trip,
-                memory_probe.empty_at_end, memory_probe.null_output_rejected);
+                memory_probe.empty_at_end, memory_probe.null_output_rejected,
+                memory_probe.realloc_succeeded, memory_probe.realloc_freed,
+                memory_probe.realloc_invalid_alignment_rejected,
+                memory_probe.realloc_invalid_old_size_rejected,
+                memory_probe.realloc_outputs_cleared,
+                memory_probe.reacquired_after_realloc);
         goto deinstantiate;
     }
     if (!rejects_non_callback_context(NULL)
@@ -287,11 +361,30 @@ main(int argc, char **argv)
     }
 
     memset(&memory_probe, 0, sizeof(memory_probe));
+    if (!wasm_component_call_prepared(prepared_call, 1, &result, 1, &argument)
+        || !wasm_component_prepared_call_post_return(prepared_call)
+        || !memory_probe.realloc_succeeded
+        || !memory_probe.reacquired_after_realloc) {
+        fprintf(stderr, "reused prepared call failed after guest realloc\n");
+        goto deinstantiate;
+    }
+
+    memset(&memory_probe, 0, sizeof(memory_probe));
     memory_probe.mode = PROBE_INVALID_RANGES;
     if (wasm_component_call_prepared(prepared_call, 1, &result, 1, &argument)
         || !memory_probe.bounds_rejected || !memory_probe.overflow_rejected
         || !memory_probe.failed_outputs_cleared) {
         fprintf(stderr, "invalid component callback memory probe failed\n");
+        goto deinstantiate;
+    }
+
+    memset(&memory_probe, 0, sizeof(memory_probe));
+    memory_probe.mode = PROBE_REALLOC_TRAP;
+    if (wasm_component_call_prepared(prepared_call, 1, &result, 1, &argument)
+        || !memory_probe.realloc_trap_rejected
+        || !memory_probe.realloc_outputs_cleared
+        || !memory_probe.realloc_trap_context_preserved) {
+        fprintf(stderr, "trapping guest realloc corrupted callback state\n");
         goto deinstantiate;
     }
 

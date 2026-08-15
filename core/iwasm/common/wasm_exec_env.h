@@ -24,6 +24,9 @@ typedef struct WASMComponentInstance WASMComponentInstance;
 typedef struct WASMFunctionInstance WASMFunctionInstance;
 typedef struct WASMMemoryInstance WASMMemoryInstance;
 typedef struct LiftLowerContext LiftLowerContext;
+#if WASM_ENABLE_LIBC_WASI_P2 != 0 && WASM_ENABLE_THREAD_MGR != 0
+typedef struct WasiP2WaitInterrupt WasiP2WaitInterrupt;
+#endif
 #endif
 
 #if WASM_ENABLE_THREAD_MGR != 0
@@ -194,6 +197,9 @@ typedef struct WASMExecEnv {
     WASMMemoryInstance *memory;
     LiftLowerContext *cx;
     bool component_callback_active;
+#if WASM_ENABLE_LIBC_WASI_P2 != 0 && WASM_ENABLE_THREAD_MGR != 0
+    WasiP2WaitInterrupt *wasi_p2_wait_interrupt;
+#endif
 #endif
 
     /* The WASM stack of current thread */

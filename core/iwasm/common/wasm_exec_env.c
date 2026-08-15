@@ -19,6 +19,11 @@
 #include "aot_runtime.h"
 #endif
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_LIBC_WASI_P2 != 0 \
+    && WASM_ENABLE_THREAD_MGR != 0
+#include "../libraries/libc-wasi-p2/wasi_p2_io.h"
+#endif
+
 #if WASM_ENABLE_THREAD_MGR != 0
 #include "../libraries/thread-mgr/thread_manager.h"
 #if WASM_ENABLE_DEBUG_INTERP != 0
@@ -117,6 +122,10 @@ fail1:
 void
 wasm_exec_env_destroy_internal(WASMExecEnv *exec_env)
 {
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_LIBC_WASI_P2 != 0 \
+    && WASM_ENABLE_THREAD_MGR != 0
+    wasi_p2_interrupt_wait_destroy(exec_env);
+#endif
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     os_munmap(exec_env->exce_check_guard_page, os_getpagesize());
 #endif
