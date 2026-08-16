@@ -15,8 +15,7 @@
 // Helper function to covert environment variable list tuple to wit_value_t
 static wit_value_t
 get_environ_val(wasi_tuple_string_string_t *environment_entry,
-                uint32_t environ_count,
-                wasm_exec_env_t exec_env)
+                uint32_t environ_count, wasm_exec_env_t exec_env)
 {
     wit_value_t *elems =
         (wit_value_t *)wasm_runtime_malloc(2 * sizeof(wit_value_t));
@@ -29,9 +28,8 @@ get_environ_val(wasi_tuple_string_string_t *environment_entry,
                   strlen(environment_entry->key), encoding, &encoded_str_key,
                   &encoded_str_len_key, &encoded_code_units_key);
     encode_string(exec_env->cx, environment_entry->value,
-                  strlen(environment_entry->value), encoding,
-                  &encoded_str_val, &encoded_str_len_val,
-                  &encoded_code_units_val);
+                  strlen(environment_entry->value), encoding, &encoded_str_val,
+                  &encoded_str_len_val, &encoded_code_units_val);
 
     elems[0] = wit_string_ctor((char *)encoded_str_key, encoded_str_len_key,
                                encoded_code_units_key, encoding);
