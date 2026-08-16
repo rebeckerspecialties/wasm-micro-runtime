@@ -4,6 +4,10 @@
 */
 
 #include <gtest/gtest.h>
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#endif
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>

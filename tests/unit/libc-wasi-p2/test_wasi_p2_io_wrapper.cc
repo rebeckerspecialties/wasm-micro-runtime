@@ -1093,6 +1093,26 @@ TEST_F(WasiP2IoWrapperTest, test_call_skip)
   ASSERT_FALSE(loaded_value->value.result_value.is_err);
 }
 
+TEST_F(WasiP2IoWrapperTest,
+       NativeInvocationAcceptsFourByteAlignedCanonicalI64Cells)
+{
+    WASMFunctionInstance *lower = find_lower(comp_instance, 25);
+    ASSERT_NE(lower, nullptr);
+    auto *exec_env =
+        reinterpret_cast<WASMExecEnv *>(wasm_runtime_get_exec_env_singleton(
+            reinterpret_cast<WASMModuleInstanceCommon *>(
+                lower->module_instance)));
+    ASSERT_NE(exec_env, nullptr);
+
+    std::vector<uint64_t> storage((lower->param_cell_num + 2) / 2 + 1, 0);
+    uint32 *argv = reinterpret_cast<uint32 *>(storage.data()) + 1;
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(argv) & 7u, 4u);
+    uint32 argv_ret[2] = {};
+
+    EXPECT_TRUE(wasm_runtime_invoke_native_p2(exec_env, lower, argv,
+                                              lower->param_cell_num, argv_ret));
+}
+
 TEST_F(WasiP2IoWrapperTest, test_call_blocking_skip)
 {
     ASSERT_TRUE(wasm_component_application_execute_func(
@@ -1339,6 +1359,24 @@ TEST_F(WasiP2IoWrapperTest, test_blocking_splice)
   ASSERT_TRUE(load_result);
   ASSERT_NE(loaded_value, nullptr);
   ASSERT_FALSE(loaded_value->value.result_value.is_err);
+}
+
+TEST_F(WasiP2IoWrapperTest,
+       SpliceUnsupportedCapabilityDoesNotFreeUninitializedHandles)
+{
+    WASIContext *context = wasm_runtime_get_wasi_ctx(
+        (WASMModuleInstanceCommon *)comp_instance->core_module_instances[0]);
+    uint32_t saved_common = context->wasi_options->common;
+    context->wasi_options->common = 0;
+
+    bool splice_executed = wasm_component_application_execute_func(
+        comp_instance, (char *)"call-splice()");
+    bool blocking_splice_executed = wasm_component_application_execute_func(
+        comp_instance, (char *)"call-blocking-splice()");
+
+    context->wasi_options->common = saved_common;
+    ASSERT_TRUE(splice_executed);
+    ASSERT_TRUE(blocking_splice_executed);
 }
 
 // Error
