@@ -786,11 +786,16 @@ wasm_resolve_core_instance(WASMComponentCoreInstSection *instance_section,
 #if WASM_ENABLE_LIBC_WASI != 0
             wasm_runtime_set_wasi_ctx((WASMModuleInstanceCommon *)core_instance,
                                       comp_instance->wasi_ctx);
+#if WASM_ENABLE_UVWASI == 0
+            /* The uvwasi WASIContext variant has no wasi_options member;
+               only the built-in libc-wasi implementation carries the
+               component-model options through the context. */
             WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(
                 (WASMModuleInstanceCommon *)core_instance);
             if (wasi_ctx) {
                 wasi_ctx->wasi_options = root_comp->wasi_args.wasi_options;
             }
+#endif
 #endif
             goto done_imports;
         fail_imports:
