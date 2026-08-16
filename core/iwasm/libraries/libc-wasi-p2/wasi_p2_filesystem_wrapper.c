@@ -1661,6 +1661,7 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
+    wit_value_t path_val = NULL;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -1675,7 +1676,6 @@ wasi_filesystem_open_at_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
         goto end;
     }
 
-    wit_value_t path_val = NULL;
     if (!load_string_from_range(exec_env->cx, path_ptr, path_len, &path_val)) {
         result = get_result_error_val(WASI_NETWORK_ERROR_CODE_INVALID_ARGUMENT);
         goto end;
@@ -1768,6 +1768,7 @@ wasi_filesystem_readlink_at_wrapper(wasm_exec_env_t exec_env,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
     wit_value_t lifted_handle = NULL;
+    char *link_content = NULL;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
         result = get_result_error_val(WASI_FILESYSTEM_CODE_UNSUPPORTED);
@@ -1782,7 +1783,6 @@ wasi_filesystem_readlink_at_wrapper(wasm_exec_env_t exec_env,
 
     char *path = name_val->value.string_value.chars;
 
-    char *link_content;
     int err = 0;
     if (!lift_borrow(
             exec_env->cx, fd,

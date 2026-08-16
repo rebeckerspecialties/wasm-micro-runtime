@@ -26,8 +26,8 @@ extern "C" {
 #define HEAP_SIZE (100 * 1024 * 1024) // 100 MB
 #define STACK_SIZE (16 * 1024)        // 100 MB
 
-#define MAX_REG_FLOATS 8
-#define MAX_REG_INTS 6
+#define COMPONENT_MAX_REG_FLOATS 8
+#define COMPONENT_MAX_REG_INTS 6
 
 typedef struct WASMComponentTypeInstance WASMComponentTypeInstance;
 typedef struct WASMComponentInstance WASMComponentInstance;

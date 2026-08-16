@@ -3540,6 +3540,9 @@ wasi_sockets_udp_incoming_datagram_stream_receive_wrapper(
 
     wit_value_t lifted_handle = NULL;
     wit_value_t result = NULL;
+    wasi_incoming_datagram_t *datagrams = NULL;
+    uint64_t datagrams_len = 0;
+    uint64_t i = 0;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common
         || !wasi_ctx->wasi_options->inherit_network
@@ -3556,10 +3559,7 @@ wasi_sockets_udp_incoming_datagram_stream_receive_wrapper(
         goto end;
     }
 
-    wasi_incoming_datagram_t *datagrams = NULL;
-    uint64_t datagrams_len = 0;
     int err = 0;
-    uint64_t i;
 
     HostResourceTable *hr_table = get_global_host_resource_table();
     HostResource *hr = host_resource_table_get(

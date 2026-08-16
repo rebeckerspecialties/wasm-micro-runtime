@@ -1954,11 +1954,12 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
 
 #if WASM_ENABLE_SIMD != 0 && WASM_ENABLE_FAST_INTERP != 0
     /* SIMD assembly: each xmm slot = 16 bytes = 2 uint64 slots */
-    argc1 =
-        1 + MAX_REG_FLOATS * 2 + (uint32)func_type->param_count + ext_ret_count;
+    argc1 = 1 + COMPONENT_MAX_REG_FLOATS * 2 + (uint32)func_type->param_count
+            + ext_ret_count;
 #else
     /* Non-SIMD assembly: each xmm slot = 8 bytes = 1 uint64 slot */
-    argc1 = 1 + MAX_REG_FLOATS + (uint32)func_type->param_count + ext_ret_count;
+    argc1 = 1 + COMPONENT_MAX_REG_FLOATS + (uint32)func_type->param_count
+            + ext_ret_count;
 #endif
 
     if (argc1 > sizeof(argv_buf) / sizeof(uint64)) {
@@ -1989,18 +1990,20 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     exec_env->core_func = cur_func;
 
 #if WASM_ENABLE_SIMD != 0 && WASM_ENABLE_FAST_INTERP != 0
-    /* fp as v128*: each step = 16 bytes; ints at byte offset MAX_REG_FLOATS*16
+    /* fp as v128*: each step = 16 bytes; ints at byte offset
+       COMPONENT_MAX_REG_FLOATS*16
      */
     fps = (V128 *)argv1;
-    ints = (uint64 *)(fps + MAX_REG_FLOATS);
+    ints = (uint64 *)(fps + COMPONENT_MAX_REG_FLOATS);
 #else
-    /* fp as v128*: each step = 16 bytes; ints at byte offset MAX_REG_FLOATS*8
+    /* fp as v128*: each step = 16 bytes; ints at byte offset
+       COMPONENT_MAX_REG_FLOATS*8
      */
     fps = argv1;
-    ints = fps + MAX_REG_FLOATS;
+    ints = fps + COMPONENT_MAX_REG_FLOATS;
 #endif
 
-    stacks = ints + MAX_REG_INTS;
+    stacks = ints + COMPONENT_MAX_REG_INTS;
 
     ints[n_ints++] = (uint64)(uintptr_t)exec_env;
 
@@ -2049,7 +2052,7 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
                         arg_i64 = (uint64)memory->memory_data + app_offset;
                     }
                 }
-                if (n_ints < MAX_REG_INTS)
+                if (n_ints < COMPONENT_MAX_REG_INTS)
                     ints[n_ints++] = arg_i64;
                 else
                     stacks[n_stacks++] = arg_i64;
@@ -2057,14 +2060,14 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
             }
             case VALUE_TYPE_I64:
                 arg_i64 = load_u64_from_cells(argv_src);
-                if (n_ints < MAX_REG_INTS)
+                if (n_ints < COMPONENT_MAX_REG_INTS)
                     ints[n_ints++] = arg_i64;
                 else
                     stacks[n_stacks++] = arg_i64;
                 argv_src += 2;
                 break;
             case VALUE_TYPE_F32:
-                if (n_fps < MAX_REG_FLOATS) {
+                if (n_fps < COMPONENT_MAX_REG_FLOATS) {
                     *(float32 *)&fps[n_fps++] = *(float32 *)argv_src++;
                 }
                 else {
@@ -2073,7 +2076,7 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
                 break;
             case VALUE_TYPE_F64:
                 arg_i64 = load_u64_from_cells(argv_src);
-                if (n_fps < MAX_REG_FLOATS) {
+                if (n_fps < COMPONENT_MAX_REG_FLOATS) {
 #if WASM_ENABLE_SIMD != 0 && WASM_ENABLE_FAST_INTERP != 0
                     bh_memcpy_s(&fps[n_fps], (uint32)sizeof(uint64), &arg_i64,
                                 (uint32)sizeof(arg_i64));
@@ -2095,7 +2098,7 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     /* Save extra result values' address to argv1 */
     for (i = 0; i < ext_ret_count; i++) {
         arg_i64 = load_u64_from_cells(argv_src);
-        if (n_ints < MAX_REG_INTS)
+        if (n_ints < COMPONENT_MAX_REG_INTS)
             ints[n_ints++] = arg_i64;
         else
             stacks[n_stacks++] = arg_i64;

@@ -1300,8 +1300,8 @@ wasi_io_streams_output_stream_splice_wrapper(wasm_exec_env_t exec_env,
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    wit_value_t lifted_output_handle;
-    wit_value_t lifted_input_handle;
+    wit_value_t lifted_output_handle = NULL;
+    wit_value_t lifted_input_handle = NULL;
     wit_value_t result = NULL;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
@@ -1406,8 +1406,8 @@ wasi_io_streams_output_stream_blocking_splice_wrapper(
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    wit_value_t lifted_output_handle;
-    wit_value_t lifted_input_handle;
+    wit_value_t lifted_output_handle = NULL;
+    wit_value_t lifted_input_handle = NULL;
     wit_value_t result = NULL;
 
     if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {

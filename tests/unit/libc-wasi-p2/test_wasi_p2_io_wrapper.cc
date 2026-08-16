@@ -393,6 +393,24 @@ TEST_F(WasiP2IoWrapperTest, test_blocking_splice)
   ASSERT_FALSE(loaded_value->value.result_value.is_err);
 }
 
+TEST_F(WasiP2IoWrapperTest,
+       SpliceUnsupportedCapabilityDoesNotFreeUninitializedHandles)
+{
+    WASIContext *context = wasm_runtime_get_wasi_ctx(
+        (WASMModuleInstanceCommon *)comp_instance->core_module_instances[0]);
+    uint32_t saved_common = context->wasi_options->common;
+    context->wasi_options->common = 0;
+
+    bool splice_executed = wasm_component_application_execute_func(
+        comp_instance, (char *)"call-splice()");
+    bool blocking_splice_executed = wasm_component_application_execute_func(
+        comp_instance, (char *)"call-blocking-splice()");
+
+    context->wasi_options->common = saved_common;
+    ASSERT_TRUE(splice_executed);
+    ASSERT_TRUE(blocking_splice_executed);
+}
+
 // Error
 
 TEST_F(WasiP2IoWrapperTest, test_to_debug_string)

@@ -185,6 +185,21 @@ TEST_F(WasiP2FilesystemWrapperTest, test_call_fs_open_at)
   ASSERT_TRUE(loaded_value->value.list_value.size);
 }
 
+TEST_F(WasiP2FilesystemWrapperTest,
+       OpenAtUnsupportedCapabilityDoesNotFreeUninitializedPath)
+{
+    WASIContext *context = wasm_runtime_get_wasi_ctx(
+        (WASMModuleInstanceCommon *)comp_instance->core_module_instances[0]);
+    uint32_t saved_common = context->wasi_options->common;
+    context->wasi_options->common = 0;
+
+    bool executed = wasm_component_application_execute_func(
+        comp_instance, (char *)"call-fs-open-at()");
+
+    context->wasi_options->common = saved_common;
+    ASSERT_TRUE(executed);
+}
+
 TEST_F(WasiP2FilesystemWrapperTest, test_call_fs_read_via_stream)
 {
   ASSERT_TRUE(wasm_component_application_execute_func(comp_instance, (char *)"call-fs-read-via-stream()"));
@@ -530,6 +545,21 @@ TEST_F(WasiP2FilesystemWrapperTest, test_call_fs_readlink_at)
   ASSERT_FALSE(loaded_value->value.result_value.is_err);
 
   unlink(test_link);
+}
+
+TEST_F(WasiP2FilesystemWrapperTest,
+       ReadlinkAtUnsupportedCapabilityDoesNotFreeUninitializedResult)
+{
+    WASIContext *context = wasm_runtime_get_wasi_ctx(
+        (WASMModuleInstanceCommon *)comp_instance->core_module_instances[0]);
+    uint32_t saved_common = context->wasi_options->common;
+    context->wasi_options->common = 0;
+
+    bool executed = wasm_component_application_execute_func(
+        comp_instance, (char *)"call-fs-readlink-at()");
+
+    context->wasi_options->common = saved_common;
+    ASSERT_TRUE(executed);
 }
 
 TEST_F(WasiP2FilesystemWrapperTest, test_call_fs_remove_directory_at)
