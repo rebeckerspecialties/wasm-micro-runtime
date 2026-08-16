@@ -1727,11 +1727,10 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
      * memory`'s mmap+memcpy+munmap dance, which on darwin first-
      * touches every page in the new mapping. */
     {
-        uint64 reserved =
-            (uint64)max_page_count * num_bytes_per_page
-                    < (uint64)WASM_LINMEM_RESERVATION_CAP
-                ? (uint64)max_page_count * num_bytes_per_page
-                : (uint64)WASM_LINMEM_RESERVATION_CAP;
+        uint64 reserved = (uint64)max_page_count * num_bytes_per_page
+                                  < (uint64)WASM_LINMEM_RESERVATION_CAP
+                              ? (uint64)max_page_count * num_bytes_per_page
+                              : (uint64)WASM_LINMEM_RESERVATION_CAP;
         if (total_size_new <= reserved)
             full_size_mmaped = true;
     }
