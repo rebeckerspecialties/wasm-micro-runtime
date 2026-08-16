@@ -696,9 +696,20 @@ unless used elsewhere */
 #define WASM_ENABLE_MEMORY64 0
 #endif
 
-/* Enable multi-memory by default */
+/* Multi-memory follows the upstream default (disabled) except in
+   component-model builds, which instantiate one linear memory per core
+   instance and need it. A global default of 1 changes memarg flag parsing
+   (bit 6 becomes a memidx marker instead of invalid) in every build that
+   does not pass the cmake option, which breaks spec conformance for plain
+   iwasm and wamrc: align.wast's oversized-alignment encodings then parse
+   as memidx-flagged and fail with the wrong error, and the extra LEB
+   consumed shifts the bytecode stream. */
 #ifndef WASM_ENABLE_MULTI_MEMORY
+#if WASM_ENABLE_COMPONENT_MODEL != 0
 #define WASM_ENABLE_MULTI_MEMORY 1
+#else
+#define WASM_ENABLE_MULTI_MEMORY 0
+#endif
 #endif
 
 #ifndef WASM_TABLE_MAX_SIZE
