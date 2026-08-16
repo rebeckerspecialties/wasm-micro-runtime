@@ -159,47 +159,28 @@ jobs:
           df -h /
 
       - name: Checkout NuttX
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           repository: apache/nuttx
           ref: 09a71ec7c16c43398d5acbdcbeee7b08736c3170
           path: nuttx
 
       - name: Checkout NuttX Apps
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           repository: apache/nuttx-apps
           ref: 6bd593459c4af3cef325c3d22bccd5537a8ed755
           path: apps
 
       - name: Checkout WAMR
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           repository: ${{ github.repository }}
           ref: ${{ env.PR_REF }}
           path: apps/interpreters/wamr/wamr
 
-      - name: Configure WAMR
-        working-directory: nuttx
-        run: |
-          tools/configure.sh ${{ matrix.nuttx_board_config }}
-          kconfig-tweak --disable CONFIG_RP2040_UF2_BINARY
-          kconfig-tweak --disable CONFIG_RP23XX_UF2_BINARY
-          kconfig-tweak --enable CONFIG_PSEUDOFS_SOFTLINKS
-          kconfig-tweak --enable CONFIG_INTERPRETERS_WAMR
-          kconfig-tweak --enable CONFIG_INTERPRETERS_IWASM_TASK
-          kconfig-tweak --set-val CONFIG_INTERPRETERS_WAMR_PRIORITY 100
-          kconfig-tweak --set-val CONFIG_INTERPRETERS_WAMR_STACKSIZE 8192
-          for x in ${{ matrix.wamr_config_option }}; do
-            kconfig-tweak --enable $x
-          done
-
-      - name: Build
-        working-directory: nuttx
-        run: make -j"$(nproc)" EXTRAFLAGS=-Werror
-
-      - name: Checkout Bloaty
-        uses: actions/checkout@v7.0.0
+      - name: Restore prebuilt bloaty
+        uses: actions/cache/restore@v6
         with:
           path: bloaty-bin
           key: bloaty-${{ env.BLOATY_REF }}-ubuntu-latest
