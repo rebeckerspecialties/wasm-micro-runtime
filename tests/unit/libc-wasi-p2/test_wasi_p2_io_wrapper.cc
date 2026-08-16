@@ -4,6 +4,7 @@
 */
 
 #include <gtest/gtest.h>
+#include <cstdint>
 #include <vector>
 #include <memory>
 #include <cstdio>
@@ -16,6 +17,35 @@ extern "C" {
 #include "wasm_component_canonical.h"
 #include "wasi_p2_types.h"
 #include "../../../product-mini/platforms/common/libc_wasi.h"
+}
+
+static WASMFunctionInstance *
+find_lower(WASMComponentInstance *instance, uint32 canonical_index)
+{
+    if (!instance || canonical_index >= instance->core_functions_count) {
+        return nullptr;
+    }
+    WASMFunctionInstance *canonical = instance->core_functions[canonical_index];
+    if (!canonical || !canonical->component_function
+        || !canonical->canon_options) {
+        return nullptr;
+    }
+    for (uint32 i = 0; i < instance->core_module_instances_count; i++) {
+        WASMModuleInstance *module = instance->core_module_instances[i];
+        if (!module || !module->module || !module->e) {
+            continue;
+        }
+        for (uint32 j = 0; j < module->module->import_function_count; j++) {
+            WASMFunctionInstance *lower = &module->e->functions[j];
+            if (lower->component_function == canonical->component_function
+                && lower->canon_options == canonical->canon_options
+                && lower->module_instance && lower->u.func_import
+                && lower->u.func_import->func_ptr_linked) {
+                return lower;
+            }
+        }
+    }
+    return nullptr;
 }
 
 class WasiP2IoWrapperTest : public testing::Test
@@ -159,6 +189,26 @@ TEST_F(WasiP2IoWrapperTest, test_call_skip)
   ASSERT_TRUE(load_result);
   ASSERT_NE(loaded_value, nullptr);
   ASSERT_FALSE(loaded_value->value.result_value.is_err);
+}
+
+TEST_F(WasiP2IoWrapperTest,
+       NativeInvocationAcceptsFourByteAlignedCanonicalI64Cells)
+{
+    WASMFunctionInstance *lower = find_lower(comp_instance, 25);
+    ASSERT_NE(lower, nullptr);
+    auto *exec_env =
+        reinterpret_cast<WASMExecEnv *>(wasm_runtime_get_exec_env_singleton(
+            reinterpret_cast<WASMModuleInstanceCommon *>(
+                lower->module_instance)));
+    ASSERT_NE(exec_env, nullptr);
+
+    std::vector<uint64_t> storage((lower->param_cell_num + 2) / 2 + 1, 0);
+    uint32 *argv = reinterpret_cast<uint32 *>(storage.data()) + 1;
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(argv) & 7u, 4u);
+    uint32 argv_ret[2] = {};
+
+    EXPECT_TRUE(wasm_runtime_invoke_native_p2(exec_env, lower, argv,
+                                              lower->param_cell_num, argv_ret));
 }
 
 TEST_F(WasiP2IoWrapperTest, test_call_blocking_skip)
