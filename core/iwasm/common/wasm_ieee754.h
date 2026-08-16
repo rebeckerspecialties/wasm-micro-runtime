@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Airbus Defence and Space Romania SRL. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ */
+
 #ifndef _WASM_IEEE754_H
 #define _WASM_IEEE754_H
 
