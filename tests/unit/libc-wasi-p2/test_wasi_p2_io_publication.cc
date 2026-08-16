@@ -260,9 +260,13 @@ invoke_lower(WASMFunctionInstance *lower, uint32_t *argv, uint32_t argc)
     }
     const bool saved_callback_active = exec_env->component_callback_active;
     uint32_t argv_ret[2] = {};
+    std::vector<uint64_t> argv_storage((argc + 2) / 2 + 1, 0);
+    uint32_t *four_byte_aligned_argv =
+        reinterpret_cast<uint32_t *>(argv_storage.data()) + 1;
+    std::memcpy(four_byte_aligned_argv, argv, argc * sizeof(uint32_t));
     exec_env->component_callback_active = true;
-    const bool success =
-        wasm_runtime_invoke_native_p2(exec_env, lower, argv, argc, argv_ret);
+    const bool success = wasm_runtime_invoke_native_p2(
+        exec_env, lower, four_byte_aligned_argv, argc, argv_ret);
     exec_env->component_callback_active = saved_callback_active;
     return success;
 }
@@ -1094,6 +1098,17 @@ TEST(WasiP2IoPublicationTest, ReadsAndSkipsAreRetryEquivalentAtEveryDenial)
            IoPublicationKind::FileSkip, IoPublicationKind::CallbackSkip }) {
         exercise_kind(component, kind);
     }
+}
+
+TEST(WasiP2IoPublicationTest,
+     NativeInvocationAcceptsFourByteAlignedCanonicalCells)
+{
+    const std::vector<uint8_t> component = read_io_component();
+    ASSERT_FALSE(component.empty());
+    const IoPublicationRun run = run_io_publication(
+        component, IoPublicationKind::FileWrite, kNoDeniedRequest);
+    expect_clean_run(run, IoPublicationKind::FileWrite, kNoDeniedRequest);
+    EXPECT_TRUE(run.invoked);
 }
 
 TEST(WasiP2IoPublicationTest, WritesAndZeroesAreRetryEquivalentAtEveryDenial)

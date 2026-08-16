@@ -3418,6 +3418,15 @@ static volatile VoidFuncPtr invokeNative_Void =
     (VoidFuncPtr)(uintptr_t)invokeNative;
 // NOLINTEND(performance-no-int-to-ptr)
 
+static uint64
+load_u64_from_cells(const uint32 *cells)
+{
+    uint64 value;
+
+    bh_memcpy_s(&value, (uint32)sizeof(value), cells, (uint32)sizeof(value));
+    return value;
+}
+
 /// @brief Executes a wasi preview 2 function wrapper
 /// @param exec_env current execution enviroment
 /// @param cur_func wasi preview 2 function to be executed
@@ -3587,10 +3596,11 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
                 break;
             }
             case VALUE_TYPE_I64:
+                arg_i64 = load_u64_from_cells(argv_src);
                 if (n_ints < COMPONENT_MAX_REG_INTS)
-                    ints[n_ints++] = *(uint64 *)argv_src;
+                    ints[n_ints++] = arg_i64;
                 else
-                    stacks[n_stacks++] = *(uint64 *)argv_src;
+                    stacks[n_stacks++] = arg_i64;
                 argv_src += 2;
                 break;
             case VALUE_TYPE_F32:
@@ -3602,11 +3612,18 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
                 }
                 break;
             case VALUE_TYPE_F64:
+                arg_i64 = load_u64_from_cells(argv_src);
                 if (n_fps < COMPONENT_MAX_REG_FLOATS) {
-                    *(float64 *)&fps[n_fps++] = *(float64 *)argv_src;
+#if WASM_ENABLE_SIMD != 0 && WASM_ENABLE_FAST_INTERP != 0
+                    bh_memcpy_s(&fps[n_fps], (uint32)sizeof(uint64), &arg_i64,
+                                (uint32)sizeof(arg_i64));
+                    n_fps++;
+#else
+                    fps[n_fps++] = arg_i64;
+#endif
                 }
                 else {
-                    *(float64 *)&stacks[n_stacks++] = *(float64 *)argv_src;
+                    stacks[n_stacks++] = arg_i64;
                 }
                 argv_src += 2;
                 break;
@@ -3617,10 +3634,11 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     }
     /* Save extra result values' address to argv1 */
     for (i = 0; i < ext_ret_count; i++) {
+        arg_i64 = load_u64_from_cells(argv_src);
         if (n_ints < COMPONENT_MAX_REG_INTS)
-            ints[n_ints++] = *(uint64 *)argv_src;
+            ints[n_ints++] = arg_i64;
         else
-            stacks[n_stacks++] = *(uint64 *)argv_src;
+            stacks[n_stacks++] = arg_i64;
         argv_src += 2;
     }
 
