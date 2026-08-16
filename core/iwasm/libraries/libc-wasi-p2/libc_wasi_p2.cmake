@@ -33,7 +33,7 @@ set(LIBC_WASI_P2_INCLUDE_DIRS
     ${WAMR_ROOT_DIR}/core/shared/platform/include
     ${WAMR_ROOT_DIR}/core/shared/utils
     ${WAMR_ROOT_DIR}/core/shared/mem-alloc
-    ${WAMR_ROOT_DIR}/core/shared/platform/linux
+    ${WAMR_ROOT_DIR}/core/shared/platform/${WAMR_BUILD_PLATFORM}
     ${WAMR_ROOT_DIR}/core/iwasm/interpreter
     ${WAMR_ROOT_DIR}/core/iwasm/libraries/lib-socket/src/wasi
     ${LIBC_WASI_P2_SSP_DIR}/include

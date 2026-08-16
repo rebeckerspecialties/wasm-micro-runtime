@@ -86,24 +86,25 @@ make_optional_owned_resource(uint32_t rep)
 
 // Helper function to covert environment variable list tuple to wit_value_t
 static wit_value_t
-get_environ_val(const wasi_tuple_string_string_t *environ,
+get_environ_val(const wasi_tuple_string_string_t *environment_entry,
                 wasm_exec_env_t exec_env)
 {
     wit_value_t *elems;
     wit_value_t result;
 
-    if (!environ || !environ->key || !environ->value)
+    if (!environment_entry || !environment_entry->key
+        || !environment_entry->value)
         return NULL;
     elems = wasm_runtime_malloc(2 * sizeof(wit_value_t));
     if (!elems)
         return NULL;
 
-    elems[0] = make_string_value(exec_env, environ->key);
+    elems[0] = make_string_value(exec_env, environment_entry->key);
     if (!elems[0]) {
         wasm_runtime_free(elems);
         return NULL;
     }
-    elems[1] = make_string_value(exec_env, environ->value);
+    elems[1] = make_string_value(exec_env, environment_entry->value);
     if (!elems[1]) {
         free_wit_value(elems[0]);
         wasm_runtime_free(elems);
