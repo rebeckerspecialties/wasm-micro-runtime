@@ -14,7 +14,8 @@
 
 // Helper function to covert environment variable list tuple to wit_value_t
 static wit_value_t
-get_environ_val(wasi_tuple_string_string_t *environ, uint32_t environ_count,
+get_environ_val(wasi_tuple_string_string_t *environment_entry,
+                uint32_t environ_count,
                 wasm_exec_env_t exec_env)
 {
     wit_value_t *elems =
@@ -24,11 +25,12 @@ get_environ_val(wasi_tuple_string_string_t *environ, uint32_t environ_count,
     uint8_t *encoded_str_key = NULL, *encoded_str_val = NULL;
     uint32_t encoded_str_len_key = 0, encoded_str_len_val = 0;
     uint32_t encoded_code_units_key = 0, encoded_code_units_val = 0;
-    encode_string(exec_env->cx, environ->key, strlen(environ->key), encoding,
-                  &encoded_str_key, &encoded_str_len_key,
-                  &encoded_code_units_key);
-    encode_string(exec_env->cx, environ->value, strlen(environ->value),
-                  encoding, &encoded_str_val, &encoded_str_len_val,
+    encode_string(exec_env->cx, environment_entry->key,
+                  strlen(environment_entry->key), encoding, &encoded_str_key,
+                  &encoded_str_len_key, &encoded_code_units_key);
+    encode_string(exec_env->cx, environment_entry->value,
+                  strlen(environment_entry->value), encoding,
+                  &encoded_str_val, &encoded_str_len_val,
                   &encoded_code_units_val);
 
     elems[0] = wit_string_ctor((char *)encoded_str_key, encoded_str_len_key,
