@@ -53,7 +53,7 @@ bh_static_assert(offsetof(AOTModuleInstance, c_api_func_imports)
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 bh_static_assert(offsetof(AOTModuleInstance, global_table_data)
                  == 13 * sizeof(uint64) + 128 + 14 * sizeof(uint64)
-                        + 2 * sizeof(void *));
+                        + 2 * sizeof(uint64));
 #else
 bh_static_assert(offsetof(AOTModuleInstance, global_table_data)
                  == 13 * sizeof(uint64) + 128 + 14 * sizeof(uint64));
