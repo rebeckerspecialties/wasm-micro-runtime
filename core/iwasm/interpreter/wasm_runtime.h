@@ -490,8 +490,14 @@ struct WASMModuleInstance {
     uint32 reserved[7];
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-    WASMComponentInstance *comp_instance;
+    /* Keep the fixed cross-32/64-bit layout of this struct: the pointer
+       gets DefPointer's 8-byte slot and the index carries an explicit
+       padding word, so global_table_data sits at the same offset on every
+       target and offsets computed by a 64-bit-host wamrc stay valid for
+       32-bit AOT targets. */
+    DefPointer(WASMComponentInstance *, comp_instance);
     uint32 core_instance_idx;
+    uint32 core_instance_idx_padding;
 #endif
 
     /*
