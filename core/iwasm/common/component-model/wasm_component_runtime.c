@@ -14,6 +14,9 @@
 #include "wasm_component_canonical.h"
 #include "wasm_component_task.h"
 #include "bh_assert.h"
+#if WASM_ENABLE_SHARED_MEMORY != 0
+#include "../wasm_shared_memory.h"
+#endif
 #include "../../libraries/libc-wasi-p2/wasi_p2_cli.h"
 #include "../../../product-mini/platforms/common/libc_wasi.h"
 
