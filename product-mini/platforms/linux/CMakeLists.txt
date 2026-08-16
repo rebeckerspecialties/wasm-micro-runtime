@@ -80,8 +80,15 @@ if (NOT DEFINED WAMR_BUILD_LIBC_WASI)
 endif ()
 
 if (NOT DEFINED WAMR_BUILD_COMPONENT_MODEL)
-  # Enable Component Model by default
-  set (WAMR_BUILD_COMPONENT_MODEL 1)
+  if (WAMR_BUILD_LIBC_UVWASI EQUAL 1)
+    # The component model's WASI Preview 2 layer is built on the built-in
+    # libc-wasi internals (fd_table/argv_environ/prestats), which uvwasi
+    # builds do not compile; don't default it on for them.
+    set (WAMR_BUILD_COMPONENT_MODEL 0)
+  else ()
+    # Enable Component Model by default
+    set (WAMR_BUILD_COMPONENT_MODEL 1)
+  endif ()
 endif ()
 
 if (NOT DEFINED WAMR_BUILD_FAST_INTERP)
