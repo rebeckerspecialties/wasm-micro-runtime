@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v7.0.0
 
       - name: Use Node.js 18.x
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 18.x
 
@@ -46,7 +46,7 @@ jobs:
         working-directory: test-tools/wamr-ide/VSCode-Extension
 
       - name: publish wamr ide vscode extension to the vsce marketplace
-        if: ${{ github.repository == 'bytecodealliance/wasm-micro-runtime' }}
+        if: ${{ github.repository == 'wasm-micro-runtime/wasm-micro-runtime' }}
         run: |
           vsce publish -p ${{ secrets.TOKEN }}
         working-directory: test-tools/wamr-ide/VSCode-Extension

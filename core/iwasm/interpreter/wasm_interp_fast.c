@@ -2605,7 +2605,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 else
                     cur_func_type = cur_func->u.func->func_type;
 
-                    /* clang-format off */
+                /* clang-format off */
 #if WASM_ENABLE_GC == 0
                 if (__builtin_expect(
                         !wasm_type_equal((WASMType *)cur_type,
