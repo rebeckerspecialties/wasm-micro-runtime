@@ -17,6 +17,34 @@
 #include "../libraries/thread-mgr/thread_manager.h"
 #endif
 
+/* Opt-in linear-memory reservation (gated by
+ * `WASM_LINMEM_RESERVATION_CAP > 0`). With HW_BOUND_CHECK off,
+ * upstream WAMR's `wasm_allocate_linear_memory` mmaps only
+ * `init_page_count * page_size` bytes, then on every `memory.grow`
+ * `wasm_enlarge_memory_internal` calls `wasm_mremap_linear_memory`
+ * which on darwin falls back to `mmap(new) + memcpy(old) +
+ * munmap(old)` — every page in the new mapping is first-touch
+ * faulted by the memcpy. For workloads that re-instantiate +
+ * grow rapidly (Porffor's no-GC graphql-validation: 555 grows
+ * across 36 iters, 6.85 GB of mmap traffic), this is pathological.
+ *
+ * The fix: reserve up to `min(max_page_count * page_size,
+ * RESERVATION_CAP)` with PROT_NONE upfront (no physical pages
+ * allocated until first touch), then `os_mprotect` only the
+ * `init_page_count * page_size` bytes the wasm actually needs
+ * for the initial memory. `wasm_enlarge_memory_internal`
+ * (patched in tandem) just `mprotect`s the new pages — no
+ * `wasm_mremap_linear_memory`, no memcpy, no refault. */
+#ifndef WASM_LINMEM_RESERVATION_CAP
+#define WASM_LINMEM_RESERVATION_CAP 0
+#endif
+
+#if WASM_LINMEM_RESERVATION_CAP > 0 && !defined(OS_ENABLE_HW_BOUND_CHECK)
+#define WASM_LINMEM_RESERVATION_ENABLED 1
+#else
+#define WASM_LINMEM_RESERVATION_ENABLED 0
+#endif
+
 typedef enum Memory_Mode {
     MEMORY_MODE_UNKNOWN = 0,
     MEMORY_MODE_POOL,
@@ -1692,6 +1720,22 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
     total_page_count = inc_page_count + cur_page_count;
     total_size_new = num_bytes_per_page * (uint64)total_page_count;
 
+#if WASM_LINMEM_RESERVATION_ENABLED
+    /* Reservation cap on: if the new size still fits inside the
+     * pre-reserved PROT_NONE mapping, treat grow as mprotect-commit
+     * (same path as HW_BOUND_CHECK). Avoids `wasm_mremap_linear_
+     * memory`'s mmap+memcpy+munmap dance, which on darwin first-
+     * touches every page in the new mapping. */
+    {
+        uint64 reserved = (uint64)max_page_count * num_bytes_per_page
+                                  < (uint64)WASM_LINMEM_RESERVATION_CAP
+                              ? (uint64)max_page_count * num_bytes_per_page
+                              : (uint64)WASM_LINMEM_RESERVATION_CAP;
+        if (total_size_new <= reserved)
+            full_size_mmaped = true;
+    }
+#endif
+
     if (inc_page_count <= 0)
         /* No need to enlarge memory */
         return true;
@@ -2034,8 +2078,27 @@ wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
     else
 #endif
     {
+#if WASM_LINMEM_RESERVATION_ENABLED
+        /* Reservation cap is on: the OS-level VMA is
+         * `min(max_page_count * page_size, RESERVATION_CAP)`, not
+         * `cur_page_count * page_size`. Free the full reservation
+         * or we leak the `RESERVATION_CAP - committed` tail per
+         * instance — Porffor's per-iter re-instantiate at ~64 MB
+         * reservation × 50 iters fills the iOS 32-bit address
+         * range. */
+        uint64 max_bytes = (uint64)memory_inst->num_bytes_per_page
+                           * memory_inst->max_page_count;
+        map_size = (max_bytes < WASM_LINMEM_RESERVATION_CAP)
+                       ? max_bytes
+                       : WASM_LINMEM_RESERVATION_CAP;
+        uint64 cur_bytes = (uint64)memory_inst->num_bytes_per_page
+                           * memory_inst->cur_page_count;
+        if (map_size < cur_bytes)
+            map_size = cur_bytes;
+#else
         map_size = (uint64)memory_inst->num_bytes_per_page
                    * memory_inst->cur_page_count;
+#endif
     }
 #else
     map_size = 8 * (uint64)BH_GB;
@@ -2063,6 +2126,9 @@ wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
                             uint64 *memory_data_size)
 {
     uint64 map_size, page_size;
+#if WASM_LINMEM_RESERVATION_ENABLED
+    uint64 commit_size;
+#endif
 
     bh_assert(data);
     bh_assert(memory_data_size);
@@ -2076,7 +2142,17 @@ wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
     else
 #endif
     {
+#if WASM_LINMEM_RESERVATION_ENABLED
+        uint64 max_bytes = max_page_count * num_bytes_per_page;
+        map_size = (max_bytes < WASM_LINMEM_RESERVATION_CAP)
+                       ? max_bytes
+                       : WASM_LINMEM_RESERVATION_CAP;
+        uint64 init_bytes = init_page_count * num_bytes_per_page;
+        if (map_size < init_bytes)
+            map_size = init_bytes;
+#else
         map_size = init_page_count * num_bytes_per_page;
+#endif
     }
 #else  /* else of OS_ENABLE_HW_BOUND_CHECK */
     /* Totally 8G is mapped, the opcode load/store address range is 0 to 8G:
@@ -2104,9 +2180,22 @@ wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
             return BHT_ERROR;
         }
 #else
+#if WASM_LINMEM_RESERVATION_ENABLED
+        /* Reserve `map_size` PROT_NONE; commit only the initial
+         * pages. Subsequent `memory.grow` calls in
+         * `wasm_enlarge_memory_internal` will mprotect more
+         * pages inside the reservation — no new mmap, no
+         * memcpy, no first-touch refault of already-committed
+         * pages. */
+        commit_size = *memory_data_size;
+        *data = wasm_mmap_linear_memory(map_size, commit_size);
+        if (!*data)
+            return BHT_ERROR;
+#else
         if (!(*data = wasm_mmap_linear_memory(map_size, *memory_data_size))) {
             return BHT_ERROR;
         }
+#endif
 #endif
     }
 
