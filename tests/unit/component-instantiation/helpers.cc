@@ -57,7 +57,13 @@ WASMComponent* load_component_from_candidates_internal(const char *file_name, co
   }
 
   const char *substr = "wasm-micro-runtime";
-  char *pos = strstr(cwd, substr);
+  /* Use the LAST occurrence: hosted CI checks the repo out under
+     .../work/wasm-micro-runtime/wasm-micro-runtime/..., and anchoring on the
+     first match truncates the prefix at the parent directory, producing a
+     fixture path one component short. */
+  char *pos = NULL;
+  for (char *p = strstr(cwd, substr); p; p = strstr(p + 1, substr))
+      pos = p;
   if (!pos) {
       printf("Could not find 'wasm-micro-runtime' in cwd\n");
       return NULL;
