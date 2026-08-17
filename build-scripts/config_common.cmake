@@ -776,6 +776,20 @@ else()
   message ("     Extended constant expression disabled")
   add_definitions(-DWASM_ENABLE_EXTENDED_CONST_EXPR=0)
 endif ()
+if (WAMR_BUILD_COMPONENT_MODEL EQUAL 1)
+  if (WAMR_BUILD_LIBC_UVWASI EQUAL 1)
+    # The WASI Preview 2 host layer reaches into the built-in libc-wasi
+    # context (fd_table/argv_environ/prestats), which uvwasi replaces.
+    message (FATAL_ERROR
+             "WAMR_BUILD_COMPONENT_MODEL requires the built-in libc-wasi; "
+             "it cannot be combined with WAMR_BUILD_LIBC_UVWASI=1")
+  endif ()
+  message ("     Component Model enabled")
+  add_definitions(-DWASM_ENABLE_COMPONENT_MODEL=1)
+else()
+  message ("     Component Model disabled")
+  add_definitions(-DWASM_ENABLE_COMPONENT_MODEL=0)
+endif ()
 if (WAMR_BUILD_LIME1 EQUAL 1)
   message ("     Lime1 enabled")
 endif ()

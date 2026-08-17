@@ -78,19 +78,26 @@ FetchContent_MakeAvailable(googletest)
 if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.24")
   FetchContent_Declare(
     cmocka
-    URL https://git.cryptomilk.org/projects/cmocka.git/snapshot/cmocka-2.0.1.tar.gz
+    URL https://gitlab.com/cmocka/cmocka/-/archive/cmocka-2.0.1/cmocka-cmocka-2.0.1.tar.gz
+    URL_HASH SHA256=44a229d3f599a593606d895b175504a642078bec8e8d8a9c30ca49c6605b621d
     DOWNLOAD_EXTRACT_TIMESTAMP ON
   )
 else()
   FetchContent_Declare(
     cmocka
-    URL https://git.cryptomilk.org/projects/cmocka.git/snapshot/cmocka-2.0.1.tar.gz
+    URL https://gitlab.com/cmocka/cmocka/-/archive/cmocka-2.0.1/cmocka-cmocka-2.0.1.tar.gz
+    URL_HASH SHA256=44a229d3f599a593606d895b175504a642078bec8e8d8a9c30ca49c6605b621d
   )
 endif()
 FetchContent_MakeAvailable(cmocka)
 
 include(GoogleTest)
 enable_testing()
+
+if(DEFINED UNITTEST_FOLDER AND NOT "${UNITTEST_FOLDER}" STREQUAL "")
+  add_subdirectory("${UNITTEST_FOLDER}")
+  return()
+endif()
 
 add_subdirectory(wasm-vm)
 add_subdirectory(interpreter)
@@ -104,6 +111,13 @@ add_subdirectory(gc)
 add_subdirectory(unsupported-features)
 add_subdirectory(exception-handling)
 add_subdirectory(running-modes)
+add_subdirectory(component)
+add_subdirectory(component-instantiation)
+add_subdirectory(component-execution)
+add_subdirectory(canonical-abi)
+add_subdirectory(canonical-execution)
+add_subdirectory(libc-wasi-p2)
+add_subdirectory(wave-parser)
 add_subdirectory(mem-alloc)
 
 if(FULL_TEST)
