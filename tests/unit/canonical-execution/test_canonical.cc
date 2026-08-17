@@ -71,7 +71,12 @@ class CanonicalExecutionTest : public testing::Test
       char cwd[PATH_MAX];
       getcwd(cwd, sizeof(cwd));
       const char *substr = "wasm-micro-runtime";
-      char *pos = strstr(cwd, substr);
+      /* Last occurrence: hosted CI nests the checkout as
+         .../wasm-micro-runtime/wasm-micro-runtime, and the first match
+         truncates the path prefix one directory short. */
+      char *pos = NULL;
+      for (char *p = strstr(cwd, substr); p; p = strstr(p + 1, substr))
+          pos = p;
       ASSERT_TRUE(pos != NULL) << "Could not find 'wasm-micro-runtime' in cwd";
       size_t prefix_len = (pos - cwd) + strlen(substr);
       strncat(path, cwd, prefix_len);
@@ -107,7 +112,12 @@ class CanonicalExecutionTest : public testing::Test
       char cwd[PATH_MAX];
       getcwd(cwd, sizeof(cwd));
       const char *substr = "wasm-micro-runtime";
-      char *pos = strstr(cwd, substr);
+      /* Last occurrence: hosted CI nests the checkout as
+         .../wasm-micro-runtime/wasm-micro-runtime, and the first match
+         truncates the path prefix one directory short. */
+      char *pos = NULL;
+      for (char *p = strstr(cwd, substr); p; p = strstr(p + 1, substr))
+          pos = p;
       if (!pos) {
           printf("Could not find 'wasm-micro-runtime' in cwd\n");
           return;
