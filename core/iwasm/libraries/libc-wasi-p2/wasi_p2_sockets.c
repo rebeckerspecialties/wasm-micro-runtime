@@ -5,7 +5,7 @@
 
 /* accept4/pipe2/SOCK_NONBLOCK/SOCK_CLOEXEC/MSG_NOSIGNAL below are GNU
    extensions; request them before any system header (see wasi_p2_io.c). */
-#ifndef _GNU_SOURCE
+#if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
 
@@ -28,7 +28,74 @@
 #include <bh_common.h>
 #include <sys/types.h>
 #include "bh_hashmap.h"
+#include "wasm_allocation_quota.h"
 #include "wasm_export.h"
+
+#if defined(__APPLE__)
+/* Darwin/BSD libc lacks the Linux-only mmsg(2) batch API, the SOCK_NONBLOCK /
+   SOCK_CLOEXEC / accept4 atomic-flag extensions and a few constants. Provide
+   local equivalents so the non-Apple path below stays byte-for-byte unchanged.
+ */
+#include <limits.h> /* IOV_MAX */
+
+/* macOS has no UIO_MAXIOV; IOV_MAX from <limits.h> is the equivalent cap. */
+#ifndef UIO_MAXIOV
+#define UIO_MAXIOV IOV_MAX
+#endif
+
+/* macOS has no MSG_NOSIGNAL send flag; SIGPIPE is suppressed per-socket via
+   the SO_NOSIGPIPE option set right after the socket is created. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+/* macOS provides neither struct mmsghdr nor recvmmsg()/sendmmsg(). Define the
+   struct and implement the two calls as a recvmsg()/sendmsg() loop matching the
+   glibc signatures, so the existing __linux__ batch paths have a portable
+   fallback if they are ever compiled on Apple. The udp receive/send paths below
+   take the non-__linux__ recvmsg/sendmsg loops, so these are marked unused to
+   keep the build clean under -Werror. */
+struct mmsghdr {
+    struct msghdr msg_hdr;
+    unsigned int msg_len;
+};
+
+static int __attribute__((unused))
+recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags,
+         struct timespec *timeout)
+{
+    /* timeout is unsupported in this fallback; the caller passes NULL. */
+    (void)timeout;
+    unsigned int i;
+    for (i = 0; i < vlen; i++) {
+        ssize_t s = recvmsg(sockfd, &msgvec[i].msg_hdr, flags);
+        if (s < 0) {
+            /* Return what we have so far, mirroring recvmmsg() semantics. */
+            if (i > 0)
+                break;
+            return -1;
+        }
+        msgvec[i].msg_len = (unsigned int)s;
+    }
+    return (int)i;
+}
+
+static int __attribute__((unused))
+sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
+{
+    unsigned int i;
+    for (i = 0; i < vlen; i++) {
+        ssize_t s = sendmsg(sockfd, &msgvec[i].msg_hdr, flags);
+        if (s < 0) {
+            if (i > 0)
+                break;
+            return -1;
+        }
+        msgvec[i].msg_len = (unsigned int)s;
+    }
+    return (int)i;
+}
+#endif /* __APPLE__ */
 
 /**
  * @brief A singleton resource representing the host's network capability.
@@ -46,7 +113,9 @@ static struct wasi_network_resource {
 void
 tcp_socket_dtor(void *data)
 {
-    close(((wasi_socket_context_t *)data)->fd);
+    int fd = ((wasi_socket_context_t *)data)->fd;
+    if (fd >= 0)
+        close(fd);
 }
 
 void
@@ -55,12 +124,14 @@ udp_socket_dtor(void *data)
     close(((wasi_socket_context_t *)data)->fd);
 }
 
-/* TCP input/output streams from tcp.accept carry a dup()'d socket fd
-   that duplicate is independently owned and must be closed on drop. */
+/* TCP input/output streams carry a duplicated socket fd that is independently
+   owned and must be closed on drop. */
 void
 tcp_owned_stream_dtor(void *data)
 {
-    close(((StreamResourceType *)data)->fd);
+    int fd = ((StreamResourceType *)data)->fd;
+    if (fd >= 0)
+        close(fd);
 }
 
 /* UDP datagram streams from udp.stream carry fcntl(F_DUPFD_CLOEXEC) fds
@@ -69,6 +140,41 @@ void
 udp_datagram_stream_dtor(void *data)
 {
     close((int)*(uint32_t *)data);
+}
+
+int
+wasi_sockets_duplicate_socket_streams(int socket_fd, int32_t *input_stream,
+                                      int32_t *output_stream)
+{
+    int input_fd;
+    int output_fd;
+    int error;
+
+    if (!input_stream || !output_stream) {
+        return EINVAL;
+    }
+
+    *input_stream = -1;
+    *output_stream = -1;
+    if (input_stream == output_stream) {
+        return EINVAL;
+    }
+
+    input_fd = fcntl(socket_fd, F_DUPFD_CLOEXEC, 0);
+    if (input_fd < 0) {
+        return errno;
+    }
+
+    output_fd = fcntl(socket_fd, F_DUPFD_CLOEXEC, 0);
+    if (output_fd < 0) {
+        error = errno;
+        close(input_fd);
+        return error;
+    }
+
+    *input_stream = input_fd;
+    *output_stream = output_fd;
+    return 0;
 }
 
 // --- Asynchronous DNS Resolution Infrastructure ---
@@ -85,6 +191,7 @@ typedef struct resolve_stream {
     struct addrinfo *addr_current;
     // A pipe used to signal when the DNS resolution is complete.
     int pipe_fd;
+    WasiP2NativeFdQuotaLease read_fd_lease;
     // The handle for the background thread performing the resolution.
     pthread_t thread;
     // A flag indicating if the background thread has finished.
@@ -106,6 +213,9 @@ static HashMap *resolve_streams_map = NULL;
  * @brief A mutex to ensure thread-safe access to the `resolve_streams_map`.
  */
 static pthread_mutex_t resolve_streams_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t resolve_workers_cond = PTHREAD_COND_INITIALIZER;
+static uint32_t resolve_active_workers = 0;
+static uint32_t resolve_stream_count = 0;
 
 /**
  * @brief A simple counter to generate unique IDs for resolve-stream resources.
@@ -155,6 +265,7 @@ destroy_resolve_stream(void *stream)
             // Close the signaling pipe.
             close(s->pipe_fd);
         }
+        wasi_p2_native_fd_quota_release(&s->read_fd_lease);
         wasm_runtime_free(s);
     }
 }
@@ -178,18 +289,25 @@ init_resolve_streams_map()
 void
 destroy_resolve_streams_map()
 {
-    resolve_streams_map = NULL;
+    wasi_p2_sockets_cleanup();
 }
 
 void
 wasi_sockets_drop_resolve_stream(uint32_t stream_id)
 {
-    if (!resolve_streams_map)
-        return;
     void *old_key = NULL, *old_val = NULL;
     pthread_mutex_lock(&resolve_streams_lock);
+    if (!resolve_streams_map) {
+        pthread_mutex_unlock(&resolve_streams_lock);
+        return;
+    }
     bool removed = bh_hash_map_remove(
         resolve_streams_map, (void *)(uintptr_t)stream_id, &old_key, &old_val);
+    if (removed) {
+        bh_assert(resolve_stream_count > 0);
+        if (resolve_stream_count > 0)
+            resolve_stream_count--;
+    }
     pthread_mutex_unlock(&resolve_streams_lock);
     if (removed && old_val)
         destroy_resolve_stream(old_val);
@@ -207,6 +325,7 @@ resolve_stream_dtor(void *data)
 struct resolve_thread_args {
     long stream_id;
     int pipe_write_fd;
+    WasiP2NativeFdQuotaLease write_fd_lease;
     char *name;
 };
 
@@ -277,8 +396,15 @@ resolve_thread(void *arg)
     if (args->pipe_write_fd != -1) {
         close(args->pipe_write_fd);
     }
+    wasi_p2_native_fd_quota_release(&args->write_fd_lease);
     wasm_runtime_free(args->name);
     wasm_runtime_free(args);
+
+    pthread_mutex_lock(&resolve_streams_lock);
+    bh_assert(resolve_active_workers > 0);
+    resolve_active_workers--;
+    pthread_cond_broadcast(&resolve_workers_cond);
+    pthread_mutex_unlock(&resolve_streams_lock);
     return NULL;
 }
 
@@ -292,12 +418,21 @@ resolve_thread(void *arg)
 void
 wasi_p2_sockets_cleanup(void)
 {
-    // Destroy the hash map, which will also call the destructor for each
-    // remaining resolve_stream_t.
+    pthread_mutex_lock(&resolve_streams_lock);
+    while (resolve_active_workers > 0) {
+        pthread_cond_wait(&resolve_workers_cond, &resolve_streams_lock);
+    }
+
+    // Destroy the map only after detached workers have stopped using both it
+    // and the runtime allocator.
     if (resolve_streams_map) {
         bh_hash_map_destroy(resolve_streams_map);
         resolve_streams_map = NULL;
     }
+    resolve_stream_count = 0;
+    resolve_stream_id_counter = 0;
+    network_resource.in_use = false;
+    pthread_mutex_unlock(&resolve_streams_lock);
 }
 
 /**
@@ -446,28 +581,87 @@ void
 wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
                                wasi_resolve_address_stream_t *ret, int *err)
 {
+    wasi_sockets_resolve_addresses_with_fd_quota(network, name, ret, err, NULL,
+                                                 NULL);
+}
+
+void
+wasi_sockets_resolve_addresses_with_fd_quota(
+    wasi_network_t network, const char *name,
+    wasi_resolve_address_stream_t *ret, int *err,
+    WasiP2NativeFdQuotaLease *read_fd_lease,
+    WasiP2NativeFdQuotaLease *write_fd_lease)
+{
+    WasiP2NativeFdQuotaLease local_read_fd_lease = { 0 };
+    WasiP2NativeFdQuotaLease local_write_fd_lease = { 0 };
+
+    if (read_fd_lease) {
+        local_read_fd_lease = *read_fd_lease;
+        memset(read_fd_lease, 0, sizeof(*read_fd_lease));
+    }
+    if (write_fd_lease) {
+        local_write_fd_lease = *write_fd_lease;
+        memset(write_fd_lease, 0, sizeof(*write_fd_lease));
+    }
     if (!name || !ret || !err) {
         if (err)
             *err = EINVAL;
         if (ret)
             *ret = -1;
+        wasi_p2_native_fd_quota_release(&local_read_fd_lease);
+        wasi_p2_native_fd_quota_release(&local_write_fd_lease);
         return;
     }
 
     *ret = -1;
+
+    /* getaddrinfo(), its resolver-owned allocations, and the detached native
+       worker cannot be bounded by WAMR's allocation owner. Until this path has
+       a cancellable bounded resolver, quota-owned guests must fail closed
+       before creating the map, pipe, worker stack, or resolver state. */
+    if (wasm_allocation_quota_get_current() != NULL) {
+        *err = ENOTSUP;
+        wasi_p2_native_fd_quota_release(&local_read_fd_lease);
+        wasi_p2_native_fd_quota_release(&local_write_fd_lease);
+        return;
+    }
+
     resolve_stream_t *stream = NULL;
     struct resolve_thread_args *args = NULL;
     long id = -1;
     bool lock_held = false;
+    bool stream_inserted = false;
+    bool stream_slot_reserved = false;
+    bool worker_slot_reserved = false;
     int pipefd[2] = { -1, -1 };
+    size_t name_length;
 
     if (!is_valid_network(network)) {
         *err = EINVAL;
         goto fail;
     }
 
+    name_length = strnlen(name, WASI_SOCKETS_MAX_RESOLVE_NAME_LENGTH + 1);
+    if (name_length == 0
+        || name_length > WASI_SOCKETS_MAX_RESOLVE_NAME_LENGTH) {
+        *err = EINVAL;
+        goto fail;
+    }
+
     pthread_mutex_lock(&resolve_streams_lock);
     lock_held = true;
+
+    /* Reserve both bounded global resources before allocating the map, pipe,
+       stream, argument copy, or detached thread stack. */
+    if (resolve_stream_count >= WASI_SOCKETS_MAX_RESOLVE_STREAMS
+        || resolve_active_workers >= WASI_SOCKETS_MAX_RESOLVE_WORKERS) {
+        *err = EAGAIN;
+        goto fail;
+    }
+    resolve_stream_count++;
+    stream_slot_reserved = true;
+    resolve_active_workers++;
+    worker_slot_reserved = true;
 
     init_resolve_streams_map();
     if (!resolve_streams_map) {
@@ -483,6 +677,8 @@ wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
     }
     memset(stream, 0, sizeof(resolve_stream_t));
     stream->pipe_fd = -1;
+    stream->read_fd_lease = local_read_fd_lease;
+    memset(&local_read_fd_lease, 0, sizeof(local_read_fd_lease));
 
     args = wasm_runtime_malloc(sizeof(*args));
     if (!args) {
@@ -491,14 +687,29 @@ wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
     }
     args->name = NULL;
     args->pipe_write_fd = -1;
+    args->write_fd_lease = local_write_fd_lease;
+    memset(&local_write_fd_lease, 0, sizeof(local_write_fd_lease));
 
     // Create a pipe to signal completion from the worker thread.
     // The read-end of this pipe will become the pollable for the stream's
     // subscribe method.
+#if defined(__APPLE__)
+    // macOS lacks pipe2; create the pipe then set FD_CLOEXEC on both ends.
+    if (pipe(pipefd) < 0) {
+        *err = errno;
+        goto fail;
+    }
+    if (fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) < 0
+        || fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) < 0) {
+        *err = errno;
+        goto fail;
+    }
+#else
     if (pipe2(pipefd, O_CLOEXEC) < 0) {
         *err = errno;
         goto fail;
     }
+#endif
     stream->pipe_fd = pipefd[0];
     args->pipe_write_fd = pipefd[1];
     pipefd[0] = pipefd[1] = -1;
@@ -519,21 +730,35 @@ wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
         *err = EINVAL;
         goto fail;
     }
+    stream_inserted = true;
 
-    // Create and detach a worker thread to perform the blocking getaddrinfo
-    // call.
+    // Create a detached worker thread to perform the blocking getaddrinfo
+    // call. Track it before creation while holding the same lock the worker
+    // needs to finish, so runtime cleanup cannot miss it.
     pthread_t th;
-    if (pthread_create(&th, NULL, resolve_thread, args) != 0) {
-        bh_hash_map_remove(resolve_streams_map, (void *)id, NULL, NULL);
-        stream = NULL; /* freed by remove */
+    pthread_attr_t thread_attr;
+    if (pthread_attr_init(&thread_attr) != 0) {
         *err = EIO;
         goto fail;
     }
-    args = NULL; /* ownership transferred to thread */
-
-    if (pthread_detach(th) != 0) {
-        fprintf(stderr, "wasi-sockets: warning: pthread_detach failed\n");
+    if (pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_DETACHED)
+        != 0) {
+        pthread_attr_destroy(&thread_attr);
+        *err = EIO;
+        goto fail;
     }
+
+    if (pthread_create(&th, &thread_attr, resolve_thread, args) != 0) {
+        pthread_attr_destroy(&thread_attr);
+        *err = EIO;
+        goto fail;
+    }
+    pthread_attr_destroy(&thread_attr);
+    stream->thread = th;
+    args = NULL;                  /* ownership transferred to thread */
+    worker_slot_reserved = false; /* released by resolve_thread */
+    stream_slot_reserved = false; /* released by drop or map teardown */
+
     *ret = id;
     *err = 0;
     pthread_mutex_unlock(&resolve_streams_lock);
@@ -541,6 +766,19 @@ wasi_sockets_resolve_addresses(wasi_network_t network, const char *name,
 
 fail:
     // Robust cleanup logic in case of any failure during setup.
+    if (lock_held && stream_inserted) {
+        bh_hash_map_remove(resolve_streams_map, (void *)id, NULL, NULL);
+    }
+    if (lock_held && worker_slot_reserved) {
+        bh_assert(resolve_active_workers > 0);
+        if (resolve_active_workers > 0)
+            resolve_active_workers--;
+    }
+    if (lock_held && stream_slot_reserved) {
+        bh_assert(resolve_stream_count > 0);
+        if (resolve_stream_count > 0)
+            resolve_stream_count--;
+    }
     if (lock_held)
         pthread_mutex_unlock(&resolve_streams_lock);
 
@@ -552,6 +790,7 @@ fail:
     if (args) {
         if (args->pipe_write_fd != -1)
             close(args->pipe_write_fd);
+        wasi_p2_native_fd_quota_release(&args->write_fd_lease);
         if (args->name)
             wasm_runtime_free(args->name);
         wasm_runtime_free(args);
@@ -559,8 +798,12 @@ fail:
     if (stream) {
         if (stream->pipe_fd != -1)
             close(stream->pipe_fd);
+        wasi_p2_native_fd_quota_release(&stream->read_fd_lease);
         wasm_runtime_free(stream);
     }
+
+    wasi_p2_native_fd_quota_release(&local_read_fd_lease);
+    wasi_p2_native_fd_quota_release(&local_write_fd_lease);
 
     *ret = -1;
 }
@@ -693,8 +936,9 @@ wasi_sockets_resolve_address_stream_subscribe(
         pthread_mutex_unlock(&resolve_streams_lock);
         return pollable;
     }
-    // dup so the pollable owns its own fd and can outlive the stream.
-    int pipe_fd = dup(stream->pipe_fd);
+    // Duplicate with close-on-exec so the pollable owns its fd without leaking
+    // it through an embedder process launch.
+    int pipe_fd = fcntl(stream->pipe_fd, F_DUPFD_CLOEXEC, 0);
     pthread_mutex_unlock(&resolve_streams_lock);
 
     if (pipe_fd < 0) {
@@ -743,7 +987,33 @@ create_socket(wasi_ip_address_family_t family, int type, int *ret_sock,
             *err = WASI_NETWORK_ERROR_CODE_NOT_SUPPORTED;
             return;
     }
-    // Create a non-blocking, close-on-exec socket of the specified type.
+        // Create a non-blocking, close-on-exec socket of the specified type.
+#if defined(__APPLE__)
+    // macOS lacks the SOCK_NONBLOCK/SOCK_CLOEXEC socket() flags: create the
+    // socket then set O_NONBLOCK and FD_CLOEXEC via fcntl. Also set
+    // SO_NOSIGPIPE so writes to a broken connection fail with EPIPE instead of
+    // raising SIGPIPE (macOS has no MSG_NOSIGNAL send flag).
+    int sock = socket(af, type, 0);
+    if (sock < 0) {
+        *err = errno;
+    }
+    else {
+        int flags = fcntl(sock, F_GETFL, 0);
+        int nosigpipe = 1;
+        if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0
+            || fcntl(sock, F_SETFD, FD_CLOEXEC) < 0
+            || setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
+                          sizeof(nosigpipe))
+                   < 0) {
+            *err = errno;
+            close(sock);
+        }
+        else {
+            *err = 0;
+            *ret_sock = sock;
+        }
+    }
+#else
     int sock = socket(af, type | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (sock < 0) {
         *err = errno;
@@ -752,6 +1022,7 @@ create_socket(wasi_ip_address_family_t family, int type, int *ret_sock,
         *err = 0;
         *ret_sock = sock;
     }
+#endif
 }
 
 // wasi:sockets/tcp-create-socket
@@ -912,60 +1183,55 @@ wasi_sockets_tcp_finish_connect(wasi_tcp_socket_t socket,
 
     *input_stream = -1;
     *output_stream = -1;
-    *err = 0;
+    *err = wasi_sockets_tcp_finish_connect_status(socket);
+    if (*err == 0) {
+        *err = wasi_sockets_duplicate_socket_streams(socket, input_stream,
+                                                     output_stream);
+    }
+}
 
-    struct pollfd pfd;
-    pfd.fd = socket;
-    pfd.events = POLLOUT; // A successful connection makes a socket writable.
+int
+wasi_sockets_tcp_finish_connect_status(wasi_tcp_socket_t socket)
+{
+    int error;
+    socklen_t len;
+
+    struct pollfd pfd = {
+        .fd = socket,
+        .events = POLLOUT, // A successful connection makes a socket writable.
+        .revents = 0,
+    };
     // A timeout of 0 makes poll non-blocking.
     int ret = poll(&pfd, 1, 0);
     if (ret < 0) {
-        *err = errno;
-        return;
+        return errno;
     }
 
     // Check if poll reported an error on the socket.
     if (pfd.revents & (POLLERR | POLLHUP)) {
-        int error = 0;
-        socklen_t len = sizeof(error);
+        error = 0;
+        len = sizeof(error);
         // Retrieve the specific error from the socket options.
         if (getsockopt(socket, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
-            *err = errno;
-            return;
+            return errno;
         }
-        *err = error;
-        return;
+        return error;
     }
 
     // If the socket is writable, the connection has completed.
     if (pfd.revents & POLLOUT) {
-        int error = 0;
-        socklen_t len = sizeof(error);
+        error = 0;
+        len = sizeof(error);
         // We must still check SO_ERROR to confirm the connection was
         // successful.
         if (getsockopt(socket, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
-            *err = errno;
-            return;
+            return errno;
         }
-
-        if (error == 0) {
-            *err = 0;
-        }
-        else {
-            *err = error;
-        }
-    }
-    else {
-        // If the socket is not yet writable, the connection is still in
-        // progress.
-        *err = EWOULDBLOCK;
+        return error;
     }
 
-    // On success, a TCP socket can be used for both reading and writing.
-    if (*err == 0) {
-        *input_stream = socket;
-        *output_stream = socket;
-    }
+    // If the socket is not yet writable, the connection is still in progress.
+    return EWOULDBLOCK;
 }
 
 /**
@@ -1031,11 +1297,6 @@ wasi_sockets_tcp_accept(wasi_tcp_socket_t socket, wasi_tcp_socket_t *ret,
     *input_stream = -1;
     *output_stream = -1;
 
-    if (!wasi_sockets_tcp_is_listening(socket)) {
-        *err = ENOTCONN;
-        return;
-    }
-
     int new_socket;
 // Use accept4 on Linux to atomically set the close-on-exec and
 // non-blocking flags. This is more efficient than calling fcntl separately.
@@ -1048,7 +1309,11 @@ wasi_sockets_tcp_accept(wasi_tcp_socket_t socket, wasi_tcp_socket_t *ret,
     if (new_socket < 0) {
         // If no connection is pending, the OS returns EAGAIN or EWOULDBLOCK.
         // This is not a fatal error; we map it to the WASI `would-block` code.
-        *err = errno;
+        /* EINVAL is the portable accept() result for a socket that is not
+           listening.  Translate it to the state error expected by the WASI
+           method instead of relying on SO_ACCEPTCONN, which is not available
+           on every supported Darwin runtime. */
+        *err = errno == EINVAL ? ENOTCONN : errno;
         return;
     }
 
@@ -1064,11 +1329,29 @@ wasi_sockets_tcp_accept(wasi_tcp_socket_t socket, wasi_tcp_socket_t *ret,
     }
 #endif
 
-    // On success, the new socket represents a bidirectional stream.
-    *err = 0;
+#if defined(__APPLE__)
+    // macOS has no MSG_NOSIGNAL: suppress SIGPIPE per-socket on the accepted
+    // fd, matching the SO_NOSIGPIPE set in create_socket().
+    {
+        int nosigpipe = 1;
+        if (setsockopt(new_socket, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe,
+                       sizeof(nosigpipe))
+            < 0) {
+            *err = errno;
+            close(new_socket);
+            return;
+        }
+    }
+#endif
+
+    // On success, the new socket and each stream own distinct descriptors.
+    *err = wasi_sockets_duplicate_socket_streams(new_socket, input_stream,
+                                                 output_stream);
+    if (*err != 0) {
+        close(new_socket);
+        return;
+    }
     *ret = new_socket;
-    *input_stream = dup(new_socket);
-    *output_stream = dup(new_socket);
 }
 
 /**
@@ -1290,7 +1573,12 @@ wasi_sockets_tcp_keep_alive_idle_time(wasi_tcp_socket_t socket,
     int val;
     socklen_t len = sizeof(val);
     // Use the helper to query the TCP_KEEPIDLE socket option.
+#if defined(__APPLE__)
+    // macOS spells the idle-before-first-probe option (seconds) TCP_KEEPALIVE.
+    get_socket_option(socket, IPPROTO_TCP, TCP_KEEPALIVE, &val, &len, err);
+#else
     get_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, &val, &len, err);
+#endif
     if (*err != 0) {
         return;
     }
@@ -1313,8 +1601,14 @@ wasi_sockets_tcp_set_keep_alive_idle_time(wasi_tcp_socket_t socket,
     // The POSIX option requires seconds; convert from nanoseconds.
     int val = value / 1000000000;
     // Use the helper to set the TCP_KEEPIDLE socket option.
+#if defined(__APPLE__)
+    // macOS spells the idle-before-first-probe option (seconds) TCP_KEEPALIVE.
+    return set_socket_option(socket, IPPROTO_TCP, TCP_KEEPALIVE, &val,
+                             sizeof(val));
+#else
     return set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, &val,
                              sizeof(val));
+#endif
 }
 
 /**
@@ -1663,6 +1957,89 @@ wasi_sockets_udp_finish_bind(wasi_udp_socket_t socket)
     return WASI_ERROR_CODE_SUCCESS;
 }
 
+int
+wasi_sockets_udp_capture_peer(wasi_udp_socket_t socket,
+                              wasi_udp_peer_state_t *state)
+{
+    struct sockaddr_storage native_addr;
+    socklen_t native_addr_len = sizeof(native_addr);
+
+    if (!state) {
+        return EINVAL;
+    }
+    memset(state, 0, sizeof(*state));
+    memset(&native_addr, 0, sizeof(native_addr));
+    if (getpeername(socket, (struct sockaddr *)&native_addr, &native_addr_len)
+        == 0) {
+        int error =
+            convert_socket_addr_from_native(&state->address, &native_addr);
+        if (error != WASI_ERROR_CODE_SUCCESS) {
+            return error;
+        }
+        state->connected = true;
+        return 0;
+    }
+    if (errno == ENOTCONN) {
+        state->connected = false;
+        return 0;
+    }
+    return errno;
+}
+
+int
+wasi_sockets_udp_restore_peer(wasi_udp_socket_t socket,
+                              const wasi_udp_peer_state_t *state)
+{
+    if (!state) {
+        return EINVAL;
+    }
+    if (state->connected) {
+        struct sockaddr_storage native_addr;
+        socklen_t native_addr_len;
+        int error = convert_socket_addr_to_native(&state->address, &native_addr,
+                                                  &native_addr_len);
+
+        if (error != WASI_ERROR_CODE_SUCCESS) {
+            return error;
+        }
+        if (connect(socket, (struct sockaddr *)&native_addr, native_addr_len)
+            < 0) {
+            return errno;
+        }
+    }
+    else {
+        struct sockaddr disconnect_addr;
+
+        memset(&disconnect_addr, 0, sizeof(disconnect_addr));
+#if defined(__APPLE__)
+        disconnect_addr.sa_len = sizeof(disconnect_addr);
+#endif
+        disconnect_addr.sa_family = AF_UNSPEC;
+        if (connect(socket, &disconnect_addr, sizeof(disconnect_addr)) < 0) {
+            int disconnect_error = errno;
+
+#if defined(__APPLE__)
+            /* Darwin disconnects a datagram socket for AF_UNSPEC but may still
+               report EAFNOSUPPORT. Verify the resulting peer state before
+               deciding that rollback failed. */
+            if (disconnect_error == EAFNOSUPPORT) {
+                struct sockaddr_storage observed;
+                socklen_t observed_len = sizeof(observed);
+
+                if (getpeername(socket, (struct sockaddr *)&observed,
+                                &observed_len)
+                        < 0
+                    && errno == ENOTCONN) {
+                    return 0;
+                }
+            }
+#endif
+            return disconnect_error;
+        }
+    }
+    return 0;
+}
+
 /**
  * @brief Create datagram streams for a UDP socket.
  * @details Implements the `stream` method on the `udp-socket` resource from the
@@ -1684,6 +2061,9 @@ wasi_sockets_udp_stream(wasi_udp_socket_t socket,
                         wasi_outgoing_datagram_stream_t *output_stream,
                         int *err)
 {
+    wasi_udp_peer_state_t previous_peer;
+    bool peer_changed = false;
+
     if (!input_stream || !output_stream || !err) {
         if (err)
             *err = EINVAL;
@@ -1704,30 +2084,32 @@ wasi_sockets_udp_stream(wasi_udp_socket_t socket,
             *err = e;
             return;
         }
-        if (connect(socket, (struct sockaddr *)&native_addr, native_addr_len)
-            < 0) {
-            *err = errno;
+        e = wasi_sockets_udp_capture_peer(socket, &previous_peer);
+        if (e != 0) {
+            *err = e;
             return;
         }
-    }
-    // Duplicate the socket descriptor to create independent handles for the
-    // input and output streams, allowing their lifecycles to be managed
-    // separately. Use F_DUPFD_CLOEXEC to atomically create a new file
-    // descriptor with the close-on-exec flag set. The O_NONBLOCK flag is
-    // inherited.
-    *input_stream = fcntl(socket, F_DUPFD_CLOEXEC, 0);
-    if (*input_stream < 0) {
-        *err = errno;
-        return;
-    }
+        if (connect(socket, (struct sockaddr *)&native_addr, native_addr_len)
+            < 0) {
+            int connect_error = errno;
+            int restore_error =
+                wasi_sockets_udp_restore_peer(socket, &previous_peer);
 
-    *output_stream = fcntl(socket, F_DUPFD_CLOEXEC, 0);
-    if (*output_stream < 0) {
-        close(*input_stream);
-        *err = errno;
-        return;
+            *err = restore_error != 0 ? restore_error : connect_error;
+            return;
+        }
+        peer_changed = true;
     }
-    *err = 0;
+    *err = wasi_sockets_duplicate_socket_streams(socket, input_stream,
+                                                 output_stream);
+    if (*err != 0 && peer_changed) {
+        int restore_error =
+            wasi_sockets_udp_restore_peer(socket, &previous_peer);
+
+        if (restore_error != 0) {
+            *err = restore_error;
+        }
+    }
 }
 
 /**
@@ -2047,19 +2429,8 @@ wasi_sockets_udp_receive(wasi_incoming_datagram_stream_t stream,
 
     for (i = 0; i < (uint64_t)n; i++) {
         datagrams[i].data_len = msgs[i].msg_len;
-        if (msgs[i].msg_len == 0) {
-            wasm_runtime_free(datagrams[i].data);
-            datagrams[i].data = NULL;
-        }
-        else {
-            uint8_t *new_data =
-                wasm_runtime_realloc(datagrams[i].data, msgs[i].msg_len);
-            if (!new_data) {
-                *err = ENOMEM;
-                goto cleanup;
-            }
-            datagrams[i].data = new_data;
-        }
+        /* Keep the preallocated buffer. Shrinking it after recvmsg() made an
+           allocator denial consume the datagram and then report failure. */
         convert_socket_addr_from_native(
             &datagrams[i].remote_address,
             (struct sockaddr_storage *)msgs[i].msg_hdr.msg_name);
@@ -2104,6 +2475,78 @@ cleanup:
     }
     *ret = NULL;
     *ret_len = 0;
+}
+
+void
+wasi_sockets_udp_peek_receive(wasi_incoming_datagram_stream_t stream,
+                              wasi_incoming_datagram_t *ret, bool *present,
+                              int *err)
+{
+    struct sockaddr_storage native_address;
+    struct iovec iov;
+    struct msghdr message;
+    ssize_t received;
+
+    if (!ret || !present || !err) {
+        if (err)
+            *err = EINVAL;
+        return;
+    }
+    memset(ret, 0, sizeof(*ret));
+    *present = false;
+    *err = 0;
+
+    ret->data = wasm_runtime_malloc(2048);
+    if (!ret->data) {
+        *err = ENOMEM;
+        return;
+    }
+    memset(&native_address, 0, sizeof(native_address));
+    memset(&message, 0, sizeof(message));
+    iov.iov_base = ret->data;
+    iov.iov_len = 2048;
+    message.msg_name = &native_address;
+    message.msg_namelen = sizeof(native_address);
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+
+    received = recvmsg(stream, &message, MSG_PEEK);
+    if (received < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            *err = errno;
+        wasm_runtime_free(ret->data);
+        ret->data = NULL;
+        return;
+    }
+    ret->data_len = (uint64_t)received;
+    *err =
+        convert_socket_addr_from_native(&ret->remote_address, &native_address);
+    if (*err != 0) {
+        wasm_runtime_free(ret->data);
+        ret->data = NULL;
+        ret->data_len = 0;
+        return;
+    }
+    *present = true;
+}
+
+int
+wasi_sockets_udp_consume_peeked(wasi_incoming_datagram_stream_t stream)
+{
+    uint8_t data[2048];
+    struct sockaddr_storage native_address;
+    struct iovec iov = { .iov_base = data, .iov_len = sizeof(data) };
+    struct msghdr message;
+
+    memset(&native_address, 0, sizeof(native_address));
+    memset(&message, 0, sizeof(message));
+    message.msg_name = &native_address;
+    message.msg_namelen = sizeof(native_address);
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    if (recvmsg(stream, &message, 0) < 0)
+        return errno;
+    return 0;
 }
 
 /**
@@ -2239,7 +2682,8 @@ wasi_sockets_udp_send(wasi_outgoing_datagram_stream_t stream,
     int sent_count = sendmmsg(stream, msgs, datagrams_len, MSG_NOSIGNAL);
     if (sent_count < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            *err = errno_to_wasi_network(errno);
+            /* Preserve the native error for the wrapper's single mapping. */
+            *err = errno;
         }
     }
     else {
@@ -2250,9 +2694,14 @@ wasi_sockets_udp_send(wasi_outgoing_datagram_stream_t stream,
     for (n = 0; n < datagrams_len; n++) {
         ssize_t s = sendmsg(stream, &msgs[n].msg_hdr, MSG_NOSIGNAL);
         if (s < 0) {
-            // If the send buffer is full, stop sending and return the count.
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                *err = errno_to_wasi_network(errno);
+            int send_error = errno;
+
+            /* POSIX has no sendmmsg on Apple platforms. Match sendmmsg's
+               partial-progress contract: once at least one datagram was sent,
+               report Ok(N). Only a failure before any progress is surfaced,
+               and retain its native errno for one wrapper-side mapping. */
+            if (n == 0 && send_error != EAGAIN && send_error != EWOULDBLOCK) {
+                *err = send_error;
             }
             break;
         }

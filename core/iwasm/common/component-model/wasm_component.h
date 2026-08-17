@@ -1553,12 +1553,21 @@ typedef struct WASMComponentSection {
     } parsed;
 } WASMComponentSection;
 
+typedef struct WASMComponentHostResourceDropRegistration {
+    char *interface_name;
+    char *resource_name;
+    wasm_component_host_resource_drop_callback_t callback;
+} WASMComponentHostResourceDropRegistration;
+
 // Main Component Structure - Complete component
 typedef struct WASMComponent {
     WASMHeader header;
     WASMComponentSection *sections;
     uint32_t section_count;
-#if WASM_ENABLE_LIBC_WASI != 0
+    WASMComponentHostResourceDropRegistration *host_resource_drops;
+    uint32_t host_resource_drop_count;
+    uint32_t host_resource_drop_capacity;
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIArguments wasi_args;
     bool import_wasi_api;
 #endif
@@ -1573,6 +1582,17 @@ extern "C" {
 void
 set_error_buf_ex(char *error_buf, uint32_t error_buf_size, const char *format,
                  ...);
+
+/* Allocate and zero a parser-owned array after checking both the runtime's
+ * uint32 allocation limit and the minimum bytes still required in the input
+ * for each encoded element. The payload bounds may be NULL only for arrays
+ * whose element count is not read from the current input buffer. */
+void *
+wasm_component_checked_calloc(uint32_t count, uint32_t element_size,
+                              const uint8_t *payload, const uint8_t *end,
+                              uint32_t min_element_size,
+                              const char *description, char *error_buf,
+                              uint32_t error_buf_size);
 
 bool
 parse_valtype(const uint8_t **payload, const uint8_t *end,
@@ -1689,10 +1709,29 @@ parse_core_valtype(const uint8_t **payload, const uint8_t *end,
 
 bool
 is_wasm_component(WASMHeader header);
+WASMComponent *
+wasm_component_load(uint8_t *buf, uint32_t size, const LoadArgs *load_args,
+                    char *error_buf, uint32_t error_buf_size);
+
+WASMComponent *
+wasm_component_load_ex2(uint8_t *buf, uint32_t size, const LoadArgs2 *load_args,
+                        char *error_buf, uint32_t error_buf_size);
+void
+wasm_component_unload(WASMComponent *component);
+bool
+wasm_component_find_host_resource_drop_callback(
+    const WASMComponent *component, const char *interface_name,
+    const char *resource_name,
+    wasm_component_host_resource_drop_callback_t *callback);
 bool
 wasm_component_parse_sections(const uint8_t *buf, uint32_t size,
                               WASMComponent *out_component, LoadArgs *args,
                               unsigned int depth);
+bool
+wasm_component_parse_sections_ex(const uint8_t *buf, uint32_t size,
+                                 WASMComponent *out_component, LoadArgs *args,
+                                 unsigned int depth, char *error_buf,
+                                 uint32_t error_buf_size);
 bool
 wasm_component_parse_core_custom_section(const uint8_t **payload,
                                          uint32_t payload_len,

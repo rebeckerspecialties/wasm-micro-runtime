@@ -133,9 +133,7 @@ jobs:
             llvm_cache_key: ${{ needs.build_llvm_libraries_on_ubuntu_2204.outputs.cache_key }}
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       # since jobs.id can't contain the dot character
       # it is hard to use `format` to assemble the cache key
@@ -300,9 +298,7 @@ jobs:
             extra_options: "-DWAMR_BUILD_SIMD=0"
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       # only download llvm cache when needed
       - name: Get LLVM libraries
@@ -345,7 +341,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7.0.0
         with:
           ref: ${{ env.PR_REF }}
           submodules: recursive
@@ -406,9 +402,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       - name: Get LLVM libraries
         id: retrieve_llvm_libs
@@ -432,6 +426,10 @@ jobs:
         working-directory: tests/regression/ba-issues
 
       - name: Run regression tests
+        env:
+          # Avoid host-CPU AOT output changing as hosted runners move between
+          # x86 generations; this matches the x86-64 spec-suite baseline.
+          WAMRC_TARGET_OPTIONS: "--target=x86_64 --cpu=skylake"
         run: |
           python run.py
         working-directory: tests/regression/ba-issues
@@ -475,9 +473,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       - name: Get LLVM libraries
         id: retrieve_llvm_libs
@@ -538,9 +534,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       - name: Get LLVM libraries
         id: retrieve_llvm_libs
@@ -736,9 +730,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       - name: Set-up OCaml
         uses: ocaml/setup-ocaml@v3
@@ -767,6 +759,16 @@ jobs:
            && matrix.test_option != '$MEMORY64_TEST_OPTIONS'
            && matrix.running_mode != 'fast-jit' && matrix.running_mode != 'jit' && matrix.running_mode != 'multi-tier-jit')
         run: echo "TEST_ON_X86_32=true" >> $GITHUB_ENV
+
+      - name: Free up disk space
+        if: env.USE_LLVM == 'true'
+        run: |
+          # Restoring the prebuilt LLVM libraries cache overflows the runner's
+          # small default free space and fails with "no space left on device".
+          # Drop preinstalled toolchains this job never uses (~20 GB freed).
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
 
       #only download llvm libraries in jit and aot mode
       - name: Get LLVM libraries

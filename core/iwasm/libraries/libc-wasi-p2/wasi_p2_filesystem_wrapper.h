@@ -153,7 +153,7 @@ wasi_filesystem_metadata_hash_at_wrapper(wasm_exec_env_t exec_env,
 /* directory-entry-stream */
 void
 wasi_filesystem_read_directory_entry_wrapper(wasm_exec_env_t exec_env,
-                                             int64_t stream,
+                                             uint32_t stream,
                                              uint32_t offset_addr);
 
 void

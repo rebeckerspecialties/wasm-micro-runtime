@@ -46,18 +46,16 @@ ComponentHelper::do_teardown()
         component_instantiated = false;
     }
 
-    if (component_init) {
-        printf("Starting to unload component\n");
-        if (component) {
-            wasm_component_free(component);
-            component = NULL;
-        }
-        if (component_raw) {
-            BH_FREE(component_raw);
-            component_raw = NULL;
-        }
-        component_init = false;
+    printf("Starting to unload component\n");
+    if (component) {
+        wasm_component_unload(component);
+        component = NULL;
     }
+    if (component_raw) {
+        BH_FREE(component_raw);
+        component_raw = NULL;
+    }
+    component_init = false;
 
     if (runtime_init) {
         printf("Starting to destroy runtime\n");
@@ -88,57 +86,22 @@ bool
 ComponentHelper::load_component()
 {
     printf("Loading wasm component in memory\n");
-    
-    // Allocate component structure if not already allocated
-    if (!component) {
-        component = (WASMComponent *)wasm_runtime_malloc(sizeof(WASMComponent));
-        if (!component) {
-            printf("Failed to allocate component structure\n");
-            return false;
-        }
-        memset(component, 0, sizeof(WASMComponent));
-    }
-    
-    // First decode the header
-    if (!wasm_decode_header(component_raw, wasm_file_size, &component->header)) {
-        printf("Not a valid WASM component file (header mismatch).\n");
-        BH_FREE(component_raw);
-        component_raw = NULL;
-        wasm_runtime_free(component);
-        component = NULL;
-        return false;
-    }
 
-    // Second check if it's a valid component
-    if (!is_wasm_component(component->header)) {
-        printf("Not a valid WASM component file (header mismatch).\n");
-        BH_FREE(component_raw);
-        component_raw = NULL;
-        wasm_runtime_free(component);
-        component = NULL;
-        return false;
-    }
-    
-    // Parse the component sections
     LoadArgs load_args = {0, false, false, false, false};
-    char name_buf[32];
-    std::memset(name_buf, 0, sizeof(name_buf));
-    std::snprintf(name_buf, sizeof(name_buf), "%s", "Test Component");
-    load_args.name = name_buf; // provide non-null, mutable name as required by loader
+    static char test_component_name[] = "Test Component";
+    load_args.name = test_component_name;
     load_args.wasm_binary_freeable = false;
     load_args.clone_wasm_binary = false;
     load_args.no_resolve = false;
     load_args.is_component = true;
-    
-    if (!wasm_component_parse_sections(component_raw, wasm_file_size, component, &load_args, 0)) {
-        printf("Failed to parse WASM component sections.\n");
-        BH_FREE(component_raw);
-        component_raw = NULL;
-        wasm_runtime_free(component);
-        component = NULL;
+
+    component = wasm_component_load(component_raw, wasm_file_size, &load_args,
+                                    error_buf, sizeof(error_buf));
+    if (!component) {
+        printf("Failed to load WASM component: %s\n", error_buf);
         return false;
     }
-    
+
     printf("Component loaded successfully with %u sections\n", component->section_count);
     component_init = true;
 
@@ -159,9 +122,14 @@ bool ComponentHelper::is_loaded() const {
 
 void ComponentHelper::reset_component() {
     if (component) {
-        wasm_component_free(component);
+        wasm_component_unload(component);
         component = NULL;
     }
+    if (component_raw) {
+        BH_FREE(component_raw);
+        component_raw = NULL;
+    }
+    wasm_file_size = 0;
     component_init = false;
 }
 
@@ -202,7 +170,8 @@ bool ComponentHelper::instantiate_component() {
     wasm_runtime_instantiation_args_set_default_stack_size(inst_args, stack_size);
     wasm_runtime_instantiation_args_set_host_managed_heap_size(inst_args, heap_size);
 
-    this->component_inst = wasm_component_instantiate(this->component, this->error_buf, 128);
+    this->component_inst = wasm_component_instantiate_ex2(
+        this->component, inst_args, this->error_buf, sizeof(this->error_buf));
 
     wasm_runtime_instantiation_args_destroy(inst_args);
 

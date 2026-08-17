@@ -7,20 +7,6 @@
 #include "wasm_component.h"
 #include "wasm_component_runtime.h"
 
-static bool is_component = false;
-
-bool
-is_component_runtime()
-{
-    return is_component;
-}
-
-void
-set_component_runtime(bool type)
-{
-    is_component = type;
-}
-
 bool
 wasm_resolve_exports(WASMComponentExportSection *export_section,
                      WASMComponentInstance *comp_instance, char *error_buf,

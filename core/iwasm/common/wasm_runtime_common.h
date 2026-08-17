@@ -16,11 +16,12 @@
 #include "gc/gc_object.h"
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0 && WASM_ENABLE_COMPONENT_MODEL != 0
+#if (WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0) \
+    && WASM_ENABLE_COMPONENT_MODEL != 0
 typedef struct libc_wasi_options_t libc_wasi_options_t;
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 #if WASM_ENABLE_UVWASI == 0
 #include "posix.h"
 #else
@@ -557,7 +558,7 @@ typedef struct WASMModuleInstMemConsumption {
     uint32 exports_size;
 } WASMModuleInstMemConsumption;
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 #if WASM_ENABLE_UVWASI == 0
 typedef struct WASIContext {
     struct fd_table *curfds;
@@ -586,7 +587,7 @@ typedef struct WASIContext {
 #if WASM_ENABLE_MULTI_MODULE != 0
 typedef struct WASMRegisteredModule {
     bh_list_link l;
-    /* point to a string pool */
+    /* Owned in the global registry, borrowed in a parent's import list. */
     const char *module_name;
     WASMModuleCommon *module;
     /* to store the original module file buffer address */
@@ -630,7 +631,13 @@ wasm_runtime_get_exec_env_tls(void);
 struct InstantiationArgs2 {
     InstantiationArgs v1;
     void *custom_data;
-#if WASM_ENABLE_LIBC_WASI != 0
+    void *memory_page_quota_attachment;
+    wasm_memory_page_quota_reserve_callback_t memory_page_quota_reserve;
+    wasm_memory_page_quota_release_callback_t memory_page_quota_release;
+    void *native_fd_quota_attachment;
+    wasm_native_fd_quota_reserve_callback_t native_fd_quota_reserve;
+    wasm_native_fd_quota_release_callback_t native_fd_quota_release;
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIArguments wasi;
 #endif
 };
@@ -686,6 +693,13 @@ wasm_runtime_is_xip_file(const uint8 *buf, uint32 size);
 WASM_RUNTIME_API_EXTERN WASMModuleCommon *
 wasm_runtime_load(uint8 *buf, uint32 size, char *error_buf,
                   uint32 error_buf_size);
+
+bool
+wasm_runtime_load_args2_normalize(const LoadArgs2 *args, LoadArgs *legacy_args,
+                                  char *error_buf, uint32 error_buf_size);
+
+bool
+wasm_runtime_load_args2_quota_enabled(const LoadArgs2 *args);
 
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN WASMModuleCommon *
@@ -753,6 +767,18 @@ WASM_RUNTIME_API_EXTERN
 void
 wasm_runtime_instantiation_args_set_max_memory_pages(
     struct InstantiationArgs2 *p, uint32 v);
+
+void
+wasm_runtime_instantiation_args_set_memory_page_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_memory_page_quota_reserve_callback_t reserve_callback,
+    wasm_memory_page_quota_release_callback_t release_callback);
+
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_instantiation_args_set_native_fd_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_native_fd_quota_reserve_callback_t reserve_callback,
+    wasm_native_fd_quota_release_callback_t release_callback);
 
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN void
@@ -930,6 +956,19 @@ wasm_runtime_call_wasm_a(WASMExecEnv *exec_env,
                          uint32 num_results, wasm_val_t *results,
                          uint32 num_args, wasm_val_t *args);
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+/* Internal component adapter entry point. The callback is consumed exactly
+   once, after every fallible pre-entry check and before guest dispatch. */
+bool
+wasm_runtime_call_wasm_a_with_pre_entry(WASMExecEnv *exec_env,
+                                        WASMFunctionInstanceCommon *function,
+                                        uint32 num_results, wasm_val_t *results,
+                                        uint32 num_args, wasm_val_t *args,
+                                        WASMCallPreEntryCallback callback,
+                                        void *attachment);
+#endif
+
 WASM_RUNTIME_API_EXTERN bool
 wasm_runtime_call_wasm_v(WASMExecEnv *exec_env,
                          WASMFunctionInstanceCommon *function,
@@ -1098,8 +1137,8 @@ wasm_runtime_register_module_internal(const char *module_name,
                                       uint32 orig_file_buf_size,
                                       char *error_buf, uint32 error_buf_size);
 
-void
-wasm_runtime_unregister_module(const WASMModuleCommon *module);
+bool
+wasm_runtime_unregister_module(WASMModuleCommon *module);
 
 WASMModuleCommon *
 wasm_runtime_find_module_registered(const char *module_name);
@@ -1160,7 +1199,7 @@ wasm_exec_env_set_aux_stack(WASMExecEnv *exec_env, uint64 start_offset,
                             uint32 size);
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_set_wasi_args_ex(WASMModuleCommon *module, const char *dir_list[],
                               uint32 dir_count, const char *map_dir_list[],
@@ -1228,7 +1267,7 @@ WASM_RUNTIME_API_EXTERN void
 wasm_runtime_set_wasi_ns_lookup_pool(wasm_module_t module,
                                      const char *ns_lookup_pool[],
                                      uint32 ns_lookup_pool_size);
-#endif /* end of WASM_ENABLE_LIBC_WASI */
+#endif /* WASM_ENABLE_LIBC_WASI || WASM_ENABLE_LIBC_WASI_P2 */
 
 #if WASM_ENABLE_GC != 0
 void
@@ -1248,6 +1287,15 @@ wasm_externref_obj2ref(WASMModuleInstanceCommon *module_inst, void *extern_obj,
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN bool
 wasm_externref_ref2obj(uint32 externref_idx, void **p_extern_obj);
+
+/* Invoke a non-reentrant accessor while the externref node remains protected
+ * by the global map lock.  Internal users which must copy/retain the mapped
+ * object use this instead of copying a raw pointer after ref2obj returns. */
+typedef bool (*wasm_externref_obj_access_t)(void *extern_obj, void *user_data);
+bool
+wasm_externref_ref2obj_access(uint32 externref_idx,
+                              wasm_externref_obj_access_t access,
+                              void *user_data);
 
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN bool
@@ -1402,7 +1450,28 @@ wasm_runtime_invoke_c_api_native(WASMModuleInstanceCommon *module_inst,
                                  uint32 argc, uint32 *argv, bool with_env,
                                  void *wasm_c_api_env);
 
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+bool
+wasm_runtime_invoke_c_api_native_with_pre_entry(
+    WASMExecEnv *exec_env, WASMModuleInstanceCommon *module_inst,
+    void *func_ptr, WASMFuncType *func_type, uint32 argc, uint32 *argv,
+    bool with_env, void *wasm_c_api_env);
+#endif
+
 struct CApiFuncImport;
+
+/* wasm-c-api with-env callbacks use an ABI-neutral shared payload behind the
+   existing CApiFuncImport::env_arg field. */
+bool
+wasm_c_api_callback_payload_get_env(void *payload, void **env);
+
+bool
+wasm_c_api_func_imports_retain(struct CApiFuncImport *imports, uint32 count);
+
+void
+wasm_c_api_func_imports_release(struct CApiFuncImport *imports, uint32 count);
+
 /* A quick version of wasm_runtime_invoke_c_api_native to directly invoke
    wasm-c-api import function from jitted code to improve performance */
 bool

@@ -17,6 +17,11 @@ parse_core_limits(const uint8_t **payload, const uint8_t *end,
                   WASMComponentCoreLimits *out, char *error_buf,
                   uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing core limits");
+        return false;
+    }
     const uint8_t *p = *payload;
     uint8_t tag = *p++;
 
@@ -69,6 +74,11 @@ parse_core_heaptype(const uint8_t **payload, const uint8_t *end,
                     WASMComponentCoreHeapType *out, char *error_buf,
                     uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing core heaptype");
+        return false;
+    }
     const uint8_t *p = *payload;
     if (p >= end) {
         set_error_buf_ex(error_buf, error_buf_size,
@@ -110,6 +120,11 @@ parse_core_valtype(const uint8_t **payload, const uint8_t *end,
                    WASMComponentCoreValType *out, char *error_buf,
                    uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing core valtype");
+        return false;
+    }
     const uint8_t *p = *payload;
     uint8_t tag = *p++;
 
@@ -191,6 +206,11 @@ parse_core_import_desc(const uint8_t **payload, const uint8_t *end,
                        WASMComponentCoreImportDesc *out, char *error_buf,
                        uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing core import descriptor");
+        return false;
+    }
     const uint8_t *p = *payload;
     uint8_t tag = *p++;
 
@@ -210,6 +230,11 @@ parse_core_import_desc(const uint8_t **payload, const uint8_t *end,
 
         case WASM_CORE_IMPORTDESC_TABLE:
         {
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing core table reference type");
+                return false;
+            }
             uint8_t ref_type_tag = *p++;
             if (ref_type_tag == WASM_CORE_REFTYPE_FUNC_REF) {
                 out->type = WASM_CORE_IMPORTDESC_TABLE;
@@ -272,6 +297,11 @@ parse_core_import_desc(const uint8_t **payload, const uint8_t *end,
             }
 
             // mut ::= 0x00 => const, 0x01 => var (spec)
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing core global mutability");
+                return false;
+            }
             uint8_t mutable_tag = *p++;
             if (mutable_tag == WASM_CORE_GLOBAL_MUTABLE) {
                 out->desc.global_type.is_mutable = true;
@@ -304,6 +334,11 @@ parse_core_import(const uint8_t **payload, const uint8_t *end,
                   WASMComponentCoreImport *out, char *error_buf,
                   uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing core import");
+        return false;
+    }
     const uint8_t *p = *payload;
 
     WASMComponentCoreName *mod_name = NULL;
@@ -344,6 +379,11 @@ parse_alias_target(const uint8_t **payload, const uint8_t *end,
                    WASMComponentCoreAliasTarget *out, char *error_buf,
                    uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing core alias target");
+        return false;
+    }
     const uint8_t *p = *payload;
     uint8_t tag = *p++;
 
@@ -434,6 +474,12 @@ parse_core_module_decl(const uint8_t **payload, const uint8_t *end,
                        WASMComponentCoreModuleDecl *out, char *error_buf,
                        uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(
+            error_buf, error_buf_size,
+            "Unexpected end while parsing core module declaration");
+        return false;
+    }
     const uint8_t *p = *payload;
     uint8_t tag = *p++;
     out->tag = tag;
@@ -545,16 +591,12 @@ parse_core_moduletype(const uint8_t **payload, const uint8_t *end,
     out->decl_count = count;
 
     if (count > 0) {
-        out->declarations =
-            wasm_runtime_malloc(sizeof(WASMComponentCoreModuleDecl) * count);
+        out->declarations = wasm_component_checked_calloc(
+            count, sizeof(WASMComponentCoreModuleDecl), p, end, 1,
+            "core module declaration", error_buf, error_buf_size);
         if (!out->declarations) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for declarations");
             return false;
         }
-        // Zero-initialize declarations array
-        memset(out->declarations, 0,
-               sizeof(WASMComponentCoreModuleDecl) * count);
 
         for (uint32_t i = 0; i < count; i++) {
             if (!parse_core_module_decl(&p, end, &out->declarations[i],
@@ -593,6 +635,7 @@ parse_single_core_type(const uint8_t **payload, const uint8_t *end,
                              "OOM allocating core moduletype");
             return false;
         }
+        memset(out->type.moduletype, 0, sizeof(WASMComponentCoreModuleType));
         if (!parse_core_moduletype(&p, end, out->type.moduletype, error_buf,
                                    error_buf_size)) {
             return false;
@@ -661,14 +704,13 @@ wasm_component_parse_core_type_section(const uint8_t **payload,
     out->count = count;
 
     if (count > 0) {
-        out->types = wasm_runtime_malloc(sizeof(WASMComponentCoreType) * count);
+        out->types = wasm_component_checked_calloc(
+            count, sizeof(WASMComponentCoreType), p, end, 1, "core type",
+            error_buf, error_buf_size);
         if (!out->types) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for types");
             return false;
         }
 
-        memset(out->types, 0, sizeof(WASMComponentCoreType) * count);
         for (uint32_t i = 0; i < count; i++) {
             WASMComponentCoreDefType *dt =
                 wasm_runtime_malloc(sizeof(WASMComponentCoreDefType));
@@ -678,12 +720,11 @@ wasm_component_parse_core_type_section(const uint8_t **payload,
                 return false;
             }
             memset(dt, 0, sizeof(WASMComponentCoreDefType));
+            out->types[i].deftype = dt;
             if (!parse_single_core_type(&p, end, dt, error_buf,
                                         error_buf_size)) {
-                wasm_runtime_free(dt);
                 return false;
             }
-            out->types[i].deftype = dt;
         }
     }
 

@@ -6,9 +6,6 @@
 #include "wasm_component_canon.h"
 #include "wasm_component_runtime.h"
 #include "wasm_component_task.h"
-#include "wasm_component_host_resource.h"
-#include "wasm_runtime.h"
-#include "../libraries/libc-wasi-p2/wasi_p2_common.h"
 #include "bh_log.h"
 
 bool
@@ -101,84 +98,19 @@ canon_resource_drop(const WASMComponentResourceInstance *rt,
         return false;
     }
 
-    bool own = handle->own;
-    uint32_t rep = handle->rep;
     Task *borrow_scope = handle->borrow_scope;
-
-    if (!wasm_component_table_remove(inst->table, handle_index)) {
-        LOG_ERROR("canon resource.drop: failed to remove handle from table");
+    if (borrow_scope && borrow_scope->num_borrows == 0) {
+        LOG_ERROR("canon resource.drop: borrow count underflow");
         return false;
     }
 
-    if (own) {
-        if (rt->is_wasi) {
-
-            HostResourceTable *hr_table = get_global_host_resource_table();
-            if (!hr_table) {
-                LOG_ERROR("canon resource.drop: failed to retrieve host "
-                          "resource table");
-                return false;
-            }
-
-            HostResource *hr = host_resource_table_get(hr_table, rep);
-            if (!hr) {
-                LOG_ERROR("canon resource.drop: failed to retrieve host "
-                          "resource handle");
-                return false;
-            }
-
-            if (!host_resource_table_delete(hr_table, rep)) {
-                LOG_ERROR("canon resource.drop: failed to remove handle from "
-                          "host table");
-                return false;
-            }
-        }
-
-        if (rt->dtor_method) {
-            WASMExecEnv *dtor_exec_env = wasm_runtime_get_exec_env_singleton(
-                (WASMModuleInstanceCommon *)rt->dtor_method->module_instance);
-            if (!dtor_exec_env) {
-                LOG_ERROR("canon resource.drop: no exec_env for dtor");
-                return false;
-            }
-
-            WASMModuleInstanceCommon *saved_inst =
-                wasm_runtime_get_module_inst(dtor_exec_env);
-            wasm_exec_env_set_module_inst(
-                dtor_exec_env,
-                (WASMModuleInstanceCommon *)rt->dtor_method->module_instance);
-
-            wasm_val_t arg = { .kind = WASM_I32, .of.i32 = (int32_t)rep };
-
-#ifdef OS_ENABLE_HW_BOUND_CHECK
-            WASMExecEnv *saved_tls = wasm_runtime_get_exec_env_tls();
-            wasm_runtime_set_exec_env_tls(NULL);
-#endif
-            if (!wasm_runtime_call_wasm_a(
-                    dtor_exec_env,
-                    (WASMFunctionInstanceCommon *)rt->dtor_method, 0, NULL, 1,
-                    &arg)) {
-                const char *ex = wasm_runtime_get_exception(
-                    (WASMModuleInstanceCommon *)
-                        rt->dtor_method->module_instance);
-                LOG_ERROR("canon resource.drop: dtor call failed: %s",
-                          ex ? ex : "(unknown)");
-#ifdef OS_ENABLE_HW_BOUND_CHECK
-                wasm_runtime_set_exec_env_tls(saved_tls);
-#endif
-                wasm_exec_env_restore_module_inst(dtor_exec_env, saved_inst);
-                return false;
-            }
-#ifdef OS_ENABLE_HW_BOUND_CHECK
-            wasm_runtime_set_exec_env_tls(saved_tls);
-#endif
-            wasm_exec_env_restore_module_inst(dtor_exec_env, saved_inst);
-        }
+    if (!wasm_component_table_drop_resource(inst->table, handle_index)) {
+        LOG_ERROR("canon resource.drop: failed to drop handle from table");
+        return false;
     }
-    else {
-        if (borrow_scope) {
-            borrow_scope->num_borrows--;
-        }
+
+    if (borrow_scope) {
+        borrow_scope->num_borrows--;
     }
 
     return true;

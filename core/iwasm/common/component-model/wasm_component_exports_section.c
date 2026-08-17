@@ -52,18 +52,14 @@ wasm_component_parse_exports_section(const uint8_t **payload,
     out->count = export_count;
 
     if (export_count > 0) {
-        out->exports =
-            wasm_runtime_malloc(sizeof(WASMComponentExport) * export_count);
+        out->exports = wasm_component_checked_calloc(
+            export_count, sizeof(WASMComponentExport), p, end, 1,
+            "component export", error_buf, error_buf_size);
         if (!out->exports) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for exports");
             if (consumed_len)
                 *consumed_len = (uint32_t)(p - *payload);
             return false;
         }
-        // Ensure all fields (including optional extern_desc) are initialized to
-        // NULL/0
-        memset(out->exports, 0, sizeof(WASMComponentExport) * export_count);
 
         // Parsing every export
         for (uint32_t i = 0; i < export_count; i++) {
@@ -86,6 +82,8 @@ wasm_component_parse_exports_section(const uint8_t **payload,
                     *consumed_len = (uint32_t)(p - *payload);
                 return false;
             }
+            memset(export_name, 0, sizeof(*export_name));
+            out->exports[i].export_name = export_name;
 
             bool status = parse_component_export_name(
                 &p, end, export_name, error_buf, error_buf_size);
@@ -93,32 +91,28 @@ wasm_component_parse_exports_section(const uint8_t **payload,
                 set_error_buf_ex(error_buf, error_buf_size,
                                  "Failed to parse component name for export %u",
                                  i);
-                wasm_runtime_free(export_name);
                 if (consumed_len)
                     *consumed_len = (uint32_t)(p - *payload);
                 return false;
             }
-            out->exports[i].export_name = export_name;
-
             // Parsing 'sortidx'
             out->exports[i].sort_idx =
                 wasm_runtime_malloc(sizeof(WASMComponentSortIdx));
             if (!out->exports[i].sort_idx) {
                 set_error_buf_ex(error_buf, error_buf_size,
                                  "Failed to allocate memory for sort_idx");
-                wasm_runtime_free(export_name);
                 if (consumed_len)
                     *consumed_len = (uint32_t)(p - *payload);
                 return false;
             }
+            memset(out->exports[i].sort_idx, 0,
+                   sizeof(*out->exports[i].sort_idx));
 
             status = parse_sort_idx(&p, end, out->exports[i].sort_idx,
                                     error_buf, error_buf_size, false);
             if (!status) {
                 set_error_buf_ex(error_buf, error_buf_size,
                                  "Failed to parse sort_idx for export %u", i);
-                wasm_runtime_free(out->exports[i].sort_idx);
-                wasm_runtime_free(export_name);
                 if (consumed_len)
                     *consumed_len = (uint32_t)(p - *payload);
                 return false;
@@ -135,9 +129,6 @@ wasm_component_parse_exports_section(const uint8_t **payload,
                                  "Unexpected end of buffer when reading "
                                  "optional extern_desc for export %u",
                                  i);
-                wasm_runtime_free(out->exports[i].sort_idx->sort);
-                wasm_runtime_free(out->exports[i].sort_idx);
-                wasm_runtime_free(export_name);
                 if (consumed_len)
                     *consumed_len = (uint32_t)(p - *payload);
                 return false;
@@ -149,30 +140,33 @@ wasm_component_parse_exports_section(const uint8_t **payload,
                                      "Unexpected end of buffer when parsing "
                                      "extern_desc for export %u",
                                      i);
-                    wasm_runtime_free(out->exports[i].sort_idx->sort);
-                    wasm_runtime_free(out->exports[i].sort_idx);
-                    wasm_runtime_free(export_name);
                     if (consumed_len)
                         *consumed_len = (uint32_t)(p - *payload);
                     return false;
                 }
                 WASMComponentExternDesc *extern_desc =
                     wasm_runtime_malloc(sizeof(WASMComponentExternDesc));
+                if (!extern_desc) {
+                    set_error_buf_ex(error_buf, error_buf_size,
+                                     "Failed to allocate extern_desc for "
+                                     "export %u",
+                                     i);
+                    if (consumed_len)
+                        *consumed_len = (uint32_t)(p - *payload);
+                    return false;
+                }
+                memset(extern_desc, 0, sizeof(*extern_desc));
+                out->exports[i].extern_desc = extern_desc;
                 bool extern_status = parse_extern_desc(
                     &p, end, extern_desc, error_buf, error_buf_size);
                 if (!extern_status) {
                     set_error_buf_ex(
                         error_buf, error_buf_size,
                         "Failed to parse extern_desc for export %u", i);
-                    wasm_runtime_free(extern_desc);
-                    wasm_runtime_free(out->exports[i].sort_idx->sort);
-                    wasm_runtime_free(out->exports[i].sort_idx);
-                    wasm_runtime_free(export_name);
                     if (consumed_len)
                         *consumed_len = (uint32_t)(p - *payload);
                     return false;
                 }
-                out->exports[i].extern_desc = extern_desc;
                 LOG_DEBUG("Extern desc added\n");
             }
             else if (opt_extern_desc == WASM_COMP_OPTIONAL_FALSE) {

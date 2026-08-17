@@ -14,6 +14,7 @@
 #include "wasm_component_resource_table.h"
 #include "mem_alloc.h"
 #include "wasm_export.h"
+#include "bh_atomic.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,11 +24,21 @@ extern "C" {
 #define EXCEPTION_BUF_LEN 128
 #endif
 
-#define HEAP_SIZE (100 * 1024 * 1024) // 100 MB
-#define STACK_SIZE (16 * 1024)        // 100 MB
+#define COMPONENT_DEFAULT_HEAP_SIZE (100 * 1024 * 1024)
+#define COMPONENT_DEFAULT_STACK_SIZE (16 * 1024)
 
+#if defined(_WIN32) || defined(_WIN32_)
+#define COMPONENT_MAX_REG_FLOATS 4
+#define COMPONENT_MAX_REG_INTS 4
+#else
 #define COMPONENT_MAX_REG_FLOATS 8
+#if defined(BUILD_TARGET_AARCH64) || defined(BUILD_TARGET_RISCV64_LP64D) \
+    || defined(BUILD_TARGET_RISCV64_LP64)
+#define COMPONENT_MAX_REG_INTS 8
+#else
 #define COMPONENT_MAX_REG_INTS 6
+#endif
+#endif
 
 typedef struct WASMComponentTypeInstance WASMComponentTypeInstance;
 typedef struct WASMComponentInstance WASMComponentInstance;
@@ -228,7 +239,7 @@ typedef struct WASMComponentFunctionInstance {
 // Used for storing the sizes of the defined types/ exports/ index spaces of the
 // Component instance type
 typedef struct WASMComponentInstanceDeclTypeSize {
-    uint32 types_size;
+    uint64 types_size;
     uint32 types_count;
     uint32 func_count;
     uint32 exports_count;
@@ -249,6 +260,12 @@ typedef struct WASMComponentInstTypeInstance {
     WASMComponentExportInstance *exports;
 
     WASMFunctionInstance *defined_core_funcs;
+
+    /* Only types in this range are declared by this instance type. Entries
+     * outside it are nominal outer aliases and must retain their owner and
+     * identity when a host import is materialized. */
+    void *owned_types_begin;
+    uint32 owned_types_size;
 
     // Memory layout at instantiation:
     /*
@@ -272,7 +289,14 @@ typedef struct WASMComponentInstTypeInstance {
 typedef struct WASMComponentResourceInstance {
     char *name;
     char *interface_name;
-    bool is_wasi;
+    /* True only when this resource's host interface was resolved entirely
+     * through WAMR's built-in WASI Preview 2 implementation.  A wasi: name by
+     * itself does not grant access to the global built-in resource table. */
+    bool is_builtin_wasi;
+    bool is_host;
+    wasm_component_host_resource_drop_callback_t host_drop_callback;
+    void *host_drop_attachment;
+    bool host_drop_attachment_is_custom_data;
     WASMComponentInstance *impl;
     WASMFunctionInstance *drop_method;
     WASMFunctionInstance *new_method;
@@ -376,10 +400,11 @@ typedef struct WASMComponentInstance {
     WASMExecEnv *cur_exec_env;       // Currently active exec env
     uint32 default_wasm_stack_size;  // Stack configuration
     void *custom_data;
+    struct InstantiationArgs2 instantiation_args;
     WASMComponent *component; // Reference to component definition
 
     WASMComponentResourceTable *table;
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIContext *wasi_ctx;
 #endif
     // Index spaces:
@@ -438,6 +463,11 @@ typedef struct WASMComponentInstance {
     WASMComponentExportInstance *exports;
     uint32 exports_count;
 
+    /* Inline instance expressions synthesize export-name wrappers which are
+     * owned by the runtime instance rather than the loaded component. */
+    WASMComponentExportName *owned_export_names;
+    uint32 owned_export_names_count;
+
     void *defined_types;
     WASMFunctionInstance *defined_core_functions;
     WASMComponentFunctionInstance *defined_functions;
@@ -457,6 +487,21 @@ typedef struct WASMComponentInstance {
     uint32 defined_canon_opts_size;
 
     uint32 resources_count;
+    uint32 outstanding_prepared_calls;
+    uint32 lifecycle_active_operations;
+    struct WASMComponentInstance *lifecycle_root;
+    /* High bit closes the gate; low bits count callers which may touch the
+     * lifecycle mutex. Keeping both in one atomic word makes close-and-drain
+     * immune to a late entrant appearing after teardown observed zero. */
+    bh_atomic_32_t lifecycle_gate_state;
+    korp_mutex lifecycle_lock;
+    bool lifecycle_lock_initialized;
+    /* Public calls are serialized per root instance because the component
+     * handle table transfers ownership through raw entries.  Recursive host
+     * callbacks on the same native thread remain supported. */
+    korp_mutex operation_lock;
+    bool operation_lock_initialized;
+    bool deinstantiating;
     bool may_leave;
 
     union {
@@ -489,9 +534,29 @@ WASMComponentInstance *
 wasm_component_instance_allocate(WASMComponentIndexCount *index_count,
                                  char *error_buf, uint32 error_buf_size);
 
-uint32
+/*
+ * Pin the root component-instance graph while a public operation is in
+ * progress.  The lifecycle lock is held only while changing the refcount;
+ * guest code and host callbacks must run after this function returns.
+ */
+bool
+wasm_component_instance_begin_operation(WASMComponentInstance *comp_instance);
+
+void
+wasm_component_instance_end_operation(WASMComponentInstance *comp_instance);
+
+bool
+wasm_component_instance_register_prepared_call(
+    WASMComponentInstance *comp_instance);
+
+bool
+wasm_component_instance_unregister_prepared_call(
+    WASMComponentInstance *comp_instance);
+
+bool
 wasm_get_inst_decl_size(WASMComponentInstType *instance_type,
-                        WASMComponentInstanceDeclTypeSize *instance_type_size);
+                        WASMComponentInstanceDeclTypeSize *instance_type_size,
+                        uint64 *size);
 
 bool
 wasm_resolve_types(WASMComponentTypeSection *type_section,
@@ -514,6 +579,17 @@ wasm_resolve_imports_WASI(WASMComponentImportSection *import_section,
                           WASMComponentInstance *comp_instance, char *error_buf,
                           uint32 error_buf_size);
 
+/*
+ * Resolve statically registered root component imports.  WASI Preview 2
+ * interfaces may fall back to the built-in libc-wasi-p2 implementation;
+ * non-WASI interfaces must already be registered through the native-symbol
+ * API by the embedder.
+ */
+bool
+wasm_resolve_imports_host(WASMComponentImportSection *import_section,
+                          WASMComponentInstance *comp_instance, char *error_buf,
+                          uint32 error_buf_size);
+
 bool
 wasm_resolve_alias(WASMComponentAliasSection *alias_section,
                    WASMComponentInstance *comp_instance, char *error_buf,
@@ -533,6 +609,11 @@ wasm_resolve_core_instance(WASMComponentCoreInstSection *instance_section,
                            WASMComponentInstance *comp_instance,
                            char *error_buf, uint32 error_buf_size);
 
+WASMCoreExport *
+wasm_import_find_in_args(WASMImport *import, WASMInstExpr *expression,
+                         WASMComponentInstance *comp_instance, char *error_buf,
+                         uint32 error_buf_size);
+
 bool
 wasm_resolve_core_imports(WASMInstExpr *expression, WASMModule *target,
                           WASMComponentInstance *comp_instance,
@@ -544,8 +625,11 @@ wasm_create_core_inst_from_expression(WASMComponentCoreInst *core_inst,
                                       WASMComponentInstance *comp_instance,
                                       char *error_buf, uint32 error_buf_size);
 
-uint32
-wasm_get_func_type_size(WASMComponentFuncType *func_type);
+bool
+wasm_get_def_val_type_size(WASMComponentDefValType *def_val_type, uint64 *size);
+
+bool
+wasm_get_func_type_size(WASMComponentFuncType *func_type, uint64 *size);
 
 bool
 wasm_resolve_canon(WASMComponentCanonSection *canon_section,
@@ -560,6 +644,39 @@ wasm_component_application_execute_func(WASMComponentInstance *, char *argv);
 bool
 wasm_component_application_execute_func_ex(WASMComponentInstance *, char *argv,
                                            uint32 *argc1, uint32 **argv1);
+/* Internal WAVE adapter policy: resource-bearing values have no CLI ownership
+ * channel and are rejected before invocation. */
+bool
+wasm_component_application_wave_type_supported(
+    const WASMComponentTypeInstance *type);
+
+WASMComponentPreparedCall *
+wasm_component_prepare_export_call(WASMComponentInstance *comp_inst,
+                                   const char *export_name, char *error_buf,
+                                   uint32 error_buf_size);
+
+WASMComponentPreparedCall *
+wasm_component_prepare_export_call_qualified(WASMComponentInstance *comp_inst,
+                                             const char *interface_name,
+                                             const char *export_name,
+                                             char *error_buf,
+                                             uint32 error_buf_size);
+
+bool
+wasm_component_prepared_call_requires_post_return(
+    const WASMComponentPreparedCall *prepared_call);
+
+bool
+wasm_component_call_prepared(WASMComponentPreparedCall *prepared_call,
+                             uint32 num_results, wasm_val_t results[],
+                             uint32 num_args, const wasm_val_t args[]);
+
+bool
+wasm_component_prepared_call_post_return(
+    WASMComponentPreparedCall *prepared_call);
+
+void
+wasm_component_destroy_prepared_call(WASMComponentPreparedCall *prepared_call);
 
 uint32_t
 align_to(uint32_t ptr, uint32_t alignment);
@@ -580,7 +697,12 @@ WASMComponentFunctionInstance *
 wasm_component_lookup_function(const WASMComponentInstance *component_inst,
                                const char *name);
 
-#if WASM_ENABLE_LIBC_WASI != 0
+WASMComponentFunctionInstance *
+wasm_component_lookup_function_qualified(
+    const WASMComponentInstance *component_inst, const char *interface_name,
+    const char *function_name);
+
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
 
 bool
 wasm_component_runtime_init_wasi(
@@ -590,7 +712,8 @@ wasm_component_runtime_init_wasi(
     uint32 addr_pool_size, const char *ns_lookup_pool[],
     uint32 ns_lookup_pool_size, char *argv[], uint32 argc,
     os_raw_file_handle stdinfd, os_raw_file_handle stdoutfd,
-    os_raw_file_handle stderrfd, char *error_buf, uint32 error_buf_size);
+    os_raw_file_handle stderrfd, const libc_wasi_options_t *wasi_options,
+    char *error_buf, uint32 error_buf_size);
 
 void
 wasm_component_runtime_set_wasi_args(WASMComponent *component,
@@ -625,11 +748,68 @@ wasm_component_instantiate_internal(
     uint32 error_buf_size);
 
 WASMComponentInstance *
+wasm_component_instantiate_internal_ex(
+    WASMComponent *component,
+    WASMComponentInstArgInstances *instance_expression,
+    const struct InstantiationArgs2 *args, char *error_buf,
+    uint32 error_buf_size);
+
+WASMComponentInstance *
 wasm_component_instantiate(WASMComponent *component, char *error_buf,
                            uint32 error_buf_size);
 
+WASMComponentInstance *
+wasm_component_instantiate_ex2(WASMComponent *component,
+                               const struct InstantiationArgs2 *args,
+                               char *error_buf, uint32 error_buf_size);
+
 void
 wasm_component_deinstantiate(WASMComponentInstance *comp_instance);
+
+void
+wasm_component_terminate(WASMComponentInstance *comp_instance);
+
+void
+wasm_component_set_custom_data(WASMComponentInstance *comp_instance,
+                               void *custom_data);
+
+void *
+wasm_component_get_custom_data(WASMComponentInstance *comp_instance);
+
+void *
+wasm_component_get_custom_data_from_exec_env(wasm_exec_env_t exec_env);
+
+bool
+wasm_component_exec_env_is_callback(wasm_exec_env_t exec_env);
+
+bool
+wasm_component_host_resource_new(wasm_exec_env_t exec_env,
+                                 const char *interface_name,
+                                 const char *resource_name,
+                                 uint32_t representation, uint32_t *out_handle);
+
+bool
+wasm_component_host_resource_rep(wasm_exec_env_t exec_env,
+                                 const char *interface_name,
+                                 const char *resource_name, uint32_t handle,
+                                 uint32_t *out_representation);
+
+bool
+wasm_component_host_resource_take(wasm_exec_env_t exec_env,
+                                  const char *interface_name,
+                                  const char *resource_name, uint32_t handle,
+                                  uint32_t *out_representation);
+
+bool
+wasm_component_cabi_realloc(wasm_exec_env_t exec_env, uint32_t old_offset,
+                            uint32_t old_size, uint32_t alignment,
+                            uint32_t new_size, uint32_t *out_offset);
+
+bool
+wasm_component_set_host_resource_drop_callback(
+    WASMComponentInstance *comp_instance, const char *interface_name,
+    const char *resource_name,
+    wasm_component_host_resource_drop_callback_t callback, void *attachment);
 
 void *
 wasm_runtime_addr_app_to_native_p2(WASMExecEnv *exec_env, uint64 app_offset);

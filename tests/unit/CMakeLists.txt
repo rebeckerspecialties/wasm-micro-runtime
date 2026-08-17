@@ -94,7 +94,22 @@ FetchContent_MakeAvailable(cmocka)
 include(GoogleTest)
 enable_testing()
 
+set(COMPONENT_MODEL_UNIT_TEST_FOLDERS
+  component
+  component-instantiation
+  component-execution
+  canonical-abi
+  canonical-execution
+  libc-wasi-p2
+  wave-parser
+)
+
 if(DEFINED UNITTEST_FOLDER AND NOT "${UNITTEST_FOLDER}" STREQUAL "")
+  if(WAMR_BUILD_TARGET STREQUAL "X86_32"
+     AND UNITTEST_FOLDER IN_LIST COMPONENT_MODEL_UNIT_TEST_FOLDERS)
+    message(FATAL_ERROR
+      "${UNITTEST_FOLDER} requires the 64-bit Preview 2 native-call bridge")
+  endif()
   add_subdirectory("${UNITTEST_FOLDER}")
   return()
 endif()
@@ -110,14 +125,17 @@ add_subdirectory(linux-perf)
 add_subdirectory(gc)
 add_subdirectory(unsupported-features)
 add_subdirectory(exception-handling)
+add_subdirectory(relaxed-simd)
 add_subdirectory(running-modes)
-add_subdirectory(component)
-add_subdirectory(component-instantiation)
-add_subdirectory(component-execution)
-add_subdirectory(canonical-abi)
-add_subdirectory(canonical-execution)
-add_subdirectory(libc-wasi-p2)
-add_subdirectory(wave-parser)
+
+# The Preview 2 native-call bridge currently uses the 64-bit invokeNative ABI.
+# Keep the component runtime suites out of X86_32 until that bridge has a
+# dedicated 32-bit argument/result implementation.
+if(NOT WAMR_BUILD_TARGET STREQUAL "X86_32")
+  foreach(component_test_folder IN LISTS COMPONENT_MODEL_UNIT_TEST_FOLDERS)
+    add_subdirectory("${component_test_folder}")
+  endforeach()
+endif()
 add_subdirectory(mem-alloc)
 
 if(FULL_TEST)

@@ -114,6 +114,11 @@ jobs:
     # we free the unused preinstalled toolchains first, then run the build with
     # `docker run`.
     strategy:
+      # A single hosted-runner loss during checkout should not discard the
+      # other board/config results, and limiting the checkout burst avoids
+      # launching all 56 container jobs at once.
+      fail-fast: false
+      max-parallel: 16
       matrix:
         nuttx_board_config: [
           # x64

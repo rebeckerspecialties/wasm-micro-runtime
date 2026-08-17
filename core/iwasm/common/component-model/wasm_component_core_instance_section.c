@@ -36,8 +36,9 @@ wasm_component_parse_core_instance_section(const uint8_t **payload,
         return false;
     }
 
-    const uint8_t *p = *payload;
-    const uint8_t *end = *payload + payload_len;
+    const uint8_t *start = *payload;
+    const uint8_t *p = start;
+    const uint8_t *end = start + payload_len;
 
     uint64_t instance_count = 0;
     if (!read_leb((uint8_t **)&p, end, 32, false, &instance_count, error_buf,
@@ -49,19 +50,14 @@ wasm_component_parse_core_instance_section(const uint8_t **payload,
     out->count = (uint32_t)instance_count;
 
     if (instance_count > 0) {
-        out->instances =
-            wasm_runtime_malloc(sizeof(WASMComponentCoreInst) * instance_count);
+        out->instances = wasm_component_checked_calloc(
+            (uint32_t)instance_count, sizeof(WASMComponentCoreInst), p, end, 1,
+            "core instance", error_buf, error_buf_size);
         if (!out->instances) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for core instances");
             if (consumed_len)
                 *consumed_len = (uint32_t)(p - *payload);
             return false;
         }
-
-        // Initialize all instances to zero to avoid garbage data
-        memset(out->instances, 0,
-               sizeof(WASMComponentCoreInst) * instance_count);
 
         for (uint32_t i = 0; i < instance_count; ++i) {
             // Check bounds before reading tag
@@ -101,20 +97,15 @@ wasm_component_parse_core_instance_section(const uint8_t **payload,
 
                     if (arg_len > 0) {
                         out->instances[i].expression.with_args.args =
-                            wasm_runtime_malloc(sizeof(WASMComponentInstArg)
-                                                * arg_len);
+                            wasm_component_checked_calloc(
+                                (uint32_t)arg_len, sizeof(WASMComponentInstArg),
+                                p, end, 1, "core instantiate argument",
+                                error_buf, error_buf_size);
                         if (!out->instances[i].expression.with_args.args) {
-                            set_error_buf_ex(error_buf, error_buf_size,
-                                             "Failed to allocate memory for "
-                                             "core instantiate args");
                             if (consumed_len)
                                 *consumed_len = (uint32_t)(p - *payload);
                             return false;
                         }
-
-                        // Initialize args to zero
-                        memset(out->instances[i].expression.with_args.args, 0,
-                               sizeof(WASMComponentInstArg) * arg_len);
 
                         for (uint32_t j = 0; j < arg_len; ++j) {
                             // core:instantiatearg ::= n:<core:name> 0x12
@@ -160,8 +151,6 @@ wasm_component_parse_core_instance_section(const uint8_t **payload,
                                     error_buf, error_buf_size,
                                     "Failed to read 0x12 flag identifier for "
                                     "core instantiatearg field");
-                                free_core_name(core_name);
-                                wasm_runtime_free(core_name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
@@ -172,8 +161,6 @@ wasm_component_parse_core_instance_section(const uint8_t **payload,
                             if (!read_leb((uint8_t **)&p, end, 32, false,
                                           &instance_idx, error_buf,
                                           error_buf_size)) {
-                                free_core_name(core_name);
-                                wasm_runtime_free(core_name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
@@ -205,25 +192,17 @@ wasm_component_parse_core_instance_section(const uint8_t **payload,
 
                     if (inline_expr_len > 0) {
                         out->instances[i].expression.without_args.inline_expr =
-                            wasm_runtime_malloc(
-                                sizeof(WASMComponentInlineExport)
-                                * inline_expr_len);
+                            wasm_component_checked_calloc(
+                                (uint32_t)inline_expr_len,
+                                sizeof(WASMComponentInlineExport), p, end, 1,
+                                "core inline export", error_buf,
+                                error_buf_size);
                         if (!out->instances[i]
                                  .expression.without_args.inline_expr) {
-                            set_error_buf_ex(error_buf, error_buf_size,
-                                             "Failed to allocate memory for "
-                                             "core inline exports");
                             if (consumed_len)
                                 *consumed_len = (uint32_t)(p - *payload);
                             return false;
                         }
-
-                        // Initialize inline exports to zero
-                        memset(out->instances[i]
-                                   .expression.without_args.inline_expr,
-                               0,
-                               sizeof(WASMComponentInlineExport)
-                                   * inline_expr_len);
 
                         for (uint32_t j = 0; j < inline_expr_len; j++) {
                             // core:inlineexport ::= n:<core:name>
@@ -273,14 +252,15 @@ wasm_component_parse_core_instance_section(const uint8_t **payload,
                                 set_error_buf_ex(error_buf, error_buf_size,
                                                  "Failed to allocate memory "
                                                  "for core sort idx");
-                                free_core_name(name);
-                                wasm_runtime_free(name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
                             }
                             // Zero-initialize sort_idx
                             memset(sort_idx, 0, sizeof(WASMComponentSortIdx));
+                            out->instances[i]
+                                .expression.without_args.inline_expr[j]
+                                .sort_idx = sort_idx;
 
                             bool status =
                                 parse_sort_idx(&p, end, sort_idx, error_buf,
@@ -289,17 +269,10 @@ wasm_component_parse_core_instance_section(const uint8_t **payload,
                                 set_error_buf_ex(
                                     error_buf, error_buf_size,
                                     "Failed to parse core sort idx");
-                                wasm_runtime_free(sort_idx);
-                                free_core_name(name);
-                                wasm_runtime_free(name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
                             }
-
-                            out->instances[i]
-                                .expression.without_args.inline_expr[j]
-                                .sort_idx = sort_idx;
                         }
                     }
                     else {
@@ -322,7 +295,8 @@ wasm_component_parse_core_instance_section(const uint8_t **payload,
         }
     }
     if (consumed_len)
-        *consumed_len = payload_len;
+        *consumed_len = (uint32_t)(p - start);
+    *payload = p;
     return true;
 }
 
@@ -407,6 +381,7 @@ wasm_create_core_inst_from_expression(WASMComponentCoreInst *core_inst,
                                       char *error_buf, uint32 error_buf_size)
 {
     uint32 total_size = 0, idx = 0;
+    uint64 total_size_64;
     WASMComponentInlineExport *inline_expr = NULL;
     if (!core_inst) {
         set_error_buf_ex(error_buf, error_buf_size, "Invalid core instance\n");
@@ -436,13 +411,24 @@ wasm_create_core_inst_from_expression(WASMComponentCoreInst *core_inst,
         }
     }
 
-    total_size = sizeof(WASMModuleInstance)
-                 + sizeof(WASMExportFuncInstance) * func_count
-                 + sizeof(WASMExportGlobInstance) * global_count
-                 + sizeof(WASMExportTabInstance) * table_count
-                 + sizeof(WASMExportMemInstance) * mem_count;
+    total_size_64 = sizeof(WASMModuleInstance)
+                    + (uint64)sizeof(WASMExportFuncInstance) * func_count
+                    + (uint64)sizeof(WASMExportGlobInstance) * global_count
+                    + (uint64)sizeof(WASMExportTabInstance) * table_count
+                    + (uint64)sizeof(WASMExportMemInstance) * mem_count;
+    if (total_size_64 > UINT32_MAX) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Inline core instance allocation is too large\n");
+        return false;
+    }
+    total_size = (uint32)total_size_64;
     WASMModuleInstance *new_inst =
         (WASMModuleInstance *)wasm_runtime_malloc(total_size);
+    if (!new_inst) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Failed to allocate inline core instance\n");
+        return false;
+    }
     memset(new_inst, 0, total_size);
 
     new_inst->export_functions =
@@ -575,200 +561,63 @@ wasm_resolve_core_instance(WASMComponentCoreInstSection *instance_section,
                                  "Empty core module\n");
                 return false;
             }
-            WASMCoreImports found_imports;
-            found_imports.func_count = 0;
-            found_imports.globals_count = 0;
-            found_imports.tables_count = 0;
-            found_imports.mem_count = 0;
-            found_imports.func_instance = NULL;
-            found_imports.table_instance = NULL;
-            found_imports.mem_instance = NULL;
-            found_imports.global_instance = NULL;
-            bool imports_ok = true;
+            WASMCoreImports found_imports = { 0 };
+            WASMModuleInstance *core_instance = NULL;
+            bool imports_ok = false;
 
-            if (target_module->import_function_count)
-                found_imports.func_instance =
-                    (WASMFunctionInstance **)wasm_runtime_malloc(
-                        target_module->import_function_count
-                        * sizeof(WASMFunctionInstance *));
-            if (target_module->import_table_count)
-                found_imports.table_instance =
-                    (WASMTableInstance **)wasm_runtime_malloc(
-                        target_module->import_table_count
-                        * sizeof(WASMTableInstance *));
-            if (target_module->import_memory_count)
-                found_imports.mem_instance =
-                    (WASMMemoryInstance **)wasm_runtime_malloc(
-                        target_module->import_memory_count
-                        * sizeof(WASMMemoryInstance *));
-            if (target_module->import_global_count)
-                found_imports.global_instance =
-                    (WASMGlobalInstance **)wasm_runtime_malloc(
-                        target_module->import_global_count
-                        * sizeof(WASMGlobalInstance *));
+            if (target_module->import_function_count
+                && !(found_imports.func_instance =
+                         (WASMFunctionInstance **)wasm_component_checked_calloc(
+                             target_module->import_function_count,
+                             sizeof(WASMFunctionInstance *), NULL, NULL, 0,
+                             "core function import", error_buf,
+                             error_buf_size))) {
+                goto done_imports;
+            }
+            if (target_module->import_table_count
+                && !(found_imports.table_instance =
+                         (WASMTableInstance **)wasm_component_checked_calloc(
+                             target_module->import_table_count,
+                             sizeof(WASMTableInstance *), NULL, NULL, 0,
+                             "core table import", error_buf, error_buf_size))) {
+                goto done_imports;
+            }
+            if (target_module->import_memory_count
+                && !(found_imports.mem_instance =
+                         (WASMMemoryInstance **)wasm_component_checked_calloc(
+                             target_module->import_memory_count,
+                             sizeof(WASMMemoryInstance *), NULL, NULL, 0,
+                             "core memory import", error_buf,
+                             error_buf_size))) {
+                goto done_imports;
+            }
+            if (target_module->import_global_count
+                && !(found_imports.global_instance =
+                         (WASMGlobalInstance **)wasm_component_checked_calloc(
+                             target_module->import_global_count,
+                             sizeof(WASMGlobalInstance *), NULL, NULL, 0,
+                             "core global import", error_buf,
+                             error_buf_size))) {
+                goto done_imports;
+            }
 
-            // Match provided instantiation arguments with the imports required
-            // by the core_module
-            if (core_inst->expression.with_args.arg_len
+            /* Resolve every declared core import.  Supplying no arguments to
+               an importing module is an error, not a request for placeholder
+               allocations that can be patched after its start function. */
+            if (target_module->import_count
                 && !wasm_resolve_core_imports(
                     &core_inst->expression, target_module, comp_instance,
                     &found_imports, error_buf, error_buf_size)) {
-                set_error_buf_ex(
-                    error_buf, error_buf_size,
-                    "Imports could not be resolved for core instance\n");
-                goto fail_imports;
-            }
-            WASMModuleInstance *core_instance = NULL;
-            struct InstantiationArgs2 inst_args;
-            wasm_runtime_instantiation_args_set_defaults(&inst_args);
-            wasm_runtime_instantiation_args_set_default_stack_size(&inst_args,
-                                                                   STACK_SIZE);
-            wasm_runtime_instantiation_args_set_host_managed_heap_size(
-                &inst_args, HEAP_SIZE);
-            core_instance =
-                wasm_instantiate(target_module, NULL, NULL, &inst_args,
-                                 error_buf, sizeof(error_buf));
-            if (!core_instance) {
-                set_error_buf_ex(error_buf, error_buf_size,
-                                 "ERROR: Core module instantiation failed\n");
-                goto fail_imports;
+                goto done_imports;
             }
 
-            uint32 import_idx = 0, func_idx = 0;
-            for (func_idx = 0; func_idx < core_instance->e->function_count;
-                 func_idx++) {
-                core_instance->e->functions[func_idx].module_instance =
-                    core_instance;
-                core_instance->e->functions[func_idx].func_idx = func_idx;
+            core_instance = wasm_instantiate_with_imports(
+                target_module, comp_instance,
+                target_module->import_count ? &found_imports : NULL,
+                &comp_instance->instantiation_args, error_buf, error_buf_size);
+            if (!core_instance) {
+                goto done_imports;
             }
-            for (import_idx = 0; import_idx < found_imports.func_count;
-                 import_idx++) {
-                if (import_idx > core_instance->e->function_count
-                    || !core_instance->e->functions[import_idx]
-                            .is_import_func) {
-                    goto fail_imports;
-                }
-                if (!found_imports.func_instance) {
-                    set_error_buf_ex(error_buf, error_buf_size,
-                                     "function not found correctly\n");
-                    goto fail_imports;
-                }
-                if (found_imports.func_instance[import_idx]->is_import_func) {
-                    core_instance->e->functions[import_idx]
-                        .u.func_import->func_ptr_linked =
-                        found_imports.func_instance[import_idx]
-                            ->u.func_import->func_ptr_linked;
-                    core_instance->e->functions[import_idx]
-                        .u.func_import->signature =
-                        found_imports.func_instance[import_idx]
-                            ->u.func_import->signature;
-                    core_instance->e->functions[import_idx]
-                        .u.func_import->attachment =
-                        found_imports.func_instance[import_idx]
-                            ->u.func_import->attachment;
-                    core_instance->e->functions[import_idx]
-                        .u.func_import->call_conv_raw =
-                        found_imports.func_instance[import_idx]
-                            ->u.func_import->call_conv_raw;
-                    core_instance->import_func_ptrs[import_idx] =
-                        found_imports.func_instance[import_idx]
-                            ->u.func_import->func_ptr_linked;
-                    core_instance->e->functions[import_idx].import_func_inst =
-                        found_imports.func_instance[import_idx]
-                            ->import_func_inst;
-                }
-                else {
-                    core_instance->e->functions[import_idx].local_types =
-                        found_imports.func_instance[import_idx]->local_types;
-                    core_instance->e->functions[import_idx].local_offsets =
-                        found_imports.func_instance[import_idx]->local_offsets;
-                    core_instance->e->functions[import_idx].u.func =
-                        found_imports.func_instance[import_idx]->u.func;
-                    core_instance->e->functions[import_idx].import_module_inst =
-                        found_imports.func_instance[import_idx]
-                            ->module_instance;
-                    core_instance->e->functions[import_idx].import_func_inst =
-                        found_imports.func_instance[import_idx];
-                }
-#if WASM_ENABLE_SIMD != 0 && WASM_ENABLE_FAST_INTERP != 0
-                /* Copy const_cell_num so fast interp sets outs_area->lp at the
-                 * correct offset when dispatching to this function. Without
-                 * this, params written at operand+0 but callee reads from
-                 * operand+const_cell_num. */
-                core_instance->e->functions[import_idx].const_cell_num =
-                    found_imports.func_instance[import_idx]->const_cell_num;
-#endif
-                core_instance->e->functions[import_idx].is_canon_func =
-                    found_imports.func_instance[import_idx]->is_canon_func;
-                core_instance->e->functions[import_idx].canon_type =
-                    found_imports.func_instance[import_idx]->canon_type;
-                core_instance->e->functions[import_idx].resource =
-                    found_imports.func_instance[import_idx]->resource;
-                core_instance->e->functions[import_idx].canon_options =
-                    found_imports.func_instance[import_idx]->canon_options;
-                core_instance->e->functions[import_idx].component_function =
-                    found_imports.func_instance[import_idx]->component_function;
-                core_instance->e->functions[import_idx].canon_options =
-                    found_imports.func_instance[import_idx]->canon_options;
-            }
-            for (import_idx = 0; import_idx < found_imports.tables_count;
-                 import_idx++) {
-                if (import_idx > core_instance->table_count) {
-                    goto fail_imports;
-                }
-                uint32 elem_idx = 0;
-                for (elem_idx = 0;
-                     elem_idx < core_instance->tables[import_idx]->max_size;
-                     elem_idx++) {
-                    uint32 table_func_idx =
-                        core_instance->tables[import_idx]->elems[elem_idx];
-                    if (table_func_idx >= core_instance->e->function_count) {
-                        set_error_buf_ex(
-                            error_buf, error_buf_size,
-                            "Invalid function index passed from table\n");
-                        goto fail_imports;
-                    }
-                    WASMFunctionInstance *table_func_instance =
-                        &core_instance->e->functions[table_func_idx];
-                    found_imports.table_instance[import_idx]->elems[elem_idx] =
-                        (table_elem_type_t)table_func_instance;
-                }
-                found_imports.table_instance[import_idx]->elem_type =
-                    VALUE_TYPE_EXTERNREF;
-            }
-            for (import_idx = 0; import_idx < found_imports.mem_count;
-                 import_idx++) {
-                if (import_idx > core_instance->memory_count) {
-                    goto fail_imports;
-                }
-                /* Free resources of the memory allocated by wasm_instantiate
-                   before replacing with the imported memory */
-                WASMMemoryInstance *orig_mem =
-                    core_instance->memories[import_idx];
-                if (orig_mem) {
-                    if (orig_mem->heap_handle) {
-                        mem_allocator_destroy(orig_mem->heap_handle);
-                        wasm_runtime_free(orig_mem->heap_handle);
-                        orig_mem->heap_handle = NULL;
-                    }
-                    if (orig_mem->memory_data) {
-                        wasm_deallocate_linear_memory(orig_mem);
-                        orig_mem->memory_data = NULL;
-                    }
-                }
-                core_instance->memories[import_idx] =
-                    found_imports.mem_instance[import_idx];
-            }
-            for (import_idx = 0; import_idx < found_imports.globals_count;
-                 import_idx++) {
-                if (import_idx > core_instance->e->global_count) {
-                    goto fail_imports;
-                }
-                memcpy(&core_instance->e->globals[import_idx],
-                       found_imports.global_instance[import_idx],
-                       sizeof(WASMGlobalInstance));
-            }
-            core_instance->comp_instance = comp_instance;
             comp_instance->core_module_instances
                 [comp_instance->core_module_instances_count] = core_instance;
             core_instance->core_instance_idx =
@@ -778,28 +627,7 @@ wasm_resolve_core_instance(WASMComponentCoreInstSection *instance_section,
                 [comp_instance->defined_core_instances_count] = core_instance;
             comp_instance->defined_core_instances_count++;
 
-            WASMComponentInstance *root_comp_inst = comp_instance;
-            while (root_comp_inst->parent)
-                root_comp_inst = root_comp_inst->parent;
-            WASMComponent *root_comp = root_comp_inst->component;
-
-#if WASM_ENABLE_LIBC_WASI != 0
-            wasm_runtime_set_wasi_ctx((WASMModuleInstanceCommon *)core_instance,
-                                      comp_instance->wasi_ctx);
-#if WASM_ENABLE_UVWASI == 0
-            /* The uvwasi WASIContext variant has no wasi_options member;
-               only the built-in libc-wasi implementation carries the
-               component-model options through the context. */
-            WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(
-                (WASMModuleInstanceCommon *)core_instance);
-            if (wasi_ctx) {
-                wasi_ctx->wasi_options = root_comp->wasi_args.wasi_options;
-            }
-#endif
-#endif
-            goto done_imports;
-        fail_imports:
-            imports_ok = false;
+            imports_ok = true;
         done_imports:
             if (found_imports.func_instance)
                 wasm_runtime_free((void *)found_imports.func_instance);

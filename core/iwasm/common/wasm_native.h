@@ -55,6 +55,17 @@ wasm_native_resolve_symbol(const char *module_name, const char *field_name,
                            const char **p_signature, void **p_attachment,
                            bool *p_call_conv_raw);
 
+void *
+wasm_native_resolve_symbol_exact(const char *module_name,
+                                 const char *field_name,
+                                 const WASMFuncType *func_type,
+                                 const char **p_signature, void **p_attachment,
+                                 bool *p_call_conv_raw);
+
+bool
+wasm_native_validate_symbol_signature(const WASMFuncType *func_type,
+                                      const char *signature);
+
 bool
 wasm_native_register_natives(const char *module_name,
                              NativeSymbol *native_symbols,

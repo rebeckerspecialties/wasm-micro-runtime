@@ -28,6 +28,7 @@ typedef struct WASMGlobalInstance WASMGlobalInstance;
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 
 typedef struct WASMComponentInstance WASMComponentInstance;
+typedef struct WASMCoreImports WASMCoreImports;
 typedef struct WASMComponentCanonOptsInstance WASMComponentCanonOptsInstance;
 typedef struct WASMComponentFunctionInstance WASMComponentFunctionInstance;
 typedef struct CanonicalOptions CanonicalOptions;
@@ -139,7 +140,13 @@ struct WASMMemoryInstance {
 
     /* Four-byte paddings to ensure the layout of WASMMemoryInstance is the same
      * in both 64-bit and 32-bit */
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    /* Preserve whether the defining core memory declared a maximum. */
+    uint8 has_max;
+    uint8 _paddings[3];
+#else
     uint8 _paddings[4];
+#endif
 
     /* Number bytes per page */
     uint32 num_bytes_per_page;
@@ -168,6 +175,13 @@ struct WASMMemoryInstance {
     /* TODO: use it to replace the g_shared_memory_lock */
     DefPointer(korp_mutex *, memory_lock);
 
+    /* Optional host-owned aggregate committed-page quota. */
+    DefPointer(void *, page_quota_attachment);
+    DefPointer(wasm_memory_page_quota_reserve_callback_t, page_quota_reserve);
+    DefPointer(wasm_memory_page_quota_release_callback_t, page_quota_release);
+    uint32 page_quota_reserved_pages;
+    uint32 page_quota_padding;
+
 #if WASM_ENABLE_FAST_JIT != 0 || WASM_ENABLE_JIT != 0 \
     || WASM_ENABLE_WAMR_COMPILER != 0 || WASM_ENABLE_AOT != 0
     MemBound mem_bound_check_1byte;
@@ -175,6 +189,13 @@ struct WASMMemoryInstance {
     MemBound mem_bound_check_4bytes;
     MemBound mem_bound_check_8bytes;
     MemBound mem_bound_check_16bytes;
+#endif
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    /* The canonical ABI can pass an offset through a core module which does
+       not itself import the selected memory.  Preserve the defining instance
+       so a raw component host call can expose the correct linear memory via
+       its execution environment. */
+    DefPointer(WASMModuleInstance *, module_instance);
 #endif
 };
 
@@ -189,7 +210,13 @@ struct WASMTableInstance {
     /* The element type */
     uint8 elem_type;
     uint8 is_table64;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    /* Preserve whether the defining core table declared a maximum. */
+    uint8 has_max;
+    uint8 __padding__[5];
+#else
     uint8 __padding__[6];
+#endif
     union {
 #if WASM_ENABLE_GC != 0
         WASMRefType *elem_ref_type;
@@ -200,6 +227,14 @@ struct WASMTableInstance {
     uint32 cur_size;
     /* Maximum size */
     uint32 max_size;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    /* Core wasm stores funcrefs as module-relative indexes.  Keep the owning
+       instance for lifetime accounting and an instance-local provenance
+       sidecar so a borrowed table can contain functions written by several
+       different core instances without rewriting its public element data. */
+    DefPointer(WASMModuleInstance *, module_instance);
+    DefPointer(WASMFunctionInstance **, component_func_refs);
+#endif
     /* Table elements */
     table_elem_type_t elems[1];
 };
@@ -221,6 +256,11 @@ struct WASMGlobalInstance {
     /* just for import, keep the reference here */
     WASMModuleInstance *import_module_inst;
     WASMGlobalInstance *import_global_inst;
+#endif
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    /* Owner of this global, including globals re-exported through an inline
+       core instance. */
+    WASMModuleInstance *module_instance;
 #endif
 };
 
@@ -273,6 +313,52 @@ struct WASMFunctionInstance {
     WASMComponentResourceInstance *resource;
 #endif
 };
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+static inline bool
+wasm_component_build_table_func_proxy(WASMModuleInstance *caller,
+                                      WASMFunctionInstance *source,
+                                      WASMFunctionInstance *proxy,
+                                      WASMFunctionImport *proxy_import)
+{
+    if (!caller || !source || !source->module_instance || !proxy
+        || !proxy_import)
+        return false;
+
+    memset(proxy, 0, sizeof(*proxy));
+    memset(proxy_import, 0, sizeof(*proxy_import));
+    if (source->is_import_func) {
+        if (!source->u.func_import)
+            return false;
+        *proxy_import = *source->u.func_import;
+    }
+    else {
+        if (!source->u.func)
+            return false;
+        proxy_import->func_type = source->u.func->func_type;
+    }
+
+    proxy->is_import_func = true;
+    proxy->param_count = source->param_count;
+    proxy->param_cell_num = source->param_cell_num;
+    proxy->ret_cell_num = source->ret_cell_num;
+    proxy->param_types = source->param_types;
+    proxy->u.func_import = proxy_import;
+    proxy->import_module_inst = source->module_instance;
+    proxy->import_func_inst = source;
+#if WASM_ENABLE_FAST_INTERP != 0
+    proxy->const_cell_num = source->const_cell_num;
+#endif
+    proxy->module_instance = caller;
+    proxy->func_idx = source->func_idx;
+    proxy->is_canon_func = source->is_canon_func;
+    proxy->canon_type = source->canon_type;
+    proxy->resource = source->resource;
+    proxy->canon_options = source->canon_options;
+    proxy->component_function = source->component_function;
+    return true;
+}
+#endif
 
 #if WASM_ENABLE_TAGS != 0
 struct WASMTagInstance {
@@ -490,14 +576,17 @@ struct WASMModuleInstance {
     uint32 reserved[7];
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-    /* Keep the fixed cross-32/64-bit layout of this struct: the pointer
-       gets DefPointer's 8-byte slot and the index carries an explicit
-       padding word, so global_table_data sits at the same offset on every
-       target and offsets computed by a 64-bit-host wamrc stay valid for
-       32-bit AOT targets. */
     DefPointer(WASMComponentInstance *, comp_instance);
     uint32 core_instance_idx;
-    uint32 core_instance_idx_padding;
+    /* Component core imports borrow their defining instance's memories.
+       These entries must never be deallocated by the importing instance. */
+    uint32 prelinked_import_memory_count;
+    /* The same ownership rule applies to imported tables and their funcref
+       provenance sidecars. */
+    uint32 prelinked_import_table_count;
+    /* Keep the component extension 64-bit aligned in AOT-enabled 32-bit
+       builds, matching the fixed-width DefPointer fields above. */
+    uint32 component_fields_padding;
 #endif
 
     /*
@@ -517,6 +606,115 @@ struct WASMModuleInstance {
         uint8 bytes[1];
     } global_table_data;
 };
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+static inline bool
+wasm_component_set_table_func_ref(WASMModuleInstance *module_inst,
+                                  WASMTableInstance *table, uint32 elem_idx,
+                                  uint32 func_idx)
+{
+    if (!table->component_func_refs)
+        return true;
+
+    if (func_idx == UINT32_MAX) {
+        table->component_func_refs[elem_idx] = NULL;
+        return true;
+    }
+
+    if (!module_inst->e || func_idx >= module_inst->e->function_count)
+        return false;
+
+    table->component_func_refs[elem_idx] = &module_inst->e->functions[func_idx];
+    return true;
+}
+
+static inline bool
+wasm_component_table_elem_to_local_ref(WASMModuleInstance *module_inst,
+                                       WASMTableInstance *table,
+                                       uint32 elem_idx,
+                                       WASMFunctionInstance **func_ref)
+{
+    uint32 func_idx;
+
+#if WASM_ENABLE_GC == 0
+    func_idx = (uint32)table->elems[elem_idx];
+#else
+    func_idx = table->elems[elem_idx] == NULL_REF
+                   ? UINT32_MAX
+                   : wasm_func_obj_get_func_idx_bound(
+                       (WASMFuncObjectRef)table->elems[elem_idx]);
+#endif
+    if (func_idx == UINT32_MAX) {
+        *func_ref = NULL;
+        return true;
+    }
+
+    if (!module_inst->e || func_idx >= module_inst->e->function_count)
+        return false;
+
+    *func_ref = &module_inst->e->functions[func_idx];
+    return true;
+}
+
+static inline bool
+wasm_component_table_get_is_local(WASMModuleInstance *module_inst,
+                                  WASMTableInstance *table, uint32 elem_idx)
+{
+    WASMFunctionInstance *func_ref;
+
+    if (!table->component_func_refs)
+        return true;
+
+    func_ref = table->component_func_refs[elem_idx];
+    return !func_ref || func_ref->module_instance == module_inst;
+}
+
+/* Prepare provenance before the raw element memmove.  This either translates
+   module-relative elements into the borrowed destination's sidecar or proves
+   that sidecar elements can safely return to a local table. */
+static inline bool
+wasm_component_prepare_table_copy(WASMModuleInstance *module_inst,
+                                  WASMTableInstance *dst_table,
+                                  uint32 dst_offset,
+                                  WASMTableInstance *src_table,
+                                  uint32 src_offset, uint32 count)
+{
+    uint32 i;
+
+    if (!count)
+        return true;
+
+    if (dst_table->component_func_refs && src_table->component_func_refs) {
+        memmove(dst_table->component_func_refs + dst_offset,
+                src_table->component_func_refs + src_offset,
+                sizeof(WASMFunctionInstance *) * count);
+    }
+    else if (dst_table->component_func_refs) {
+        for (i = 0; i < count; i++) {
+            WASMFunctionInstance *func_ref;
+
+            if (!wasm_component_table_elem_to_local_ref(
+                    module_inst, src_table, src_offset + i, &func_ref))
+                return false;
+            dst_table->component_func_refs[dst_offset + i] = func_ref;
+        }
+    }
+    else if (src_table->component_func_refs) {
+        for (i = 0; i < count; i++) {
+            WASMFunctionInstance *func_ref, *local_ref;
+
+            func_ref = src_table->component_func_refs[src_offset + i];
+            if (!wasm_component_table_elem_to_local_ref(
+                    module_inst, src_table, src_offset + i, &local_ref)
+                || func_ref != local_ref
+                || (func_ref && func_ref->module_instance != module_inst))
+                return false;
+        }
+    }
+
+    return true;
+}
+#endif
 
 struct WASMInterpFrame;
 typedef struct WASMInterpFrame WASMRuntimeFrame;
@@ -593,6 +791,15 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
                  WASMExecEnv *exec_env_main,
                  const struct InstantiationArgs2 *args, char *error_buf,
                  uint32 error_buf_size);
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+WASMModuleInstance *
+wasm_instantiate_with_imports(WASMModule *module,
+                              WASMComponentInstance *component_inst,
+                              const WASMCoreImports *imports,
+                              const struct InstantiationArgs2 *args,
+                              char *error_buf, uint32 error_buf_size);
+#endif
 
 void
 wasm_dump_perf_profiling(const WASMModuleInstance *module_inst);

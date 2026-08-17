@@ -1,0 +1,48 @@
+# Copyright (C) 2026 Matt Hargett. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# Cache initializer for the Apple App Store embedding profile.  The product
+# supplies custom host interfaces as statically linked native symbols and uses
+# WAMR's Preview 2 implementation for standard wasi:0.2 imports. Preview 1 and
+# every dynamically loaded/guest-threading facility stay off.
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
+set(CMAKE_C_FLAGS_RELEASE
+    "-O3 -DNDEBUG -Werror -flto=full"
+    CACHE STRING "" FORCE)
+
+set(WAMR_BUILD_INTERP 1 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_FAST_INTERP 1 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_DEBUG_INTERP 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_MINI_LOADER 0 CACHE BOOL "" FORCE)
+
+set(WAMR_BUILD_AOT 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_JIT 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_FAST_JIT 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_WAMR_COMPILER 0 CACHE BOOL "" FORCE)
+
+set(WAMR_BUILD_COMPONENT_MODEL 1 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_MULTI_MEMORY 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_LIBC_WASI 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_LIBC_WASI_P2 1 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_LIBC_UVWASI 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_LIBC_BUILTIN 0 CACHE BOOL "" FORCE)
+
+# Native host threads may own independent component instances.  Guest shared
+# memory, guest pthreads, wasi-threads, and dynamic core-module linking are not
+# part of this statically composed wasm32-wasip2 profile.
+set(WAMR_BUILD_THREAD_MGR 1 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_SHARED_MEMORY 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_LIB_PTHREAD 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_LIB_PTHREAD_SEMAPHORE 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_LIB_WASI_THREADS 0 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_MULTI_MODULE 0 CACHE BOOL "" FORCE)
+
+set(WAMR_BUILD_SIMD 1 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_RELAXED_SIMD 1 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_EXCE_HANDLING 1 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_REF_TYPES 1 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_CUSTOM_NAME_SECTION 1 CACHE BOOL "" FORCE)
+set(WAMR_BUILD_DUMP_CALL_STACK 1 CACHE BOOL "" FORCE)
+set(WAMR_DISABLE_HW_BOUND_CHECK 1 CACHE BOOL "" FORCE)
+set(WAMR_DISABLE_WAKEUP_BLOCKING_OP 1 CACHE BOOL "" FORCE)

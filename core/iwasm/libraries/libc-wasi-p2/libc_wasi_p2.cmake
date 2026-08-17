@@ -8,13 +8,20 @@
 
 # Set the directory for this module
 set(LIBC_WASI_P2_DIR ${CMAKE_CURRENT_LIST_DIR})
+set(LIBC_WASI_P2_SSP_DIR
+    ${WAMR_ROOT_DIR}/core/iwasm/libraries/libc-wasi/sandboxed-system-primitives)
+
+add_definitions(-DWASM_ENABLE_LIBC_WASI_P2=1)
 
 # Gather all source files for the library
 file(GLOB LIBC_WASI_P2_SOURCE
     "${LIBC_WASI_P2_DIR}/*.c"
 )
 list(APPEND LIBC_WASI_P2_SOURCE
-    "${WAMR_ROOT_DIR}/core/iwasm/libraries/libc-wasi/sandboxed-system-primitives/src/random.c"
+    "${LIBC_WASI_P2_SSP_DIR}/src/blocking_op.c"
+    "${LIBC_WASI_P2_SSP_DIR}/src/posix.c"
+    "${LIBC_WASI_P2_SSP_DIR}/src/random.c"
+    "${LIBC_WASI_P2_SSP_DIR}/src/str.c"
     "${WAMR_ROOT_DIR}/core/shared/platform/common/libc-util/libc_errno.c"
 )
 
@@ -29,8 +36,10 @@ set(LIBC_WASI_P2_INCLUDE_DIRS
     ${WAMR_ROOT_DIR}/core/shared/platform/${WAMR_BUILD_PLATFORM}
     ${WAMR_ROOT_DIR}/core/iwasm/interpreter
     ${WAMR_ROOT_DIR}/core/iwasm/libraries/lib-socket/src/wasi
-    ${WAMR_ROOT_DIR}/core/iwasm/libraries/libc-wasi/sandboxed-system-primitives/include
-    ${WAMR_ROOT_DIR}/core/iwasm/libraries/libc-wasi/sandboxed-system-primitives/src
+    ${LIBC_WASI_P2_SSP_DIR}/include
+    ${LIBC_WASI_P2_SSP_DIR}/src
     ${WAMR_ROOT_DIR}/core/shared/platform/common/libc-util
     # Note: OpenSSL include is handled at the target level in the root CMakeLists
 )
+
+include_directories(${LIBC_WASI_P2_INCLUDE_DIRS})

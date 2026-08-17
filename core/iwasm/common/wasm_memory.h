@@ -142,6 +142,16 @@ wasm_runtime_set_enlarge_mem_error_callback(
     const enlarge_memory_error_callback_t callback, void *user_data);
 
 void
+wasm_memory_set_page_quota(WASMMemoryInstance *memory_inst,
+                           const struct InstantiationArgs2 *args);
+
+bool
+wasm_memory_reserve_page_quota(WASMMemoryInstance *memory_inst, uint32 pages);
+
+void
+wasm_memory_release_page_quota(WASMMemoryInstance *memory_inst, uint32 pages);
+
+void
 wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst);
 
 int

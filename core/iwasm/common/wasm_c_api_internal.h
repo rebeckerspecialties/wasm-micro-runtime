@@ -122,6 +122,8 @@ struct wasm_foreign_t {
     WASMModuleInstanceCommon *inst_comm_rt;
 };
 
+typedef struct CApiCallbackPayload CApiCallbackPayload;
+
 struct wasm_func_t {
     wasm_store_t *store;
     wasm_name_t *module_name;
@@ -142,6 +144,8 @@ struct wasm_func_t {
             void (*finalizer)(void *);
         } cb_env;
     } u;
+    /* Shared by copied host functions and every live importing instance. */
+    CApiCallbackPayload *callback_payload;
     /*
      * an index in both functions runtime instance lists
      * of interpreter mode and aot mode

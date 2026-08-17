@@ -244,6 +244,46 @@ WAMR actively tracks the lifecycle of these handles to prevent resource leaks. W
 
 > **Important Note on Resource Hierarchies:** WAMR does not internally track parent-child relationships between resources. It is strictly the application's responsibility to ensure that all child resources are appropriately dropped before their corresponding parent resource is destroyed.
 
+### Callback-safe canonical host I/O
+
+Raw component host-import callbacks can use three public helpers without
+depending on WAMR's internal resource table:
+
+- `wasm_component_cabi_realloc()` invokes the canonical `realloc` selected for
+  the current callback. It validates the old range, alignment, returned range,
+  and callback state. Guest execution can grow linear memory, so discard every
+  translated guest pointer before calling it and translate offsets again
+  afterward.
+- `wasm_component_wasi_input_stream_new()` returns an owned
+  `wasi:io/streams/input-stream@0.2.6` handle backed by copied read, skip, and
+  drop callbacks. Each read or skip request is capped at the public
+  `WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES` value (64 KiB). An
+  `OK` callback must report positive bounded progress; closed and failed
+  callbacks report zero bytes. The host callback writes the returned handle to
+  its canonical result cell.
+- `wasm_component_wasi_pollable_new()` returns an owned
+  `wasi:io/poll/pollable@0.2.6` plus a caller-owned signal reference. The ready
+  callback is a level query made on the component owner thread. A bridge thread
+  may only call `wasm_component_wasi_pollable_notify()` while it retains the
+  signal; notify wakes `block` and mixed `poll` lists but does not call host
+  code or inspect guest memory. Unregister external notifiers synchronously,
+  then release the signal reference before destroying their backing state.
+
+`wasm_component_terminate()` also wakes callback `pollable.block` and mixed
+`poll` waits when no notifier or other event exists. Termination uses a
+per-execution interrupt edge and remains distinct from host readiness: the
+guest observes the ordinary `terminated by user` failure, never a fabricated
+ready index. The interrupt is level-safe across terminate-before-wait and
+check-before-block races. As with other asynchronous termination, join the
+owner thread before deinstantiating the component.
+
+All constructors are valid only during the exact raw component callback whose
+result contains the nominal resource type. A structurally valid callback table
+transfers its attachment even when later construction fails; its drop callback
+runs exactly once. Invalid tables transfer nothing. Explicit resource drop and
+component teardown use the same owner-thread drop path, and no callback is made
+after drop returns.
+
 ## Source layout
 
 All component model sources reside in `core/iwasm/common/component-model/`:

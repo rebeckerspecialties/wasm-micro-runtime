@@ -41,12 +41,7 @@ void *
 os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 {
     int map_prot = PROT_NONE;
-#if (defined(__APPLE__) || defined(__MACH__)) && defined(__arm64__) \
-    && defined(TARGET_OS_OSX) && TARGET_OS_OSX != 0
-    int map_flags = MAP_ANONYMOUS | MAP_PRIVATE | MAP_JIT;
-#else
     int map_flags = MAP_ANONYMOUS | MAP_PRIVATE;
-#endif
     uint64 request_size, page_size;
     uint8 *addr = MAP_FAILED;
     uint32 i;
@@ -81,6 +76,15 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 
     if (prot & MMAP_PROT_EXEC)
         map_prot |= PROT_EXEC;
+
+#if (defined(__APPLE__) || defined(__MACH__)) && defined(__arm64__) \
+    && defined(TARGET_OS_OSX) && TARGET_OS_OSX != 0
+    /* MAP_JIT is only needed for executable mappings. Adding it to ordinary
+     * interpreter memory requires an unnecessary JIT entitlement in hardened
+     * macOS applications. */
+    if (prot & MMAP_PROT_EXEC)
+        map_flags |= MAP_JIT;
+#endif
 
 #if defined(BUILD_TARGET_X86_64) || defined(BUILD_TARGET_AMD_64)
 #ifndef __APPLE__

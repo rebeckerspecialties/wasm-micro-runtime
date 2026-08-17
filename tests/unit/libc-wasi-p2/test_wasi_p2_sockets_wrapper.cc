@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include "../component-instantiation/helpers.h"
+#include "wasi_p2_unavailable_context_test.h"
 extern "C" {
 #include "wasm_component_runtime.h"
 #include "wasm_component_host_resource.h"
@@ -25,7 +26,7 @@ class WasiP2SocketsWrapperTest : public testing::Test
     ~WasiP2SocketsWrapperTest() {}
     RuntimeInitArgs init_args;
     unsigned char *component_raw = NULL;
-    libc_wasi_parse_context_t parse_ctx;
+    libc_wasi_parse_context_t parse_ctx = {};
 
     char error_buf[128];
     char global_heap_buf[HEAP_SIZE]; // 100 MB
@@ -102,15 +103,50 @@ TEST_F(WasiP2SocketsWrapperTest, test_call_instance_network)
 {
   uint32 argc1 = 1;
   uint32 *argv1 = (uint32 *)wasm_runtime_malloc(sizeof(uint32) * 1);
-  ASSERT_TRUE(wasm_component_application_execute_func_ex(comp_instance, (char*)"call-instance-network()", &argc1, &argv1));
+  ASSERT_TRUE(wasm_component_application_execute_func_ex(
+      comp_instance, (char *)"call-instance-network()", &argc1, &argv1));
   ASSERT_TRUE(argv1[0]);
+}
+
+void
+exercise_unavailable_sockets(WASMComponentInstance *comp_instance,
+                             bool remove_context)
+{
+    wasi_p2_test::SideEffectSnapshot snapshot;
+    wasi_p2_test::ScopedUnavailableWasi unavailable(comp_instance,
+                                                    remove_context);
+    ASSERT_TRUE(unavailable.valid());
+
+    uint32_t argc = 1;
+    uint32_t *argv =
+        static_cast<uint32_t *>(wasm_runtime_malloc(sizeof(uint32_t)));
+    ASSERT_NE(argv, nullptr);
+    argv[0] = UINT32_MAX;
+    ASSERT_TRUE(wasm_component_application_execute_func_ex(
+        comp_instance, const_cast<char *>("call-instance-network()"), &argc,
+        &argv));
+    EXPECT_EQ(argv[0], 0u);
+    wasm_runtime_free(argv);
+
+    snapshot.expect_unchanged();
+}
+
+TEST_F(WasiP2SocketsWrapperTest, missing_wasi_context_fails_closed)
+{
+    exercise_unavailable_sockets(comp_instance, true);
+}
+
+TEST_F(WasiP2SocketsWrapperTest, null_wasi_options_fail_closed)
+{
+    exercise_unavailable_sockets(comp_instance, false);
 }
 
 TEST_F(WasiP2SocketsWrapperTest, test_call_create_udp_socket)
 {
   ASSERT_TRUE(wasm_component_application_execute_func(comp_instance, (char *)"call-create-udp-socket()"));
 
-  WASMComponentTypeInstance *ret_type = comp_instance->functions[10]->func_type->results->result;
+  WASMComponentTypeInstance *ret_type =
+      comp_instance->functions[9]->func_type->results->result;
   LiftLowerContext cx;
   cx.canonical_opts = comp_instance->core_functions[54]->canon_options;
   cx.inst = comp_instance;
@@ -461,8 +497,9 @@ TEST_F(WasiP2SocketsWrapperTest, test_call_tcp_finish_bind)
 TEST_F(WasiP2SocketsWrapperTest, test_call_tcp_start_connect)
 {
   ASSERT_TRUE(wasm_component_application_execute_func(comp_instance, (char *)"call-tcp-start-connect()"));
-  
-  WASMComponentTypeInstance *ret_type = comp_instance->functions[27]->func_type->results->result;
+
+  WASMComponentTypeInstance *ret_type =
+      comp_instance->functions[27]->func_type->results->result;
   LiftLowerContext cx;
   cx.canonical_opts = comp_instance->core_functions[71]->canon_options;
   cx.inst = comp_instance;

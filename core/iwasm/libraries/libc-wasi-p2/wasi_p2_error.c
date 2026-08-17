@@ -42,7 +42,7 @@ get_stream_error_val(bool is_closed, uint32_t error_idx)
     }
     else {
         ret = wit_variant_ctor("last-operation-failed", 21,
-                               wit_u32_ctor(error_idx));
+                               wit_resource_ctor(error_idx));
     }
     return wit_result_ctor(true, ret);
 }
@@ -50,16 +50,19 @@ get_stream_error_val(bool is_closed, uint32_t error_idx)
 wit_value_t
 get_hr_stream_error_val(HostResource *hr, wasi_stream_error_t *err)
 {
-    IOStreamType stream_type = ((WasiErrorResource *)hr->data)->type;
+    bool is_closed = err->kind == WASI_STREAM_ERROR_KIND_CLOSED;
+
+    if (is_closed) {
+        return get_stream_error_val(true, 0);
+    }
+
+    IOStreamType stream_type = ((StreamResourceType *)hr->data)->type;
     int32_t error = err->payload.error;
-    uint32_t code = (stream_type == STREAM_TYPE_FILE)
-                        ? errno_to_wasi_filesystem(error)
-                        : errno_to_wasi_network(error);
-    uint32_t new_err =
-        wasi_error_new(((WasiErrorResource *)hr->data)->type, code);
-    bool is_closed =
-        (err->kind == WASI_STREAM_ERROR_KIND_CLOSED) ? true : false;
-    return get_stream_error_val(is_closed, new_err);
+    uint32_t code = stream_type == STREAM_TYPE_SOCKET
+                        ? errno_to_wasi_network(error)
+                        : errno_to_wasi_filesystem(error);
+    uint32_t new_err = wasi_error_new(stream_type, code);
+    return get_stream_error_val(false, new_err);
 }
 
 const char *

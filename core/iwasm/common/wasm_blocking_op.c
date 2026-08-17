@@ -9,7 +9,12 @@
 #include "bh_common.h"
 #include "bh_assert.h"
 
-#if WASM_ENABLE_THREAD_MGR != 0 && defined(OS_ENABLE_WAKEUP_BLOCKING_OP)
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_LIBC_WASI_P2 != 0 \
+    && WASM_ENABLE_THREAD_MGR != 0
+#include "../libraries/libc-wasi-p2/wasi_p2_io.h"
+#endif
+
+#if WASM_ENABLE_THREAD_MGR != 0
 
 #define LOCK(env) WASM_SUSPEND_FLAGS_LOCK((env)->wait_lock)
 #define UNLOCK(env) WASM_SUSPEND_FLAGS_UNLOCK((env)->wait_lock)
@@ -25,6 +30,7 @@
 bool
 wasm_runtime_begin_blocking_op(wasm_exec_env_t env)
 {
+#ifdef OS_ENABLE_WAKEUP_BLOCKING_OP
     LOCK(env);
     bh_assert(!ISSET(env, BLOCKING));
     SET(env, BLOCKING);
@@ -36,11 +42,16 @@ wasm_runtime_begin_blocking_op(wasm_exec_env_t env)
     UNLOCK(env);
     os_begin_blocking_op();
     return true;
+#else
+    (void)env;
+    return true;
+#endif
 }
 
 void
 wasm_runtime_end_blocking_op(wasm_exec_env_t env)
 {
+#ifdef OS_ENABLE_WAKEUP_BLOCKING_OP
     int saved_errno = errno;
     LOCK(env);
     bh_assert(ISSET(env, BLOCKING));
@@ -48,11 +59,15 @@ wasm_runtime_end_blocking_op(wasm_exec_env_t env)
     UNLOCK(env);
     os_end_blocking_op();
     errno = saved_errno;
+#else
+    (void)env;
+#endif
 }
 
 void
 wasm_runtime_interrupt_blocking_op(wasm_exec_env_t env)
 {
+#ifdef OS_ENABLE_WAKEUP_BLOCKING_OP
     /*
      * ISSET(BLOCKING) here means that the target thread
      * is in somewhere between wasm_begin_blocking_op and
@@ -75,9 +90,18 @@ wasm_runtime_interrupt_blocking_op(wasm_exec_env_t env)
         LOCK(env);
     }
     UNLOCK(env);
+#else
+    LOCK(env);
+    SET(env, TERMINATE);
+    UNLOCK(env);
+#endif
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_LIBC_WASI_P2 != 0
+    wasi_p2_interrupt_wait_request(env);
+#endif
 }
 
-#else /* WASM_ENABLE_THREAD_MGR && OS_ENABLE_WAKEUP_BLOCKING_OP */
+#else /* WASM_ENABLE_THREAD_MGR */
 
 bool
 wasm_runtime_begin_blocking_op(wasm_exec_env_t env)
@@ -90,4 +114,4 @@ wasm_runtime_end_blocking_op(wasm_exec_env_t env)
 {
 }
 
-#endif /* WASM_ENABLE_THREAD_MGR && OS_ENABLE_WAKEUP_BLOCKING_OP */
+#endif /* WASM_ENABLE_THREAD_MGR */

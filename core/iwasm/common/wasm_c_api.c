@@ -7,8 +7,10 @@
 #include "wasm_c_api_internal.h"
 
 #include "bh_assert.h"
+#include "wasm_allocation_quota.h"
 #include "wasm_export.h"
 #include "wasm_memory.h"
+#include "wasm_runtime_common.h"
 #if WASM_ENABLE_INTERP != 0
 #include "wasm_runtime.h"
 #endif
@@ -51,6 +53,13 @@ typedef struct wasm_module_ex_t {
 #endif
 } wasm_module_ex_t;
 
+struct CApiCallbackPayload {
+    korp_mutex lock;
+    uint32 ref_count;
+    void *env;
+    void (*finalizer)(void *);
+};
+
 #ifndef os_thread_local_attribute
 typedef struct thread_local_stores {
     korp_tid tid;
@@ -63,6 +72,33 @@ wasm_module_delete_internal(wasm_module_t *);
 
 static void
 wasm_instance_delete_internal(wasm_instance_t *);
+
+static void
+destroy_store_foreigns(wasm_store_t *store);
+
+static bool
+foreign_release_by_index(wasm_store_t *store, uint32 foreign_idx_rt,
+                         wasm_foreign_t *expected);
+
+static wasm_foreign_t *
+foreign_retain_by_index(wasm_store_t *store, uint32 foreign_idx_rt);
+
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
+static void
+delete_c_api_externref(void *externref);
+
+static bool
+copy_c_api_externref_locked(void *externref, void *user_data)
+{
+    wasm_ref_t **out = (wasm_ref_t **)user_data;
+
+    if (!externref || !out) {
+        return false;
+    }
+    *out = wasm_ref_copy((wasm_ref_t *)externref);
+    return *out != NULL;
+}
+#endif
 
 /* temporarily put stubs here */
 static wasm_store_t *
@@ -100,6 +136,216 @@ malloc_internal(uint64 size)
     }
 
     return mem;
+}
+
+/* Engine/store vectors are process/embedder containers, not guest-owned
+   objects. Keep their backing storage owner-neutral even when a versioned
+   load or instantiation is executing inside a quota scope. */
+static bool
+host_vector_append(Vector *vector, const void *element)
+{
+    WASMAllocationQuotaToken *previous;
+    WASMAllocationQuotaToken *restored;
+    bool result;
+
+    if (!vector || !element)
+        return false;
+
+    previous = wasm_allocation_quota_set_current(NULL);
+    result =
+        wasm_allocation_quota_allocation_matches_current(vector->data)
+        && (!vector->lock
+            || wasm_allocation_quota_allocation_matches_current(vector->lock))
+        && bh_vector_append(vector, element);
+    restored = wasm_allocation_quota_set_current(previous);
+    bh_assert(restored == NULL);
+    (void)restored;
+    return result;
+}
+
+static bool
+host_allocation_is_owner_neutral(const void *allocation)
+{
+    WASMAllocationQuotaToken *previous;
+    WASMAllocationQuotaToken *restored;
+    bool result;
+
+    if (!allocation)
+        return false;
+
+    previous = wasm_allocation_quota_set_current(NULL);
+    result = wasm_allocation_quota_allocation_matches_current(allocation);
+    restored = wasm_allocation_quota_set_current(previous);
+    bh_assert(restored == NULL);
+    (void)restored;
+    return result;
+}
+
+static CApiCallbackPayload *
+c_api_callback_payload_new(void *env, void (*finalizer)(void *))
+{
+    WASMAllocationQuotaToken *previous;
+    WASMAllocationQuotaToken *restored;
+    CApiCallbackPayload *payload;
+
+    /* Callback environments belong to the embedder, not to one guest owner.
+       Every importing instance may therefore retain the same neutral payload.
+     */
+    previous = wasm_allocation_quota_set_current(NULL);
+    payload = malloc_internal(sizeof(*payload));
+    if (payload && os_mutex_init(&payload->lock) != BHT_OK) {
+        wasm_runtime_free(payload);
+        payload = NULL;
+    }
+    if (payload) {
+        payload->ref_count = 1;
+        payload->env = env;
+        payload->finalizer = finalizer;
+    }
+    restored = wasm_allocation_quota_set_current(previous);
+    bh_assert(restored == NULL);
+    (void)restored;
+    return payload;
+}
+
+static bool
+c_api_callback_payload_retain(CApiCallbackPayload *payload)
+{
+    bool retained = false;
+
+    if (!payload)
+        return false;
+
+    os_mutex_lock(&payload->lock);
+    if (payload->ref_count != 0 && payload->ref_count != UINT32_MAX) {
+        payload->ref_count++;
+        retained = true;
+    }
+    os_mutex_unlock(&payload->lock);
+    return retained;
+}
+
+static void
+c_api_callback_payload_release(CApiCallbackPayload *payload)
+{
+    WASMAllocationQuotaToken *previous;
+    WASMAllocationQuotaToken *restored;
+    void *env = NULL;
+    void (*finalizer)(void *) = NULL;
+    bool destroy = false;
+
+    if (!payload)
+        return;
+
+    os_mutex_lock(&payload->lock);
+    bh_assert(payload->ref_count != 0);
+    if (payload->ref_count != 0 && --payload->ref_count == 0) {
+        env = payload->env;
+        finalizer = payload->finalizer;
+        payload->env = NULL;
+        payload->finalizer = NULL;
+        destroy = true;
+    }
+    os_mutex_unlock(&payload->lock);
+
+    if (!destroy)
+        return;
+
+    /* Detach under the lock, but never invoke arbitrary embedder code while
+       holding it. The payload itself is owner-neutral. */
+    previous = wasm_allocation_quota_set_current(NULL);
+    os_mutex_destroy(&payload->lock);
+    wasm_runtime_free(payload);
+    if (finalizer)
+        finalizer(env);
+    restored = wasm_allocation_quota_set_current(previous);
+    bh_assert(restored == NULL);
+    (void)restored;
+}
+
+bool
+wasm_c_api_callback_payload_get_env(void *payload, void **env)
+{
+    CApiCallbackPayload *callback_payload = payload;
+    bool found = false;
+
+    if (!callback_payload || !env)
+        return false;
+
+    os_mutex_lock(&callback_payload->lock);
+    if (callback_payload->ref_count != 0) {
+        *env = callback_payload->env;
+        found = true;
+    }
+    os_mutex_unlock(&callback_payload->lock);
+    return found;
+}
+
+bool
+wasm_c_api_func_imports_retain(CApiFuncImport *imports, uint32 count)
+{
+    uint32 i;
+
+    if (!imports && count != 0)
+        return false;
+
+    for (i = 0; i < count; i++) {
+        if (imports[i].with_env_arg && imports[i].env_arg
+            && !c_api_callback_payload_retain(imports[i].env_arg)) {
+            while (i > 0) {
+                i--;
+                if (imports[i].with_env_arg && imports[i].env_arg)
+                    c_api_callback_payload_release(imports[i].env_arg);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+void
+wasm_c_api_func_imports_release(CApiFuncImport *imports, uint32 count)
+{
+    uint32 i;
+
+    if (!imports)
+        return;
+
+    for (i = 0; i < count; i++) {
+        if (imports[i].with_env_arg && imports[i].env_arg) {
+            CApiCallbackPayload *payload = imports[i].env_arg;
+            imports[i].env_arg = NULL;
+            c_api_callback_payload_release(payload);
+        }
+    }
+}
+
+/* Caller holds vector->lock. */
+static bool
+remove_pointer_from_vector_locked(Vector *vector, const void *element)
+{
+    size_t i;
+
+    if (!vector || !element || vector->size_elem != sizeof(void *))
+        return false;
+
+    for (i = 0; i < vector->num_elems; i++) {
+        void *candidate = NULL;
+
+        bh_memcpy_s(&candidate, sizeof(candidate),
+                    vector->data + i * vector->size_elem,
+                    (uint32)sizeof(candidate));
+        if (candidate == element) {
+            if (i + 1 < vector->num_elems) {
+                memmove(vector->data + i * vector->size_elem,
+                        vector->data + (i + 1) * vector->size_elem,
+                        (vector->num_elems - i - 1) * vector->size_elem);
+            }
+            vector->num_elems--;
+            return true;
+        }
+    }
+    return false;
 }
 
 /* clang-format off */
@@ -149,122 +395,136 @@ failed:                                \
     }
 
 /* vectors with no ownership management of elements */
-#define WASM_DEFINE_VEC_PLAIN(name)                                       \
-    WASM_DEFINE_VEC(name)                                                 \
-    void wasm_##name##_vec_new(own wasm_##name##_vec_t *out, size_t size, \
-                               own wasm_##name##_t const data[])          \
-    {                                                                     \
-        if (!out) {                                                       \
-            return;                                                       \
-        }                                                                 \
-                                                                          \
-        memset(out, 0, sizeof(wasm_##name##_vec_t));                      \
-                                                                          \
-        if (!size) {                                                      \
-            return;                                                       \
-        }                                                                 \
-                                                                          \
-        if (!bh_vector_init((Vector *)out, size, sizeof(wasm_##name##_t), \
-                            true)) {                                      \
-            LOG_DEBUG("bh_vector_init failed");                           \
-            goto failed;                                                  \
-        }                                                                 \
-                                                                          \
-        if (data) {                                                       \
-            uint32 size_in_bytes = 0;                                     \
-            size_in_bytes = (uint32)(size * sizeof(wasm_##name##_t));     \
-            bh_memcpy_s(out->data, size_in_bytes, data, size_in_bytes);   \
-            out->num_elems = size;                                        \
-        }                                                                 \
-                                                                          \
-        RETURN_VOID(out, wasm_##name##_vec_delete)                        \
-    }                                                                     \
-    void wasm_##name##_vec_copy(wasm_##name##_vec_t *out,                 \
-                                const wasm_##name##_vec_t *src)           \
-    {                                                                     \
-        if (!src) {                                                       \
-            return;                                                       \
-        }                                                                 \
-        wasm_##name##_vec_new(out, src->size, src->data);                 \
-    }                                                                     \
-    void wasm_##name##_vec_delete(wasm_##name##_vec_t *v)                 \
-    {                                                                     \
-        if (v) {                                                          \
-            bh_vector_destroy((Vector *)v);                               \
-        }                                                                 \
+#define WASM_DEFINE_VEC_PLAIN(name)                                            \
+    WASM_DEFINE_VEC(name)                                                      \
+    void wasm_##name##_vec_new(own wasm_##name##_vec_t *out, size_t size,      \
+                               own wasm_##name##_t const data[])               \
+    {                                                                          \
+        if (!out) {                                                            \
+            return;                                                            \
+        }                                                                      \
+                                                                               \
+        memset(out, 0, sizeof(wasm_##name##_vec_t));                           \
+                                                                               \
+        if (!size) {                                                           \
+            return;                                                            \
+        }                                                                      \
+                                                                               \
+        if (!bh_vector_init((Vector *)out, size, sizeof(wasm_##name##_t),      \
+                            true)) {                                           \
+            LOG_DEBUG("bh_vector_init failed");                                \
+            goto failed;                                                       \
+        }                                                                      \
+                                                                               \
+        if (data) {                                                            \
+            uint32 size_in_bytes = 0;                                          \
+            size_in_bytes = (uint32)(size * sizeof(wasm_##name##_t));          \
+            bh_memcpy_s(out->data, size_in_bytes, data, size_in_bytes);        \
+            out->num_elems = size;                                             \
+        }                                                                      \
+                                                                               \
+        RETURN_VOID(out, wasm_##name##_vec_delete)                             \
+    }                                                                          \
+    void wasm_##name##_vec_copy(wasm_##name##_vec_t *out,                      \
+                                const wasm_##name##_vec_t *src)                \
+    {                                                                          \
+        if (!src) {                                                            \
+            return;                                                            \
+        }                                                                      \
+        wasm_##name##_vec_new(out, src->size, src->data);                      \
+    }                                                                          \
+    void wasm_##name##_vec_delete(wasm_##name##_vec_t *v)                      \
+    {                                                                          \
+        WASMAllocationQuotaScope scope = { 0 };                                \
+        if (v) {                                                               \
+            if (v->data                                                        \
+                && !wasm_allocation_quota_scope_enter_for_allocation(&scope,   \
+                                                                     v->data)) \
+                return;                                                        \
+            bh_vector_destroy((Vector *)v);                                    \
+            if (scope.active)                                                  \
+                wasm_allocation_quota_scope_leave(&scope);                     \
+        }                                                                      \
     }
 
 /* vectors that own their elements */
-#define WASM_DEFINE_VEC_OWN(name, elem_destroy_func)                        \
-    WASM_DEFINE_VEC(name)                                                   \
-    void wasm_##name##_vec_new(own wasm_##name##_vec_t *out, size_t size,   \
-                               own wasm_##name##_t *const data[])           \
-    {                                                                       \
-        if (!out) {                                                         \
-            return;                                                         \
-        }                                                                   \
-                                                                            \
-        memset(out, 0, sizeof(wasm_##name##_vec_t));                        \
-                                                                            \
-        if (!size) {                                                        \
-            return;                                                         \
-        }                                                                   \
-                                                                            \
-        if (!bh_vector_init((Vector *)out, size, sizeof(wasm_##name##_t *), \
-                            true)) {                                        \
-            LOG_DEBUG("bh_vector_init failed");                             \
-            goto failed;                                                    \
-        }                                                                   \
-                                                                            \
-        if (data) {                                                         \
-            uint32 size_in_bytes = 0;                                       \
-            size_in_bytes = (uint32)(size * sizeof(wasm_##name##_t *));     \
-            bh_memcpy_s(out->data, size_in_bytes, data, size_in_bytes);     \
-            out->num_elems = size;                                          \
-        }                                                                   \
-                                                                            \
-        RETURN_VOID(out, wasm_##name##_vec_delete)                          \
-    }                                                                       \
-    void wasm_##name##_vec_copy(own wasm_##name##_vec_t *out,               \
-                                const wasm_##name##_vec_t *src)             \
-    {                                                                       \
-        size_t i = 0;                                                       \
-                                                                            \
-        if (!out) {                                                         \
-            return;                                                         \
-        }                                                                   \
-        memset(out, 0, sizeof(Vector));                                     \
-                                                                            \
-        if (!src || !src->size) {                                           \
-            return;                                                         \
-        }                                                                   \
-                                                                            \
-        if (!bh_vector_init((Vector *)out, src->size,                       \
-                            sizeof(wasm_##name##_t *), true)) {             \
-            LOG_DEBUG("bh_vector_init failed");                             \
-            goto failed;                                                    \
-        }                                                                   \
-                                                                            \
-        for (i = 0; i != src->num_elems; ++i) {                             \
-            if (!(out->data[i] = wasm_##name##_copy(src->data[i]))) {       \
-                LOG_DEBUG("wasm_%s_copy failed", #name);                    \
-                goto failed;                                                \
-            }                                                               \
-        }                                                                   \
-        out->num_elems = src->num_elems;                                    \
-                                                                            \
-        RETURN_VOID(out, wasm_##name##_vec_delete)                          \
-    }                                                                       \
-    void wasm_##name##_vec_delete(wasm_##name##_vec_t *v)                   \
-    {                                                                       \
-        size_t i = 0;                                                       \
-        if (!v) {                                                           \
-            return;                                                         \
-        }                                                                   \
-        for (i = 0; i != v->num_elems && v->data; ++i) {                    \
-            elem_destroy_func(*(v->data + i));                              \
-        }                                                                   \
-        bh_vector_destroy((Vector *)v);                                     \
+#define WASM_DEFINE_VEC_OWN(name, elem_destroy_func)                          \
+    WASM_DEFINE_VEC(name)                                                     \
+    void wasm_##name##_vec_new(own wasm_##name##_vec_t *out, size_t size,     \
+                               own wasm_##name##_t *const data[])             \
+    {                                                                         \
+        if (!out) {                                                           \
+            return;                                                           \
+        }                                                                     \
+                                                                              \
+        memset(out, 0, sizeof(wasm_##name##_vec_t));                          \
+                                                                              \
+        if (!size) {                                                          \
+            return;                                                           \
+        }                                                                     \
+                                                                              \
+        if (!bh_vector_init((Vector *)out, size, sizeof(wasm_##name##_t *),   \
+                            true)) {                                          \
+            LOG_DEBUG("bh_vector_init failed");                               \
+            goto failed;                                                      \
+        }                                                                     \
+                                                                              \
+        if (data) {                                                           \
+            uint32 size_in_bytes = 0;                                         \
+            size_in_bytes = (uint32)(size * sizeof(wasm_##name##_t *));       \
+            bh_memcpy_s(out->data, size_in_bytes, data, size_in_bytes);       \
+            out->num_elems = size;                                            \
+        }                                                                     \
+                                                                              \
+        RETURN_VOID(out, wasm_##name##_vec_delete)                            \
+    }                                                                         \
+    void wasm_##name##_vec_copy(own wasm_##name##_vec_t *out,                 \
+                                const wasm_##name##_vec_t *src)               \
+    {                                                                         \
+        size_t i = 0;                                                         \
+                                                                              \
+        if (!out) {                                                           \
+            return;                                                           \
+        }                                                                     \
+        memset(out, 0, sizeof(Vector));                                       \
+                                                                              \
+        if (!src || !src->size) {                                             \
+            return;                                                           \
+        }                                                                     \
+        if (!bh_vector_init((Vector *)out, src->size,                         \
+                            sizeof(wasm_##name##_t *), true)) {               \
+            LOG_DEBUG("bh_vector_init failed");                               \
+            goto failed;                                                      \
+        }                                                                     \
+                                                                              \
+        for (i = 0; i != src->num_elems; ++i) {                               \
+            if (!(out->data[i] = wasm_##name##_copy(src->data[i]))) {         \
+                LOG_DEBUG("wasm_%s_copy failed", #name);                      \
+                goto failed;                                                  \
+            }                                                                 \
+            /* Keep the initialized prefix visible to the failure cleanup. */ \
+            out->num_elems++;                                                 \
+        }                                                                     \
+                                                                              \
+        RETURN_VOID(out, wasm_##name##_vec_delete)                            \
+    }                                                                         \
+    void wasm_##name##_vec_delete(wasm_##name##_vec_t *v)                     \
+    {                                                                         \
+        WASMAllocationQuotaScope scope = { 0 };                               \
+        size_t i = 0;                                                         \
+        if (!v) {                                                             \
+            return;                                                           \
+        }                                                                     \
+        if (v->data                                                           \
+            && !wasm_allocation_quota_scope_enter_for_allocation(&scope,      \
+                                                                 v->data))    \
+            return;                                                           \
+        for (i = 0; i != v->num_elems && v->data; ++i) {                      \
+            elem_destroy_func(*(v->data + i));                                \
+        }                                                                     \
+        bh_vector_destroy((Vector *)v);                                       \
+        if (scope.active)                                                     \
+            wasm_allocation_quota_scope_leave(&scope);                        \
     }
 
 WASM_DEFINE_VEC_PLAIN(byte)
@@ -432,6 +692,20 @@ wasm_engine_new_internal(wasm_config_t *config)
 
 /* global engine instance */
 static wasm_engine_t *singleton_engine;
+
+/* `wasm_func_call` uses NULL to report success, so an allocation failure while
+   constructing its failure trap must never collapse into a false success.  The
+   immutable emergency trap is shared, allocation-free, and deliberately has no
+   frames.  Its public delete operation is a no-op. */
+static wasm_trap_t c_api_emergency_trap;
+static const char c_api_emergency_trap_message[] =
+    "C API function call failed while allocating its trap";
+
+static bool
+is_c_api_emergency_trap(const wasm_trap_t *trap)
+{
+    return trap == &c_api_emergency_trap;
+}
 #ifdef os_thread_local_attribute
 /* categorize wasm_store_t as threads*/
 static os_thread_local_attribute unsigned thread_local_stores_num = 0;
@@ -459,6 +733,11 @@ wasm_engine_new()
 own wasm_engine_t *
 wasm_engine_new_with_config(wasm_config_t *config)
 {
+    if (wasm_allocation_quota_get_current() != NULL) {
+        LOG_ERROR("C API engine creation requires an owner-neutral host "
+                  "context");
+        return NULL;
+    }
 #if defined(OS_THREAD_MUTEX_INITIALIZER)
     os_mutex_lock(&engine_lock);
 #endif
@@ -489,6 +768,11 @@ wasm_engine_delete(wasm_engine_t *engine)
 {
     if (!engine)
         return;
+    if (wasm_allocation_quota_get_current() != NULL) {
+        LOG_ERROR("C API engine deletion requires an owner-neutral host "
+                  "context");
+        return;
+    }
 
 #if defined(OS_THREAD_MUTEX_INITIALIZER)
     os_mutex_lock(&engine_lock);
@@ -663,7 +947,8 @@ wasm_store_new(wasm_engine_t *engine)
 
     WASM_C_DUMP_PROC_MEM();
 
-    if (!engine || singleton_engine != engine)
+    if (!engine || singleton_engine != engine
+        || wasm_allocation_quota_get_current() != NULL)
         return NULL;
 
     if (!retrieve_thread_local_store_num(&engine->stores_by_tid,
@@ -724,10 +1009,16 @@ wasm_store_delete(wasm_store_t *store)
     if (!store) {
         return;
     }
+    if (wasm_allocation_quota_get_current() != NULL) {
+        LOG_ERROR("C API store deletion requires an owner-neutral host "
+                  "context");
+        return;
+    }
 
     DEINIT_VEC(store->instances, wasm_instance_vec_delete);
     DEINIT_VEC(store->modules, wasm_module_vec_delete);
     if (store->foreigns) {
+        destroy_store_foreigns(store);
         bh_vector_destroy(store->foreigns);
         wasm_runtime_free(store->foreigns);
     }
@@ -796,9 +1087,13 @@ wasm_valtype_new(wasm_valkind_t kind)
 void
 wasm_valtype_delete(wasm_valtype_t *val_type)
 {
-    if (val_type) {
-        wasm_runtime_free(val_type);
-    }
+    WASMAllocationQuotaScope scope;
+
+    if (!val_type
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, val_type))
+        return;
+    wasm_runtime_free(val_type);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 wasm_valtype_t *
@@ -940,7 +1235,11 @@ failed:
 void
 wasm_functype_delete(wasm_functype_t *func_type)
 {
-    if (!func_type) {
+    WASMAllocationQuotaScope scope;
+
+    if (!func_type
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             func_type)) {
         return;
     }
 
@@ -948,6 +1247,7 @@ wasm_functype_delete(wasm_functype_t *func_type)
     DEINIT_VEC(func_type->results, wasm_valtype_vec_delete);
 
     wasm_runtime_free(func_type);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 const wasm_valtype_vec_t *
@@ -1054,7 +1354,11 @@ wasm_globaltype_new_internal(uint8 val_type_rt, bool is_mutable)
 void
 wasm_globaltype_delete(wasm_globaltype_t *global_type)
 {
-    if (!global_type) {
+    WASMAllocationQuotaScope scope;
+
+    if (!global_type
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             global_type)) {
         return;
     }
 
@@ -1064,6 +1368,7 @@ wasm_globaltype_delete(wasm_globaltype_t *global_type)
     }
 
     wasm_runtime_free(global_type);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 wasm_globaltype_t *
@@ -1179,7 +1484,11 @@ wasm_tabletype_copy(const wasm_tabletype_t *src)
 void
 wasm_tabletype_delete(wasm_tabletype_t *table_type)
 {
-    if (!table_type) {
+    WASMAllocationQuotaScope scope;
+
+    if (!table_type
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             table_type)) {
         return;
     }
 
@@ -1189,6 +1498,7 @@ wasm_tabletype_delete(wasm_tabletype_t *table_type)
     }
 
     wasm_runtime_free(table_type);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 const wasm_valtype_t *
@@ -1251,9 +1561,14 @@ wasm_memorytype_copy(const wasm_memorytype_t *src)
 void
 wasm_memorytype_delete(wasm_memorytype_t *memory_type)
 {
-    if (memory_type) {
-        wasm_runtime_free(memory_type);
-    }
+    WASMAllocationQuotaScope scope;
+
+    if (!memory_type
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             memory_type))
+        return;
+    wasm_runtime_free(memory_type);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 const wasm_limits_t *
@@ -1392,17 +1707,19 @@ wasm_importtype_new(own wasm_byte_vec_t *module_name,
         return NULL;
     }
 
-    /* take ownership */
+    /* Allocate every wrapper before taking ownership.  On allocation denial
+       the caller still owns all three inputs and can unwind them once. */
     if (!(import_type->module_name =
               malloc_internal(sizeof(wasm_byte_vec_t)))) {
         goto failed;
     }
-    bh_memcpy_s(import_type->module_name, sizeof(wasm_byte_vec_t), module_name,
-                sizeof(wasm_byte_vec_t));
 
     if (!(import_type->name = malloc_internal(sizeof(wasm_byte_vec_t)))) {
         goto failed;
     }
+
+    bh_memcpy_s(import_type->module_name, sizeof(wasm_byte_vec_t), module_name,
+                sizeof(wasm_byte_vec_t));
     bh_memcpy_s(import_type->name, sizeof(wasm_byte_vec_t), field_name,
                 sizeof(wasm_byte_vec_t));
 
@@ -1410,7 +1727,11 @@ wasm_importtype_new(own wasm_byte_vec_t *module_name,
 
     return import_type;
 failed:
-    wasm_importtype_delete(import_type);
+    if (import_type) {
+        wasm_runtime_free(import_type->module_name);
+        wasm_runtime_free(import_type->name);
+        wasm_runtime_free(import_type);
+    }
     return NULL;
 }
 
@@ -1660,8 +1981,9 @@ rt_val_to_wasm_val(const uint8 *data, uint8 val_type_rt, wasm_val_t *out)
                 out->of.ref = NULL;
             }
             else {
-                ret = wasm_externref_ref2obj(*(uint32 *)data,
-                                             (void **)&out->of.ref);
+                out->of.ref = NULL;
+                ret = wasm_externref_ref2obj_access(
+                    *(uint32 *)data, copy_c_api_externref_locked, &out->of.ref);
             }
             break;
 #endif
@@ -1699,10 +2021,46 @@ wasm_val_to_rt_val(WASMModuleInstanceCommon *inst_comm_rt, uint8 val_type_rt,
             break;
 #if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
         case VALUE_TYPE_EXTERNREF:
+        {
+            wasm_ref_t *ref;
+            wasm_ref_t *map_ref;
+            uint32 externref_idx;
+
             bh_assert(WASM_EXTERNREF == v->kind);
-            ret =
-                wasm_externref_obj2ref(inst_comm_rt, v->of.ref, (uint32 *)data);
+            ref = v->of.ref;
+            if (!ref) {
+                *(uint32 *)data = NULL_REF;
+                break;
+            }
+            if ((!host_allocation_is_owner_neutral(ref)
+                 && !wasm_allocation_quota_allocations_share_owner(
+                     ref, inst_comm_rt))
+                || ref->kind != WASM_REF_foreign) {
+                ret = false;
+                break;
+            }
+            map_ref = wasm_ref_new_internal(ref->store, ref->kind,
+                                            ref->ref_idx_rt, ref->inst_comm_rt);
+            if (!map_ref) {
+                ret = false;
+                break;
+            }
+            if (!wasm_externref_obj2ref(inst_comm_rt, map_ref,
+                                        &externref_idx)) {
+                wasm_ref_delete(map_ref);
+                ret = false;
+                break;
+            }
+            if (!wasm_externref_set_cleanup(inst_comm_rt, map_ref,
+                                            delete_c_api_externref)) {
+                (void)wasm_externref_objdel(inst_comm_rt, map_ref);
+                wasm_ref_delete(map_ref);
+                ret = false;
+                break;
+            }
+            *(uint32 *)data = externref_idx;
             break;
+        }
 #endif
         default:
             LOG_WARNING("unexpected value type %d", val_type_rt);
@@ -1735,15 +2093,10 @@ wasm_ref_new_internal(wasm_store_t *store, enum wasm_reference_kind kind,
 
     /* workaround */
     if (WASM_REF_foreign == kind) {
-        wasm_foreign_t *foreign;
-
-        if (!(bh_vector_get(ref->store->foreigns, ref->ref_idx_rt, &foreign))
-            || !foreign) {
+        if (!foreign_retain_by_index(ref->store, ref->ref_idx_rt)) {
             wasm_runtime_free(ref);
             return NULL;
         }
-
-        foreign->ref_cnt++;
     }
     /* others doesn't include ref counters */
 
@@ -1753,12 +2106,19 @@ wasm_ref_new_internal(wasm_store_t *store, enum wasm_reference_kind kind,
 own wasm_ref_t *
 wasm_ref_copy(const wasm_ref_t *src)
 {
+    WASMAllocationQuotaScope scope;
+    wasm_ref_t *copy;
+
     if (!src)
+        return NULL;
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, src))
         return NULL;
 
     /* host_info are different in wasm_ref_t(s) */
-    return wasm_ref_new_internal(src->store, src->kind, src->ref_idx_rt,
+    copy = wasm_ref_new_internal(src->store, src->kind, src->ref_idx_rt,
                                  src->inst_comm_rt);
+    wasm_allocation_quota_scope_leave(&scope);
+    return copy;
 }
 
 #define DELETE_HOST_INFO(obj)                              \
@@ -1771,21 +2131,21 @@ wasm_ref_copy(const wasm_ref_t *src)
 void
 wasm_ref_delete(own wasm_ref_t *ref)
 {
+    WASMAllocationQuotaScope scope;
+
     if (!ref || !ref->store)
+        return;
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, ref))
         return;
 
     DELETE_HOST_INFO(ref);
 
     if (WASM_REF_foreign == ref->kind) {
-        wasm_foreign_t *foreign = NULL;
-
-        if (bh_vector_get(ref->store->foreigns, ref->ref_idx_rt, &foreign)
-            && foreign) {
-            wasm_foreign_delete(foreign);
-        }
+        (void)foreign_release_by_index(ref->store, ref->ref_idx_rt, NULL);
     }
 
     wasm_runtime_free(ref);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 #define WASM_DEFINE_REF_BASE(name)                                          \
@@ -1891,19 +2251,31 @@ wasm_frame_new(wasm_instance_t *instance, size_t module_offset,
 own wasm_frame_t *
 wasm_frame_copy(const wasm_frame_t *src)
 {
+    WASMAllocationQuotaScope scope;
+    wasm_frame_t *copy;
+
     if (!src) {
         return NULL;
     }
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, src))
+        return NULL;
 
-    return wasm_frame_new(src->instance, src->module_offset, src->func_index,
+    copy = wasm_frame_new(src->instance, src->module_offset, src->func_index,
                           src->func_offset);
+    wasm_allocation_quota_scope_leave(&scope);
+    return copy;
 }
 
 void
 wasm_frame_delete(own wasm_frame_t *frame)
 {
+    WASMAllocationQuotaScope scope;
+
     if (frame) {
+        if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, frame))
+            return;
         wasm_runtime_free(frame);
+        wasm_allocation_quota_scope_leave(&scope);
     }
 }
 
@@ -1958,6 +2330,7 @@ wasm_trap_new_internal(wasm_store_t *store,
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
     wasm_instance_vec_t *instances;
     wasm_instance_t *frame_instance = NULL;
+    Vector *source_frames;
     uint32 i;
 #endif
 
@@ -1982,11 +2355,26 @@ wasm_trap_new_internal(wasm_store_t *store,
 
     /* fill in frames */
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
-    trap->frames = cluster_frames
-                       ? cluster_frames
-                       : ((WASMModuleInstance *)inst_comm_rt)->frames;
+    source_frames = cluster_frames
+                        ? cluster_frames
+                        : ((WASMModuleInstance *)inst_comm_rt)->frames;
 
-    if (trap->frames) {
+    if (source_frames && source_frames->num_elems > 0) {
+        if (source_frames->num_elems > UINT32_MAX / sizeof(WASMCApiFrame)) {
+            goto failed;
+        }
+        trap->frames = malloc_internal(sizeof(Vector));
+        if (!trap->frames
+            || !bh_vector_init(trap->frames, source_frames->num_elems,
+                               sizeof(WASMCApiFrame), false)) {
+            goto failed;
+        }
+        bh_memcpy_s(trap->frames->data,
+                    (uint32)(source_frames->num_elems * sizeof(WASMCApiFrame)),
+                    source_frames->data,
+                    (uint32)(source_frames->num_elems * sizeof(WASMCApiFrame)));
+        trap->frames->num_elems = source_frames->num_elems;
+
         /* fill in instances */
         instances = store->instances;
         bh_assert(instances != NULL);
@@ -2041,56 +2429,98 @@ failed:
 void
 wasm_trap_delete(wasm_trap_t *trap)
 {
-    if (!trap) {
+    WASMAllocationQuotaScope scope;
+
+    if (!trap || is_c_api_emergency_trap(trap)) {
+        return;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, trap)) {
+        LOG_ERROR("C API trap deletion rejected by allocation owner");
         return;
     }
 
     DEINIT_VEC(trap->message, wasm_byte_vec_delete);
-    /* reuse frames of WASMModuleInstance, do not free it here */
+    if (trap->frames) {
+        bh_vector_destroy(trap->frames);
+        wasm_runtime_free(trap->frames);
+        trap->frames = NULL;
+    }
 
     wasm_runtime_free(trap);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 void
 wasm_trap_message(const wasm_trap_t *trap, own wasm_message_t *out)
 {
+    WASMAllocationQuotaScope scope;
+
     if (!trap || !out) {
         return;
     }
+    memset(out, 0, sizeof(*out));
+    if (is_c_api_emergency_trap(trap)) {
+        wasm_name_new_from_string_nt(out, c_api_emergency_trap_message);
+        return;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, trap))
+        return;
 
-    wasm_byte_vec_copy(out, trap->message);
+    if (trap->message)
+        wasm_byte_vec_copy(out, trap->message);
+    else
+        wasm_byte_vec_new_empty(out);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 own wasm_frame_t *
 wasm_trap_origin(const wasm_trap_t *trap)
 {
+    WASMAllocationQuotaScope scope;
     wasm_frame_t *latest_frame;
+    wasm_frame_t *copy = NULL;
 
     if (!trap || !trap->frames || !trap->frames->num_elems) {
         return NULL;
     }
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, trap))
+        return NULL;
 
     /* first frame is the latest frame */
     latest_frame = (wasm_frame_t *)trap->frames->data;
-    return wasm_frame_copy(latest_frame);
+    copy = wasm_frame_new(latest_frame->instance, latest_frame->module_offset,
+                          latest_frame->func_index, latest_frame->func_offset);
+    wasm_allocation_quota_scope_leave(&scope);
+    return copy;
 }
 
 void
 wasm_trap_trace(const wasm_trap_t *trap, own wasm_frame_vec_t *out)
 {
+    WASMAllocationQuotaScope scope;
     uint32 i;
 
-    if (!trap || !out) {
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!trap || is_c_api_emergency_trap(trap)) {
+        wasm_frame_vec_new_empty(out);
+        return;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, trap)) {
         return;
     }
 
     if (!trap->frames || !trap->frames->num_elems) {
         wasm_frame_vec_new_empty(out);
+        wasm_allocation_quota_scope_leave(&scope);
         return;
     }
 
     wasm_frame_vec_new_uninitialized(out, trap->frames->num_elems);
     if (out->size == 0 || !out->data) {
+        wasm_allocation_quota_scope_leave(&scope);
         return;
     }
 
@@ -2104,6 +2534,7 @@ wasm_trap_trace(const wasm_trap_t *trap, own wasm_frame_vec_t *out)
         out->num_elems++;
     }
 
+    wasm_allocation_quota_scope_leave(&scope);
     return;
 failed:
     for (i = 0; i < out->num_elems; i++) {
@@ -2113,33 +2544,158 @@ failed:
     }
 
     wasm_runtime_free(out->data);
+    memset(out, 0, sizeof(*out));
+    wasm_allocation_quota_scope_leave(&scope);
+}
+
+static void
+destroy_detached_foreign(wasm_foreign_t *foreign)
+{
+    WASMAllocationQuotaToken *previous;
+    WASMAllocationQuotaToken *restored;
+    void *host_info;
+    void (*finalizer)(void *);
+
+    if (!foreign)
+        return;
+
+    host_info = foreign->host_info.info;
+    finalizer = foreign->host_info.finalizer;
+    foreign->host_info.info = NULL;
+    foreign->host_info.finalizer = NULL;
+    foreign->store = NULL;
+
+    /* Store-owned foreign objects are deliberately owner-neutral.  Detach
+       them before invoking arbitrary finalizers so re-entry cannot observe a
+       half-destroyed vector entry. */
+    previous = wasm_allocation_quota_set_current(NULL);
+    if (host_info && finalizer)
+        finalizer(host_info);
+    wasm_runtime_free(foreign);
+    restored = wasm_allocation_quota_set_current(previous);
+    bh_assert(restored == NULL);
+    (void)restored;
+}
+
+static wasm_foreign_t *
+foreign_retain_by_index(wasm_store_t *store, uint32 foreign_idx_rt)
+{
+    Vector *foreigns;
+    wasm_foreign_t *foreign = NULL;
+
+    if (!store || !(foreigns = store->foreigns) || !foreigns->lock)
+        return NULL;
+
+    os_mutex_lock(foreigns->lock);
+    if (foreign_idx_rt < foreigns->num_elems) {
+        bh_memcpy_s(&foreign, sizeof(foreign),
+                    foreigns->data + foreign_idx_rt * foreigns->size_elem,
+                    (uint32)sizeof(foreign));
+        if (!foreign || foreign->store != store
+            || foreign->foreign_idx_rt != foreign_idx_rt
+            || foreign->ref_cnt <= 0 || foreign->ref_cnt == INT32_MAX) {
+            foreign = NULL;
+        }
+        else {
+            foreign->ref_cnt++;
+        }
+    }
+    os_mutex_unlock(foreigns->lock);
+    return foreign;
+}
+
+static bool
+foreign_release_by_index(wasm_store_t *store, uint32 foreign_idx_rt,
+                         wasm_foreign_t *expected)
+{
+    Vector *foreigns;
+    wasm_foreign_t *foreign = NULL;
+    wasm_foreign_t *null_foreign = NULL;
+    bool destroy = false;
+
+    if (!store || !(foreigns = store->foreigns) || !foreigns->lock)
+        return false;
+
+    os_mutex_lock(foreigns->lock);
+    if (foreign_idx_rt < foreigns->num_elems) {
+        bh_memcpy_s(&foreign, sizeof(foreign),
+                    foreigns->data + foreign_idx_rt * foreigns->size_elem,
+                    (uint32)sizeof(foreign));
+        if (!foreign || (expected && foreign != expected)
+            || foreign->store != store
+            || foreign->foreign_idx_rt != foreign_idx_rt
+            || foreign->ref_cnt <= 0) {
+            foreign = NULL;
+        }
+        else {
+            foreign->ref_cnt--;
+            if (foreign->ref_cnt == 0) {
+                bh_memcpy_s(foreigns->data
+                                + foreign_idx_rt * foreigns->size_elem,
+                            (uint32)foreigns->size_elem, &null_foreign,
+                            (uint32)sizeof(null_foreign));
+                destroy = true;
+            }
+        }
+    }
+    os_mutex_unlock(foreigns->lock);
+
+    if (destroy)
+        destroy_detached_foreign(foreign);
+    return foreign != NULL;
+}
+
+static void
+destroy_store_foreigns(wasm_store_t *store)
+{
+    Vector *foreigns;
+    size_t i;
+
+    if (!store || !(foreigns = store->foreigns) || !foreigns->lock)
+        return;
+
+    for (i = 0; i < foreigns->num_elems; i++) {
+        wasm_foreign_t *foreign = NULL;
+        wasm_foreign_t *null_foreign = NULL;
+
+        os_mutex_lock(foreigns->lock);
+        if (i < foreigns->num_elems) {
+            bh_memcpy_s(&foreign, sizeof(foreign),
+                        foreigns->data + i * foreigns->size_elem,
+                        (uint32)sizeof(foreign));
+            if (foreign) {
+                bh_memcpy_s(foreigns->data + i * foreigns->size_elem,
+                            (uint32)foreigns->size_elem, &null_foreign,
+                            (uint32)sizeof(null_foreign));
+            }
+        }
+        os_mutex_unlock(foreigns->lock);
+
+        if (foreign)
+            destroy_detached_foreign(foreign);
+    }
 }
 
 wasm_foreign_t *
 wasm_foreign_new_internal(wasm_store_t *store, uint32 foreign_idx_rt,
                           WASMModuleInstanceCommon *inst_comm_rt)
 {
-    wasm_foreign_t *foreign = NULL;
-
-    if (!store || !store->foreigns)
-        return NULL;
-
-    if (!(bh_vector_get(store->foreigns, foreign_idx_rt, &foreign))
-        || !foreign) {
-        return NULL;
-    }
-
-    foreign->ref_cnt++;
     (void)inst_comm_rt;
-    return foreign;
+    return foreign_retain_by_index(store, foreign_idx_rt);
 }
 
 own wasm_foreign_t *
 wasm_foreign_new(wasm_store_t *store)
 {
+    Vector *foreigns;
     wasm_foreign_t *foreign;
+    wasm_foreign_t *candidate;
+    size_t i;
 
-    if (!store)
+    if (!store || !(foreigns = store->foreigns)
+        || wasm_allocation_quota_get_current() != NULL
+        || !host_allocation_is_owner_neutral(store)
+        || !host_allocation_is_owner_neutral(foreigns))
         return NULL;
 
     if (!(foreign = malloc_internal(sizeof(wasm_foreign_t))))
@@ -2147,8 +2703,34 @@ wasm_foreign_new(wasm_store_t *store)
 
     foreign->store = store;
     foreign->kind = WASM_REF_foreign;
-    foreign->foreign_idx_rt = (uint32)bh_vector_size(store->foreigns);
-    if (!(bh_vector_append(store->foreigns, &foreign))) {
+    foreign->ref_cnt = 1;
+
+    /* Reuse tombstones so repeated create/delete cycles cannot grow the
+       store's host vector without bound.  Stores are thread-confined by the
+       C-API contract, while the lock also makes ref release atomic. */
+    os_mutex_lock(foreigns->lock);
+    for (i = 0; i < foreigns->num_elems; i++) {
+        bh_memcpy_s(&candidate, sizeof(candidate),
+                    foreigns->data + i * foreigns->size_elem,
+                    (uint32)sizeof(candidate));
+        if (!candidate) {
+            foreign->foreign_idx_rt = (uint32)i;
+            bh_memcpy_s(foreigns->data + i * foreigns->size_elem,
+                        (uint32)foreigns->size_elem, &foreign,
+                        (uint32)sizeof(foreign));
+            os_mutex_unlock(foreigns->lock);
+            return foreign;
+        }
+    }
+    if (foreigns->num_elems > UINT32_MAX) {
+        os_mutex_unlock(foreigns->lock);
+        wasm_runtime_free(foreign);
+        return NULL;
+    }
+    foreign->foreign_idx_rt = (uint32)foreigns->num_elems;
+    os_mutex_unlock(foreigns->lock);
+
+    if (!host_vector_append(foreigns, &foreign)) {
         wasm_runtime_free(foreign);
         return NULL;
     }
@@ -2159,17 +2741,9 @@ wasm_foreign_new(wasm_store_t *store)
 void
 wasm_foreign_delete(wasm_foreign_t *foreign)
 {
-    if (!foreign)
-        return;
-
-    if (foreign->ref_cnt < 1) {
-        return;
-    }
-
-    foreign->ref_cnt--;
-    if (!foreign->ref_cnt) {
-        wasm_runtime_free(foreign);
-    }
+    if (foreign && foreign->store)
+        (void)foreign_release_by_index(foreign->store, foreign->foreign_idx_rt,
+                                       foreign);
 }
 
 static inline wasm_module_t *
@@ -2194,60 +2768,46 @@ module_to_module_ext(wasm_module_t *module)
 
 #if WASM_ENABLE_WASM_CACHE != 0
 static wasm_module_ex_t *
-check_loaded_module(Vector *modules, char *binary_hash)
-{
-    unsigned i;
-    wasm_module_ex_t *module = NULL;
-
-    for (i = 0; i < modules->num_elems; i++) {
-        bh_vector_get(modules, i, &module);
-        if (!module) {
-            LOG_ERROR("Unexpected failure at %d\n", __LINE__);
-            return NULL;
-        }
-
-        os_mutex_lock(&module->lock);
-        bool is_valid =
-            (module->ref_count > 0
-             && memcmp(module->hash, binary_hash, SHA256_DIGEST_LENGTH) == 0);
-        os_mutex_unlock(&module->lock);
-
-        if (is_valid) {
-            return module;
-        }
-    }
-    return NULL;
-}
-
-static wasm_module_ex_t *
 try_reuse_loaded_module(wasm_store_t *store, char *binary_hash)
 {
-    wasm_module_ex_t *cached = NULL;
+    Vector *modules = &singleton_engine->modules;
     wasm_module_ex_t *ret = NULL;
+    size_t i;
 
-    cached = check_loaded_module(&singleton_engine->modules, binary_hash);
-    if (!cached)
-        goto quit;
+    os_mutex_lock(modules->lock);
+    for (i = 0; i < modules->num_elems; i++) {
+        wasm_module_ex_t *cached = NULL;
 
-    os_mutex_lock(&cached->lock);
-    if (!cached->ref_count)
-        goto unlock;
+        bh_memcpy_s(&cached, sizeof(cached),
+                    modules->data + i * modules->size_elem,
+                    (uint32)sizeof(cached));
+        if (!cached
+            || !wasm_allocation_quota_allocation_matches_current(cached)) {
+            continue;
+        }
 
-    if (!bh_vector_append((Vector *)store->modules, &cached))
-        goto unlock;
+        /* Keep the engine entry pinned until its refcount is acquired. The
+           zero-ref deletion path takes these locks in the same order. */
+        os_mutex_lock(&cached->lock);
+        if (cached->ref_count > 0
+            && memcmp(cached->hash, binary_hash, SHA256_DIGEST_LENGTH) == 0
+            && host_vector_append((Vector *)store->modules, &cached)) {
+            cached->ref_count++;
+            ret = cached;
+        }
+        os_mutex_unlock(&cached->lock);
+        if (ret)
+            break;
+    }
+    os_mutex_unlock(modules->lock);
 
-    cached->ref_count += 1;
-    ret = cached;
-
-unlock:
-    os_mutex_unlock(&cached->lock);
-quit:
     return ret;
 }
 #endif /* WASM_ENABLE_WASM_CACHE != 0 */
 
-wasm_module_t *
-wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
+static wasm_module_t *
+wasm_module_new_internal(wasm_store_t *store, wasm_byte_vec_t *binary,
+                         LoadArgs *args)
 {
     char error_buf[128] = { 0 };
     wasm_module_ex_t *module_ex = NULL;
@@ -2257,8 +2817,13 @@ wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
 
     bh_assert(singleton_engine);
 
-    if (!store || !binary || binary->size == 0 || binary->size > UINT32_MAX)
+    if (!store || !binary || binary->size == 0 || binary->size > UINT32_MAX
+        || !host_allocation_is_owner_neutral(store)
+        || !host_allocation_is_owner_neutral(store->modules)
+        || !host_allocation_is_owner_neutral(store->instances)
+        || !host_allocation_is_owner_neutral(store->foreigns)) {
         goto quit;
+    }
 
     /* whether the combination of compilation flags are compatible with the
      * package type */
@@ -2319,13 +2884,13 @@ wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
     }
 
     /* append it to a watching list in store */
-    if (!bh_vector_append((Vector *)store->modules, &module_ex))
+    if (!host_vector_append((Vector *)store->modules, &module_ex))
         goto unload;
 
     if (os_mutex_init(&module_ex->lock) != BHT_OK)
         goto remove_last;
 
-    if (!bh_vector_append(&singleton_engine->modules, &module_ex))
+    if (!host_vector_append(&singleton_engine->modules, &module_ex))
         goto destroy_lock;
 
 #if WASM_ENABLE_WASM_CACHE != 0
@@ -2360,6 +2925,46 @@ quit:
 }
 
 wasm_module_t *
+wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
+{
+    if (wasm_allocation_quota_get_current() != NULL) {
+        LOG_ERROR("legacy C API module load is unavailable inside an "
+                  "allocation-quota scope; use wasm_module_new_ex2");
+        return NULL;
+    }
+    return wasm_module_new_internal(store, binary, args);
+}
+
+wasm_module_t *
+wasm_module_new_ex2(wasm_store_t *store, wasm_byte_vec_t *binary,
+                    const LoadArgs2 *args)
+{
+    char error_buf[128] = { 0 };
+    LoadArgs legacy_args;
+    WASMAllocationQuotaScope scope;
+    wasm_module_t *module;
+
+    if (!wasm_runtime_load_args2_normalize(args, &legacy_args, error_buf,
+                                           (uint32)sizeof(error_buf))) {
+        LOG_ERROR("%s", error_buf);
+        return NULL;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_load(&scope, args)) {
+        LOG_ERROR("allocation quota owner could not be established");
+        return NULL;
+    }
+    if (!scope.active && wasm_allocation_quota_get_current() != NULL) {
+        LOG_ERROR("unowned C API module load rejected inside an active "
+                  "allocation-quota scope");
+        return NULL;
+    }
+
+    module = wasm_module_new_internal(store, binary, &legacy_args);
+    wasm_allocation_quota_scope_leave(&scope);
+    return module;
+}
+
+wasm_module_t *
 wasm_module_new(wasm_store_t *store, const wasm_byte_vec_t *binary)
 {
     LoadArgs args = { 0 };
@@ -2378,7 +2983,9 @@ wasm_module_validate(wasm_store_t *store, const wasm_byte_vec_t *binary)
 
     bh_assert(singleton_engine);
 
-    if (!store || !binary || binary->size > UINT32_MAX) {
+    if (!store || !binary || binary->size > UINT32_MAX
+        || wasm_allocation_quota_get_current() != NULL
+        || !host_allocation_is_owner_neutral(store)) {
         LOG_ERROR("%s failed", __FUNCTION__);
         return false;
     }
@@ -2407,22 +3014,52 @@ wasm_module_validate(wasm_store_t *store, const wasm_byte_vec_t *binary)
 static void
 wasm_module_delete_internal(wasm_module_t *module)
 {
+    WASMAllocationQuotaScope scope;
     wasm_module_ex_t *module_ex;
+    Vector *modules;
+    bool removed = false;
 
-    if (!module) {
+    if (!module
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, module)) {
         return;
     }
 
     module_ex = module_to_module_ext(module);
+    if (module_ex->module_comm_rt
+        && !wasm_allocation_quota_allocations_share_owner(
+            module_ex, module_ex->module_comm_rt)) {
+        LOG_ERROR("C API module and runtime module allocation owners differ");
+        wasm_allocation_quota_scope_leave(&scope);
+        return;
+    }
+    modules = singleton_engine ? &singleton_engine->modules : NULL;
 
+    if (modules && modules->lock)
+        os_mutex_lock(modules->lock);
     os_mutex_lock(&module_ex->lock);
 
-    /* N -> N-1 -> 0 -> UINT32_MAX */
+    if (module_ex->ref_count == 0) {
+        LOG_WARNING("C API module deletion observed a zero refcount");
+        os_mutex_unlock(&module_ex->lock);
+        if (modules && modules->lock)
+            os_mutex_unlock(modules->lock);
+        wasm_allocation_quota_scope_leave(&scope);
+        return;
+    }
+
     module_ex->ref_count--;
     if (module_ex->ref_count > 0) {
         os_mutex_unlock(&module_ex->lock);
+        if (modules && modules->lock)
+            os_mutex_unlock(modules->lock);
+        wasm_allocation_quota_scope_leave(&scope);
         return;
     }
+
+    if (modules)
+        removed = remove_pointer_from_vector_locked(modules, module_ex);
+    if (modules && modules->lock)
+        os_mutex_unlock(modules->lock);
 
     if (module_ex->is_binary_cloned)
         DEINIT_VEC(module_ex->binary, wasm_byte_vec_delete);
@@ -2437,6 +3074,16 @@ wasm_module_delete_internal(wasm_module_t *module)
 #endif
 
     os_mutex_unlock(&module_ex->lock);
+    if (removed) {
+        os_mutex_destroy(&module_ex->lock);
+        wasm_runtime_free(module_ex);
+    }
+    else {
+        /* Preserve a safe zero-ref tombstone for engine teardown if the
+           engine list invariant was already broken. */
+        LOG_ERROR("C API module was not present in the engine module list");
+    }
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 void
@@ -2449,23 +3096,29 @@ wasm_module_delete(wasm_module_t *module)
 void
 wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
 {
+    WASMAllocationQuotaScope scope;
+    wasm_module_ex_t *module_ex;
     uint32 i, import_func_count = 0, import_memory_count = 0,
               import_global_count = 0, import_table_count = 0, import_count = 0;
+    uint64 total_import_count;
     wasm_byte_vec_t module_name = { 0 }, name = { 0 };
     wasm_externtype_t *extern_type = NULL;
     wasm_importtype_t *import_type = NULL;
 
-    if (!module || !out) {
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!module
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, module)) {
         return;
     }
 
-    wasm_module_ex_t *module_ex = module_to_module_ext((wasm_module_t *)module);
+    module_ex = module_to_module_ext((wasm_module_t *)module);
     os_mutex_lock(&module_ex->lock);
     if (module_ex->ref_count == 0) {
-        os_mutex_unlock(&module_ex->lock);
-        return;
+        goto done;
     }
-    os_mutex_unlock(&module_ex->lock);
 
 #if WASM_ENABLE_INTERP != 0
     if ((*module)->module_type == Wasm_Module_Bytecode) {
@@ -2485,8 +3138,13 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
     }
 #endif
 
-    import_count = import_func_count + import_global_count + import_table_count
-                   + import_memory_count;
+    total_import_count = (uint64)import_func_count + import_global_count
+                         + import_table_count + import_memory_count;
+    if (total_import_count > UINT32_MAX
+        || total_import_count > UINT32_MAX / sizeof(wasm_importtype_t *)) {
+        goto done;
+    }
+    import_count = (uint32)total_import_count;
 
     wasm_importtype_vec_new_uninitialized(out, import_count);
     /*
@@ -2494,7 +3152,7 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
      * also leads to below branch
      */
     if (!out->data) {
-        return;
+        goto done;
     }
 
     for (i = 0; i != import_count; ++i) {
@@ -2689,28 +3347,39 @@ wasm_module_imports(const wasm_module_t *module, own wasm_importtype_vec_t *out)
         wasm_externtype_delete(extern_type);
     failed_importtype_new:
         wasm_importtype_delete(import_type);
+        wasm_importtype_vec_delete(out);
+        goto done;
     }
+
+done:
+    os_mutex_unlock(&module_ex->lock);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 void
 wasm_module_exports(const wasm_module_t *module, wasm_exporttype_vec_t *out)
 {
+    WASMAllocationQuotaScope scope;
+    wasm_module_ex_t *module_ex;
     uint32 i, export_count = 0;
     wasm_byte_vec_t name = { 0 };
     wasm_externtype_t *extern_type = NULL;
     wasm_exporttype_t *export_type = NULL;
 
-    if (!module || !out) {
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!module
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, module)) {
         return;
     }
 
-    wasm_module_ex_t *module_ex = module_to_module_ext((wasm_module_t *)module);
+    module_ex = module_to_module_ext((wasm_module_t *)module);
     os_mutex_lock(&module_ex->lock);
     if (module_ex->ref_count == 0) {
-        os_mutex_unlock(&module_ex->lock);
-        return;
+        goto done;
     }
-    os_mutex_unlock(&module_ex->lock);
 
 #if WASM_ENABLE_INTERP != 0
     if ((*module)->module_type == Wasm_Module_Bytecode) {
@@ -2730,11 +3399,15 @@ wasm_module_exports(const wasm_module_t *module, wasm_exporttype_vec_t *out)
      * also leads to below branch
      */
     if (!out->data) {
-        return;
+        goto done;
     }
 
     for (i = 0; i != export_count; i++) {
         WASMExport *export = NULL;
+
+        memset(&name, 0, sizeof(name));
+        extern_type = NULL;
+        export_type = NULL;
 #if WASM_ENABLE_INTERP != 0
         if ((*module)->module_type == Wasm_Module_Bytecode) {
             export = MODULE_INTERP(module)->exports + i;
@@ -2860,7 +3533,7 @@ wasm_module_exports(const wasm_module_t *module, wasm_exporttype_vec_t *out)
         }
     }
 
-    return;
+    goto done;
 
 failed:
     wasm_byte_vec_delete(&name);
@@ -2868,6 +3541,9 @@ failed:
 failed_exporttype_new:
     wasm_exporttype_delete(export_type);
     wasm_exporttype_vec_delete(out);
+done:
+    os_mutex_unlock(&module_ex->lock);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 #if WASM_ENABLE_JIT == 0 || WASM_ENABLE_LAZY_JIT != 0
@@ -2934,12 +3610,23 @@ wasm_module_deserialize(wasm_store_t *store, const wasm_byte_vec_t *binary)
 wasm_module_t *
 wasm_module_obtain(wasm_store_t *store, wasm_shared_module_t *shared_module)
 {
+    WASMAllocationQuotaScope scope;
     wasm_module_ex_t *module_ex = NULL;
+    wasm_module_t *result = NULL;
 
-    if (!store || !shared_module)
+    if (!store || !shared_module || !host_allocation_is_owner_neutral(store)
+        || !host_allocation_is_owner_neutral(store->modules)
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             shared_module)) {
         return NULL;
+    }
 
     module_ex = (wasm_module_ex_t *)shared_module;
+    if (!module_ex->module_comm_rt
+        || !wasm_allocation_quota_allocations_share_owner(
+            module_ex, module_ex->module_comm_rt)) {
+        goto done;
+    }
 
     os_mutex_lock(&module_ex->lock);
 
@@ -2947,30 +3634,42 @@ wasm_module_obtain(wasm_store_t *store, wasm_shared_module_t *shared_module)
     if (module_ex->ref_count == 0) {
         LOG_WARNING("wasm_module_obtain re-enter a module under deleting.");
         os_mutex_unlock(&module_ex->lock);
-        return NULL;
+        goto done;
     }
 
     /* add it to a watching list in store */
-    if (!bh_vector_append((Vector *)store->modules, &module_ex)) {
+    if (!host_vector_append((Vector *)store->modules, &module_ex)) {
         os_mutex_unlock(&module_ex->lock);
-        return NULL;
+        goto done;
     }
 
     module_ex->ref_count++;
     os_mutex_unlock(&module_ex->lock);
+    result = (wasm_module_t *)shared_module;
 
-    return (wasm_module_t *)shared_module;
+done:
+    wasm_allocation_quota_scope_leave(&scope);
+    return result;
 }
 
 wasm_shared_module_t *
 wasm_module_share(wasm_module_t *module)
 {
+    WASMAllocationQuotaScope scope;
     wasm_module_ex_t *module_ex = NULL;
+    wasm_shared_module_t *result = NULL;
 
-    if (!module)
+    if (!module
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, module)) {
         return NULL;
+    }
 
     module_ex = (wasm_module_ex_t *)module;
+    if (!module_ex->module_comm_rt
+        || !wasm_allocation_quota_allocations_share_owner(
+            module_ex, module_ex->module_comm_rt)) {
+        goto done;
+    }
 
     os_mutex_lock(&module_ex->lock);
 
@@ -2978,14 +3677,16 @@ wasm_module_share(wasm_module_t *module)
     if (module_ex->ref_count == 0) {
         LOG_WARNING("wasm_module_share re-enter a module under deleting.");
         os_mutex_unlock(&module_ex->lock);
-        return NULL;
+        goto done;
     }
 
     module_ex->ref_count++;
-
+    result = (wasm_shared_module_t *)module;
     os_mutex_unlock(&module_ex->lock);
 
-    return (wasm_shared_module_t *)module;
+done:
+    wasm_allocation_quota_scope_leave(&scope);
+    return result;
 }
 
 void
@@ -2997,38 +3698,70 @@ wasm_shared_module_delete(own wasm_shared_module_t *shared_module)
 bool
 wasm_module_set_name(wasm_module_t *module, const char *name)
 {
+    WASMAllocationQuotaScope scope;
     char error_buf[256] = { 0 };
     wasm_module_ex_t *module_ex = NULL;
+    bool ret = false;
 
-    if (!module)
+    if (!module || !name
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, module))
         return false;
 
     module_ex = module_to_module_ext(module);
-    bool ret = wasm_runtime_set_module_name(module_ex->module_comm_rt, name,
-                                            error_buf, sizeof(error_buf) - 1);
+    os_mutex_lock(&module_ex->lock);
+    if (module_ex->ref_count != 0 && module_ex->module_comm_rt) {
+        ret = wasm_runtime_set_module_name(module_ex->module_comm_rt, name,
+                                           error_buf, sizeof(error_buf) - 1);
+    }
+    os_mutex_unlock(&module_ex->lock);
     if (!ret)
         LOG_WARNING("set module name failed: %s", error_buf);
+    wasm_allocation_quota_scope_leave(&scope);
     return ret;
 }
 
 const char *
 wasm_module_get_name(wasm_module_t *module)
 {
+    WASMAllocationQuotaScope scope;
     wasm_module_ex_t *module_ex = NULL;
-    if (!module)
+    const char *name = "";
+
+    if (!module
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, module))
         return "";
 
     module_ex = module_to_module_ext(module);
-    return wasm_runtime_get_module_name(module_ex->module_comm_rt);
+    os_mutex_lock(&module_ex->lock);
+    if (module_ex->ref_count != 0 && module_ex->module_comm_rt)
+        name = wasm_runtime_get_module_name(module_ex->module_comm_rt);
+    os_mutex_unlock(&module_ex->lock);
+    wasm_allocation_quota_scope_leave(&scope);
+    return name ? name : "";
 }
 
 bool
 wasm_module_is_underlying_binary_freeable(const wasm_module_t *module)
 {
-    if (((wasm_module_ex_t *)module)->is_binary_cloned)
-        return true;
+    WASMAllocationQuotaScope scope;
+    wasm_module_ex_t *module_ex;
+    bool result = false;
 
-    return wasm_runtime_is_underlying_binary_freeable(*module);
+    if (!module
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, module))
+        return false;
+
+    module_ex = (wasm_module_ex_t *)module;
+    os_mutex_lock(&module_ex->lock);
+    if (module_ex->ref_count != 0) {
+        result = module_ex->is_binary_cloned
+                     ? true
+                     : wasm_runtime_is_underlying_binary_freeable(*module);
+    }
+    os_mutex_unlock(&module_ex->lock);
+
+    wasm_allocation_quota_scope_leave(&scope);
+    return result;
 }
 
 static wasm_func_t *
@@ -3084,6 +3817,10 @@ wasm_func_new_with_env_basic(wasm_store_t *store, const wasm_functype_t *type,
     func->u.cb_env.cb = callback;
     func->u.cb_env.env = env;
     func->u.cb_env.finalizer = finalizer;
+    if (!(func->callback_payload =
+              c_api_callback_payload_new(env, finalizer))) {
+        goto failed;
+    }
 
     if (!(func->type = wasm_functype_copy(type))) {
         goto failed;
@@ -3217,7 +3954,10 @@ wasm_func_new_empty(wasm_store_t *store)
 void
 wasm_func_delete(wasm_func_t *func)
 {
-    if (!func) {
+    WASMAllocationQuotaScope scope;
+
+    if (!func
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, func)) {
         return;
     }
 
@@ -3226,41 +3966,78 @@ wasm_func_delete(wasm_func_t *func)
         func->type = NULL;
     }
 
-    if (func->with_env) {
-        if (func->u.cb_env.finalizer) {
-            func->u.cb_env.finalizer(func->u.cb_env.env);
-            func->u.cb_env.finalizer = NULL;
-            func->u.cb_env.env = NULL;
-        }
+    if (func->with_env && func->callback_payload) {
+        CApiCallbackPayload *payload = func->callback_payload;
+        func->callback_payload = NULL;
+        func->u.cb_env.finalizer = NULL;
+        func->u.cb_env.env = NULL;
+        c_api_callback_payload_release(payload);
+    }
+    else if (func->with_env && func->u.cb_env.finalizer) {
+        WASMAllocationQuotaToken *previous;
+        WASMAllocationQuotaToken *restored;
+        void *env = func->u.cb_env.env;
+        void (*finalizer)(void *) = func->u.cb_env.finalizer;
+
+        func->u.cb_env.finalizer = NULL;
+        func->u.cb_env.env = NULL;
+        previous = wasm_allocation_quota_set_current(NULL);
+        finalizer(env);
+        restored = wasm_allocation_quota_set_current(previous);
+        bh_assert(restored == NULL);
+        (void)restored;
     }
 
     DELETE_HOST_INFO(func)
 
     wasm_runtime_free(func);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 own wasm_func_t *
 wasm_func_copy(const wasm_func_t *func)
 {
+    WASMAllocationQuotaScope scope;
     wasm_func_t *cloned = NULL;
 
-    if (!func) {
+    if (!func
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, func)) {
         return NULL;
     }
 
-    if (!(cloned =
-              func->with_env
-                  ? wasm_func_new_with_env_basic(
-                        func->store, func->type, func->u.cb_env.cb,
-                        func->u.cb_env.env, func->u.cb_env.finalizer)
-                  : wasm_func_new_basic(func->store, func->type, func->u.cb))) {
-        goto failed;
+    if (!func->with_env) {
+        cloned = wasm_func_new_basic(func->store, func->type, func->u.cb);
     }
+    else {
+        if (!(cloned = malloc_internal(sizeof(*cloned))))
+            goto failed;
+        cloned->store = func->store;
+        cloned->kind = WASM_EXTERN_FUNC;
+        cloned->func_idx_rt = (uint16)-1;
+        if (!c_api_callback_payload_retain(func->callback_payload))
+            goto failed;
+        cloned->with_env = true;
+        cloned->u.cb_env = func->u.cb_env;
+        cloned->callback_payload = func->callback_payload;
+        if (!(cloned->type = wasm_functype_copy(func->type)))
+            goto failed;
+        cloned->param_count = (uint16)cloned->type->params->num_elems;
+        cloned->result_count = (uint16)cloned->type->results->num_elems;
+    }
+    if (!cloned)
+        goto failed;
 
     cloned->func_idx_rt = func->func_idx_rt;
     cloned->inst_comm_rt = func->inst_comm_rt;
+    cloned->func_comm_rt = func->func_comm_rt;
 
-    RETURN_OBJ(cloned, wasm_func_delete)
+    wasm_allocation_quota_scope_leave(&scope);
+    return cloned;
+
+failed:
+    wasm_func_delete(cloned);
+    wasm_allocation_quota_scope_leave(&scope);
+    return NULL;
 }
 
 own wasm_functype_t *
@@ -3366,6 +4143,7 @@ wasm_trap_t *
 wasm_func_call(const wasm_func_t *func, const wasm_val_vec_t *params,
                wasm_val_vec_t *results)
 {
+    WASMAllocationQuotaBorrowedScope scope;
     /* parameters count as if all are uint32 */
     /* a int64 or float64 parameter means 2 */
     uint32 argc = 0;
@@ -3387,7 +4165,13 @@ wasm_func_call(const wasm_func_t *func, const wasm_val_vec_t *params,
         trap = wasm_trap_new(func->store, &message);
         wasm_byte_vec_delete(&message);
 
-        return trap;
+        return trap ? trap : &c_api_emergency_trap;
+    }
+
+    if (!wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &scope, func->inst_comm_rt)) {
+        LOG_ERROR("C API function call rejected by allocation owner");
+        return &c_api_emergency_trap;
     }
 
     if (func->inst_comm_rt->module_type == Wasm_Module_Bytecode) {
@@ -3421,6 +4205,9 @@ wasm_func_call(const wasm_func_t *func, const wasm_val_vec_t *params,
     alloc_count = (param_count > result_count) ? param_count : result_count;
     if (alloc_count > (size_t)sizeof(argv_buf) / sizeof(uint64)) {
         if (!(argv = malloc_internal(sizeof(uint64) * alloc_count))) {
+            wasm_runtime_set_exception(
+                func->inst_comm_rt,
+                "C API function call argument allocation failed");
             goto failed;
         }
     }
@@ -3469,11 +4256,17 @@ wasm_func_call(const wasm_func_t *func, const wasm_val_vec_t *params,
 
     if (argv != argv_buf)
         wasm_runtime_free(argv);
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
     return NULL;
 
 failed:
     if (argv != argv_buf)
         wasm_runtime_free(argv);
+
+    if (!wasm_runtime_get_exception(func->inst_comm_rt)) {
+        wasm_runtime_set_exception(func->inst_comm_rt,
+                                   "C API function call failed");
+    }
 
 #if WASM_ENABLE_DUMP_CALL_STACK != 0 && WASM_ENABLE_THREAD_MGR != 0
     WASMCluster *cluster = NULL;
@@ -3497,7 +4290,8 @@ failed:
         wasm_cluster_traverse_unlock(exec_env);
     }
 #endif
-    return trap;
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
+    return trap ? trap : &c_api_emergency_trap;
 }
 
 size_t
@@ -3613,7 +4407,10 @@ failed:
 void
 wasm_global_delete(wasm_global_t *global)
 {
-    if (!global) {
+    WASMAllocationQuotaScope scope;
+
+    if (!global
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, global)) {
         return;
     }
 
@@ -3630,6 +4427,7 @@ wasm_global_delete(wasm_global_t *global)
     DELETE_HOST_INFO(global)
 
     wasm_runtime_free(global);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 #if WASM_ENABLE_INTERP != 0
@@ -3640,7 +4438,7 @@ interp_global_set(const WASMModuleInstance *inst_interp, uint16 global_idx_rt,
     const WASMGlobalInstance *global_interp =
         inst_interp->e->globals + global_idx_rt;
     uint8 val_type_rt = global_interp->type;
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
     uint8 *data = global_interp->import_global_inst
                       ? global_interp->import_module_inst->global_data
                             + global_interp->import_global_inst->data_offset
@@ -3659,7 +4457,7 @@ interp_global_get(const WASMModuleInstance *inst_interp, uint16 global_idx_rt,
 {
     WASMGlobalInstance *global_interp = inst_interp->e->globals + global_idx_rt;
     uint8 val_type_rt = global_interp->type;
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
     uint8 *data = global_interp->import_global_inst
                       ? global_interp->import_module_inst->global_data
                             + global_interp->import_global_inst->data_offset
@@ -3730,7 +4528,11 @@ aot_global_get(const AOTModuleInstance *inst_aot, uint16 global_idx_rt,
 void
 wasm_global_set(wasm_global_t *global, const wasm_val_t *v)
 {
-    if (!global || !v || !global->inst_comm_rt) {
+    WASMAllocationQuotaBorrowedScope scope;
+
+    if (!global || !v || !global->inst_comm_rt
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &scope, global->inst_comm_rt)) {
         return;
     }
 
@@ -3738,7 +4540,7 @@ wasm_global_set(wasm_global_t *global, const wasm_val_t *v)
     if (global->inst_comm_rt->module_type == Wasm_Module_Bytecode) {
         (void)interp_global_set((WASMModuleInstance *)global->inst_comm_rt,
                                 global->global_idx_rt, v);
-        return;
+        goto done;
     }
 #endif
 
@@ -3746,7 +4548,7 @@ wasm_global_set(wasm_global_t *global, const wasm_val_t *v)
     if (global->inst_comm_rt->module_type == Wasm_Module_AoT) {
         (void)aot_global_set((AOTModuleInstance *)global->inst_comm_rt,
                              global->global_idx_rt, v);
-        return;
+        goto done;
     }
 #endif
 
@@ -3755,16 +4557,19 @@ wasm_global_set(wasm_global_t *global, const wasm_val_t *v)
      * leads to below branch
      */
     UNREACHABLE();
+
+done:
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
 }
 
 void
 wasm_global_get(const wasm_global_t *global, wasm_val_t *out)
 {
-    if (!global || !out) {
-        return;
-    }
+    WASMAllocationQuotaBorrowedScope scope;
 
-    if (!global->inst_comm_rt) {
+    if (!global || !out || !global->inst_comm_rt
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &scope, global->inst_comm_rt)) {
         return;
     }
 
@@ -3774,7 +4579,7 @@ wasm_global_get(const wasm_global_t *global, wasm_val_t *out)
     if (global->inst_comm_rt->module_type == Wasm_Module_Bytecode) {
         (void)interp_global_get((WASMModuleInstance *)global->inst_comm_rt,
                                 global->global_idx_rt, out);
-        return;
+        goto done;
     }
 #endif
 
@@ -3782,7 +4587,7 @@ wasm_global_get(const wasm_global_t *global, wasm_val_t *out)
     if (global->inst_comm_rt->module_type == Wasm_Module_AoT) {
         (void)aot_global_get((AOTModuleInstance *)global->inst_comm_rt,
                              global->global_idx_rt, out);
-        return;
+        goto done;
     }
 #endif
 
@@ -3791,6 +4596,9 @@ wasm_global_get(const wasm_global_t *global, wasm_val_t *out)
      * leads to below branch
      */
     UNREACHABLE();
+
+done:
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
 }
 
 wasm_global_t *
@@ -4005,7 +4813,10 @@ wasm_table_copy(const wasm_table_t *src)
 void
 wasm_table_delete(wasm_table_t *table)
 {
-    if (!table) {
+    WASMAllocationQuotaScope scope;
+
+    if (!table
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, table)) {
         return;
     }
 
@@ -4017,6 +4828,7 @@ wasm_table_delete(wasm_table_t *table)
     DELETE_HOST_INFO(table)
 
     wasm_runtime_free(table);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 wasm_tabletype_t *
@@ -4028,15 +4840,30 @@ wasm_table_type(const wasm_table_t *table)
     return wasm_tabletype_copy(table->type);
 }
 
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
+static void
+delete_c_api_externref(void *externref)
+{
+    wasm_ref_delete((wasm_ref_t *)externref);
+}
+#endif
+
 #if WASM_ENABLE_GC == 0
 own wasm_ref_t *
 wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
 {
+    WASMAllocationQuotaBorrowedScope scope;
     uint32 ref_idx = NULL_REF;
+    WASMModuleInstanceCommon *ref_inst_comm_rt;
+    wasm_ref_t *result = NULL;
 
-    if (!table || !table->inst_comm_rt) {
+    if (!table || !table->inst_comm_rt
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &scope, table->inst_comm_rt)) {
         return NULL;
     }
+
+    ref_inst_comm_rt = table->inst_comm_rt;
 
 #if WASM_ENABLE_INTERP != 0
     if (table->inst_comm_rt->module_type == Wasm_Module_Bytecode) {
@@ -4044,9 +4871,31 @@ wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
             ((WASMModuleInstance *)table->inst_comm_rt)
                 ->tables[table->table_idx_rt];
         if (index >= table_interp->cur_size) {
-            return NULL;
+            goto done;
         }
-        ref_idx = (uint32)table_interp->elems[index];
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (table_interp->component_func_refs) {
+            WASMFunctionInstance *func_ref =
+                table_interp->component_func_refs[index];
+
+            if (!func_ref) {
+                goto done;
+            }
+            if (!func_ref->module_instance || !func_ref->module_instance->e
+                || func_ref->func_idx
+                       >= func_ref->module_instance->e->function_count) {
+                goto done;
+            }
+
+            ref_idx = func_ref->func_idx;
+            ref_inst_comm_rt =
+                (WASMModuleInstanceCommon *)func_ref->module_instance;
+        }
+        else
+#endif
+        {
+            ref_idx = (uint32)table_interp->elems[index];
+        }
     }
 #endif
 
@@ -4055,7 +4904,7 @@ wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
         AOTModuleInstance *inst_aot = (AOTModuleInstance *)table->inst_comm_rt;
         AOTTableInstance *table_aot = inst_aot->tables[table->table_idx_rt];
         if (index >= table_aot->cur_size) {
-            return NULL;
+            goto done;
         }
         ref_idx = (uint32)table_aot->elems[index];
     }
@@ -4066,35 +4915,51 @@ wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
      * also leads to below branch
      */
     if (ref_idx == NULL_REF) {
-        return NULL;
+        goto done;
     }
 
 #if WASM_ENABLE_REF_TYPES != 0
     if (table->type->val_type->kind == WASM_EXTERNREF) {
-        void *externref_obj;
-        if (!wasm_externref_ref2obj(ref_idx, &externref_obj)) {
-            return NULL;
+        if (!wasm_externref_ref2obj_access(ref_idx, copy_c_api_externref_locked,
+                                           &result)) {
+            goto done;
         }
-
-        return externref_obj;
     }
     else
 #endif
     {
-        return wasm_ref_new_internal(table->store, WASM_REF_func, ref_idx,
-                                     table->inst_comm_rt);
+        result = wasm_ref_new_internal(table->store, WASM_REF_func, ref_idx,
+                                       ref_inst_comm_rt);
     }
+
+done:
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
+    return result;
 }
 
 bool
-wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
-               own wasm_ref_t *ref)
+wasm_table_set(wasm_table_t *table, wasm_table_size_t index, wasm_ref_t *ref)
 {
+    WASMAllocationQuotaBorrowedScope scope;
     uint32 *p_ref_idx = NULL;
     uint32 function_count = 0;
+    bool result = false;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0
+    WASMFunctionInstance **p_component_func_ref = NULL;
+#endif
 
-    if (!table || !table->inst_comm_rt) {
+    if (!table || !table->inst_comm_rt
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &scope, table->inst_comm_rt)) {
         return false;
+    }
+
+    if (ref
+        && (ref->store != table->store
+            || (!host_allocation_is_owner_neutral(ref)
+                && !wasm_allocation_quota_allocations_share_owner(
+                    ref, table->inst_comm_rt)))) {
+        goto done;
     }
 
     if (ref
@@ -4104,7 +4969,7 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
 #endif
         && !(WASM_REF_func == ref->kind
              && WASM_FUNCREF == table->type->val_type->kind)) {
-        return false;
+        goto done;
     }
 
 #if WASM_ENABLE_INTERP != 0
@@ -4114,12 +4979,17 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
                 ->tables[table->table_idx_rt];
 
         if (index >= table_interp->cur_size) {
-            return false;
+            goto done;
         }
 
         p_ref_idx = (uint32 *)(table_interp->elems + index);
         function_count =
             ((WASMModuleInstance *)table->inst_comm_rt)->e->function_count;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (table_interp->component_func_refs) {
+            p_component_func_ref = &table_interp->component_func_refs[index];
+        }
+#endif
     }
 #endif
 
@@ -4130,7 +5000,7 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
         AOTTableInstance *table_aot = inst_aot->tables[table->table_idx_rt];
 
         if (index >= table_aot->cur_size) {
-            return false;
+            goto done;
         }
 
         p_ref_idx = (uint32 *)(table_aot->elems + index);
@@ -4143,31 +5013,96 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index,
      * leads to below branch
      */
     if (!p_ref_idx) {
-        return false;
+        goto done;
     }
 
 #if WASM_ENABLE_REF_TYPES != 0
     if (table->type->val_type->kind == WASM_EXTERNREF) {
-        return wasm_externref_obj2ref(table->inst_comm_rt, ref, p_ref_idx);
+        wasm_ref_t *map_ref;
+        uint32 new_ref_idx;
+
+        if (!ref) {
+            *p_ref_idx = NULL_REF;
+            result = true;
+            goto done;
+        }
+
+        /* Runtime externref nodes retain a table-private reference.  This
+           prevents caller deletion from invalidating the table, while the
+           cleanup callback releases the copy after GC/module teardown. */
+        map_ref = wasm_ref_new_internal(ref->store, ref->kind, ref->ref_idx_rt,
+                                        ref->inst_comm_rt);
+        if (!map_ref)
+            goto done;
+        if (!wasm_externref_obj2ref(table->inst_comm_rt, map_ref,
+                                    &new_ref_idx)) {
+            wasm_ref_delete(map_ref);
+            goto done;
+        }
+        if (!wasm_externref_set_cleanup(table->inst_comm_rt, map_ref,
+                                        delete_c_api_externref)) {
+            (void)wasm_externref_objdel(table->inst_comm_rt, map_ref);
+            wasm_ref_delete(map_ref);
+            goto done;
+        }
+        *p_ref_idx = new_ref_idx;
+        result = true;
+        goto done;
     }
     else
 #endif
     {
         if (ref) {
             if (NULL_REF != ref->ref_idx_rt) {
-                if (ref->ref_idx_rt >= function_count) {
-                    return false;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0
+                if (p_component_func_ref) {
+                    WASMModuleInstance *ref_module_inst;
+
+                    if (!ref->inst_comm_rt
+                        || ref->inst_comm_rt->module_type
+                               != Wasm_Module_Bytecode) {
+                        goto done;
+                    }
+                    ref_module_inst = (WASMModuleInstance *)ref->inst_comm_rt;
+                    if (!ref_module_inst->e
+                        || ref->ref_idx_rt
+                               >= ref_module_inst->e->function_count) {
+                        goto done;
+                    }
+                    *p_component_func_ref =
+                        &ref_module_inst->e->functions[ref->ref_idx_rt];
+                }
+                else
+#endif
+                {
+                    if (ref->inst_comm_rt != table->inst_comm_rt
+                        || ref->ref_idx_rt >= function_count) {
+                        goto done;
+                    }
                 }
             }
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0
+            else if (p_component_func_ref) {
+                *p_component_func_ref = NULL;
+            }
+#endif
             *p_ref_idx = ref->ref_idx_rt;
-            wasm_ref_delete(ref);
         }
         else {
             *p_ref_idx = NULL_REF;
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0
+            if (p_component_func_ref) {
+                *p_component_func_ref = NULL;
+            }
+#endif
         }
     }
 
-    return true;
+    result = true;
+
+done:
+    wasm_allocation_quota_borrowed_scope_leave(&scope);
+    return result;
 }
 #else  /* else of WASM_ENABLE_GC == 0 */
 own wasm_ref_t *
@@ -4355,7 +5290,10 @@ wasm_memory_new_internal(wasm_store_t *store, uint16 memory_idx_rt,
 void
 wasm_memory_delete(wasm_memory_t *memory)
 {
-    if (!memory) {
+    WASMAllocationQuotaScope scope;
+
+    if (!memory
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, memory)) {
         return;
     }
 
@@ -4367,6 +5305,7 @@ wasm_memory_delete(wasm_memory_t *memory)
     DELETE_HOST_INFO(memory)
 
     wasm_runtime_free(memory);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 wasm_memorytype_t *
@@ -4858,6 +5797,138 @@ failed:
 }
 #endif /* WASM_ENABLE_AOT */
 
+typedef struct CApiImportBindingSnapshot {
+    wasm_extern_t *external;
+    WASMModuleInstanceCommon *inst_comm_rt;
+    WASMFunctionInstanceCommon *func_comm_rt;
+    wasm_externkind_t kind;
+    uint16 index_rt;
+} CApiImportBindingSnapshot;
+
+static bool
+snapshot_import_bindings(const wasm_extern_vec_t *imports,
+                         CApiImportBindingSnapshot **snapshots,
+                         uint32 *snapshot_count)
+{
+    CApiImportBindingSnapshot *entries;
+    uint64 total_size;
+    uint32 i;
+
+    bh_assert(snapshots && snapshot_count);
+    *snapshots = NULL;
+    *snapshot_count = 0;
+    if (!imports || imports->num_elems == 0)
+        return true;
+    if (!imports->data || imports->num_elems > UINT32_MAX)
+        return false;
+
+    total_size = (uint64)sizeof(*entries) * imports->num_elems;
+    if (!(entries = malloc_internal(total_size)))
+        return false;
+
+    /* Snapshot the complete vector before do_link mutates even the first
+       object. This is intentional for duplicate/aliased imports: every
+       occurrence records the same pre-transaction binding. */
+    for (i = 0; i < (uint32)imports->num_elems; i++) {
+        wasm_extern_t *external = imports->data[i];
+
+        if (!external)
+            goto failed;
+        entries[i].external = external;
+        entries[i].kind = external->kind;
+        switch (external->kind) {
+            case WASM_EXTERN_FUNC:
+            {
+                wasm_func_t *func = wasm_extern_as_func(external);
+                entries[i].inst_comm_rt = func->inst_comm_rt;
+                entries[i].func_comm_rt = func->func_comm_rt;
+                entries[i].index_rt = func->func_idx_rt;
+                break;
+            }
+            case WASM_EXTERN_GLOBAL:
+            {
+                wasm_global_t *global = wasm_extern_as_global(external);
+                entries[i].inst_comm_rt = global->inst_comm_rt;
+                entries[i].index_rt = global->global_idx_rt;
+                break;
+            }
+            case WASM_EXTERN_MEMORY:
+            {
+                wasm_memory_t *memory = wasm_extern_as_memory(external);
+                entries[i].inst_comm_rt = memory->inst_comm_rt;
+                entries[i].index_rt = memory->memory_idx_rt;
+                break;
+            }
+            case WASM_EXTERN_TABLE:
+            {
+                wasm_table_t *table = wasm_extern_as_table(external);
+                entries[i].inst_comm_rt = table->inst_comm_rt;
+                entries[i].index_rt = table->table_idx_rt;
+                break;
+            }
+            default:
+                goto failed;
+        }
+    }
+
+    *snapshots = entries;
+    *snapshot_count = (uint32)imports->num_elems;
+    return true;
+
+failed:
+    wasm_runtime_free(entries);
+    return false;
+}
+
+static void
+restore_import_bindings(CApiImportBindingSnapshot *snapshots,
+                        uint32 snapshot_count)
+{
+    uint32 i;
+
+    /* Restore in reverse order so duplicate entries are safe even if a future
+       transaction mutates an alias more than once. All entries were captured
+       before the first mutation. */
+    for (i = snapshot_count; i > 0; i--) {
+        CApiImportBindingSnapshot *entry = &snapshots[i - 1];
+
+        switch (entry->kind) {
+            case WASM_EXTERN_FUNC:
+            {
+                wasm_func_t *func = wasm_extern_as_func(entry->external);
+                func->inst_comm_rt = entry->inst_comm_rt;
+                func->func_comm_rt = entry->func_comm_rt;
+                func->func_idx_rt = entry->index_rt;
+                break;
+            }
+            case WASM_EXTERN_GLOBAL:
+            {
+                wasm_global_t *global = wasm_extern_as_global(entry->external);
+                global->inst_comm_rt = entry->inst_comm_rt;
+                global->global_idx_rt = entry->index_rt;
+                break;
+            }
+            case WASM_EXTERN_MEMORY:
+            {
+                wasm_memory_t *memory = wasm_extern_as_memory(entry->external);
+                memory->inst_comm_rt = entry->inst_comm_rt;
+                memory->memory_idx_rt = entry->index_rt;
+                break;
+            }
+            case WASM_EXTERN_TABLE:
+            {
+                wasm_table_t *table = wasm_extern_as_table(entry->external);
+                table->inst_comm_rt = entry->inst_comm_rt;
+                table->table_idx_rt = entry->index_rt;
+                break;
+            }
+            default:
+                bh_assert(0);
+                break;
+        }
+    }
+}
+
 static bool
 do_link(const wasm_instance_t *inst, const wasm_module_t *module,
         const wasm_extern_vec_t *imports)
@@ -4974,11 +6045,14 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
                                own wasm_trap_t **trap,
                                const InstantiationArgs *inst_args)
 {
+    WASMAllocationQuotaScope scope;
     char sub_error_buf[128] = { 0 };
     char error_buf[256] = { 0 };
     wasm_instance_t *instance = NULL;
     CApiFuncImport *func_import = NULL, **p_func_imports = NULL;
+    CApiImportBindingSnapshot *import_binding_snapshots = NULL;
     uint32 i = 0, import_func_count = 0;
+    uint32 import_binding_snapshot_count = 0;
     uint64 total_size;
     bool build_exported = false;
 
@@ -4986,6 +6060,11 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
 
     if (!module)
         return NULL;
+    if (!*module
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, *module)) {
+        LOG_ERROR("C API instantiation rejected by allocation owner");
+        return NULL;
+    }
 
     /*
      * will do the check at the end of wasm_runtime_instantiate
@@ -4997,6 +6076,13 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
     if (!instance) {
         snprintf(sub_error_buf, sizeof(sub_error_buf),
                  "Failed to malloc instance");
+        goto failed;
+    }
+
+    if (!snapshot_import_bindings(imports, &import_binding_snapshots,
+                                  &import_binding_snapshot_count)) {
+        snprintf(sub_error_buf, sizeof(sub_error_buf),
+                 "Failed to snapshot import bindings");
         goto failed;
     }
 
@@ -5015,6 +6101,12 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
     instance->inst_comm_rt = wasm_runtime_instantiate_ex(
         *module, inst_args, sub_error_buf, sizeof(sub_error_buf));
     if (!instance->inst_comm_rt) {
+        goto failed;
+    }
+    if (!wasm_allocation_quota_allocations_share_owner(
+            instance, instance->inst_comm_rt)) {
+        snprintf(sub_error_buf, sizeof(sub_error_buf),
+                 "Instance allocation owner mismatch");
         goto failed;
     }
 
@@ -5070,7 +6162,12 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
         func_import->with_env_arg = func_host->with_env;
         if (func_host->with_env) {
             func_import->func_ptr_linked = func_host->u.cb_env.cb;
-            func_import->env_arg = func_host->u.cb_env.env;
+            if (!c_api_callback_payload_retain(func_host->callback_payload)) {
+                snprintf(sub_error_buf, sizeof(sub_error_buf),
+                         "Failed to retain wasm-c-api callback environment");
+                goto failed;
+            }
+            func_import->env_arg = func_host->callback_payload;
         }
         else {
             func_import->func_ptr_linked = func_host->u.cb;
@@ -5166,7 +6263,7 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
     }
 
     /* add it to a watching list in store */
-    if (!bh_vector_append((Vector *)store->instances, &instance)) {
+    if (!host_vector_append((Vector *)store->instances, &instance)) {
         snprintf(sub_error_buf, sizeof(sub_error_buf),
                  "Failed to add to store instances");
         goto failed;
@@ -5174,9 +6271,14 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
 
     WASM_C_DUMP_PROC_MEM();
 
+    wasm_runtime_free(import_binding_snapshots);
+    wasm_allocation_quota_scope_leave(&scope);
     return instance;
 
 failed:
+    restore_import_bindings(import_binding_snapshots,
+                            import_binding_snapshot_count);
+    wasm_runtime_free(import_binding_snapshots);
     snprintf(error_buf, sizeof(error_buf), "%s failed: %s", __FUNCTION__,
              sub_error_buf);
     if (trap != NULL) {
@@ -5187,13 +6289,27 @@ failed:
     }
     LOG_DEBUG("%s", error_buf);
     wasm_instance_delete_internal(instance);
+    wasm_allocation_quota_scope_leave(&scope);
     return NULL;
 }
 
 static void
 wasm_instance_delete_internal(wasm_instance_t *instance)
 {
+    WASMAllocationQuotaScope scope;
+
     if (!instance) {
+        return;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&scope, instance)) {
+        LOG_ERROR("C API instance deletion rejected by allocation owner");
+        return;
+    }
+    if (instance->inst_comm_rt
+        && !wasm_allocation_quota_allocations_share_owner(
+            instance, instance->inst_comm_rt)) {
+        LOG_ERROR("C API and runtime instance allocation owners differ");
+        wasm_allocation_quota_scope_leave(&scope);
         return;
     }
 
@@ -5204,12 +6320,27 @@ wasm_instance_delete_internal(wasm_instance_t *instance)
         instance->inst_comm_rt = NULL;
     }
     wasm_runtime_free(instance);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 void
 wasm_instance_delete(wasm_instance_t *inst)
 {
-    DELETE_HOST_INFO(inst)
+    WASMAllocationQuotaScope scope;
+    void *host_info;
+    void (*finalizer)(void *);
+
+    if (!inst
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, inst))
+        return;
+
+    host_info = inst->host_info.info;
+    finalizer = inst->host_info.finalizer;
+    inst->host_info.info = NULL;
+    inst->host_info.finalizer = NULL;
+    if (host_info && finalizer)
+        finalizer(host_info);
+    wasm_allocation_quota_scope_leave(&scope);
     /* will release instance when releasing the store */
 }
 
@@ -5217,18 +6348,29 @@ void
 wasm_instance_exports(const wasm_instance_t *instance,
                       own wasm_extern_vec_t *out)
 {
-    if (!instance || !out) {
+    WASMAllocationQuotaScope scope;
+
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!instance
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             instance)) {
         return;
     }
     wasm_extern_vec_copy(out, instance->exports);
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 wasm_extern_t *
 wasm_extern_copy(const wasm_extern_t *src)
 {
+    WASMAllocationQuotaScope scope;
     wasm_extern_t *dst = NULL;
 
-    if (!src) {
+    if (!src
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope, src)) {
         return NULL;
     }
 
@@ -5259,18 +6401,24 @@ wasm_extern_copy(const wasm_extern_t *src)
         goto failed;
     }
 
+    wasm_allocation_quota_scope_leave(&scope);
     return dst;
 
 failed:
     LOG_DEBUG("%s failed", __FUNCTION__);
     wasm_extern_delete(dst);
+    wasm_allocation_quota_scope_leave(&scope);
     return NULL;
 }
 
 void
 wasm_extern_delete(wasm_extern_t *external)
 {
-    if (!external) {
+    WASMAllocationQuotaScope scope;
+
+    if (!external
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             external)) {
         return;
     }
 
@@ -5298,6 +6446,7 @@ wasm_extern_delete(wasm_extern_t *external)
                         external->kind);
             break;
     }
+    wasm_allocation_quota_scope_leave(&scope);
 }
 
 wasm_externkind_t
@@ -5313,29 +6462,39 @@ wasm_extern_kind(const wasm_extern_t *external)
 own wasm_externtype_t *
 wasm_extern_type(const wasm_extern_t *external)
 {
-    if (!external) {
+    WASMAllocationQuotaScope scope;
+    wasm_externtype_t *result = NULL;
+
+    if (!external
+        || !wasm_allocation_quota_scope_enter_for_allocation(&scope,
+                                                             external)) {
         return NULL;
     }
 
     switch (wasm_extern_kind(external)) {
         case WASM_EXTERN_FUNC:
-            return wasm_functype_as_externtype(
+            result = wasm_functype_as_externtype(
                 wasm_func_type(wasm_extern_as_func_const(external)));
+            break;
         case WASM_EXTERN_GLOBAL:
-            return wasm_globaltype_as_externtype(
+            result = wasm_globaltype_as_externtype(
                 wasm_global_type(wasm_extern_as_global_const(external)));
+            break;
         case WASM_EXTERN_MEMORY:
-            return wasm_memorytype_as_externtype(
+            result = wasm_memorytype_as_externtype(
                 wasm_memory_type(wasm_extern_as_memory_const(external)));
+            break;
         case WASM_EXTERN_TABLE:
-            return wasm_tabletype_as_externtype(
+            result = wasm_tabletype_as_externtype(
                 wasm_table_type(wasm_extern_as_table_const(external)));
+            break;
         default:
             LOG_WARNING("%s meets unsupported kind: %d", __FUNCTION__,
                         external->kind);
             break;
     }
-    return NULL;
+    wasm_allocation_quota_scope_leave(&scope);
+    return result;
 }
 
 #define BASIC_FOUR_LIST(V) \

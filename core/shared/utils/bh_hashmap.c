@@ -22,13 +22,30 @@ struct HashMap {
     KeyEqualFunc key_equal_func;
     KeyDestroyFunc key_destroy_func;
     ValueDestroyFunc value_destroy_func;
+    HashMapMallocFunc malloc_func;
+    HashMapFreeFunc free_func;
     HashMapElem *elements[1];
 };
 
-HashMap *
-bh_hash_map_create(uint32 size, bool use_lock, HashFunc hash_func,
-                   KeyEqualFunc key_equal_func, KeyDestroyFunc key_destroy_func,
-                   ValueDestroyFunc value_destroy_func)
+static void *
+hash_map_malloc(uint32 size)
+{
+    return BH_MALLOC(size);
+}
+
+static void
+hash_map_free(void *ptr)
+{
+    BH_FREE(ptr);
+}
+
+static HashMap *
+hash_map_create_internal(uint32 size, bool use_lock, HashFunc hash_func,
+                         KeyEqualFunc key_equal_func,
+                         KeyDestroyFunc key_destroy_func,
+                         ValueDestroyFunc value_destroy_func,
+                         HashMapMallocFunc malloc_func,
+                         HashMapFreeFunc free_func)
 {
     HashMap *map;
     uint64 total_size;
@@ -47,13 +64,18 @@ bh_hash_map_create(uint32 size, bool use_lock, HashFunc hash_func,
         return NULL;
     }
 
+    if (!malloc_func || !free_func) {
+        LOG_ERROR("HashMap create failed: malloc or free function is NULL.\n");
+        return NULL;
+    }
+
     total_size = offsetof(HashMap, elements)
                  + sizeof(HashMapElem *) * (uint64)size
                  + (use_lock ? sizeof(korp_mutex) : 0);
 
     /* size <= HASH_MAP_MAX_SIZE, so total_size won't be larger than
        UINT32_MAX, no need to check integer overflow */
-    if (!(map = BH_MALLOC((uint32)total_size))) {
+    if (!(map = malloc_func((uint32)total_size))) {
         LOG_ERROR("HashMap create failed: alloc memory failed.\n");
         return NULL;
     }
@@ -65,7 +87,7 @@ bh_hash_map_create(uint32 size, bool use_lock, HashFunc hash_func,
                                    + sizeof(HashMapElem *) * size);
         if (os_mutex_init(map->lock)) {
             LOG_ERROR("HashMap create failed: init map lock failed.\n");
-            BH_FREE(map);
+            free_func(map);
             return NULL;
         }
     }
@@ -75,7 +97,30 @@ bh_hash_map_create(uint32 size, bool use_lock, HashFunc hash_func,
     map->key_equal_func = key_equal_func;
     map->key_destroy_func = key_destroy_func;
     map->value_destroy_func = value_destroy_func;
+    map->malloc_func = malloc_func;
+    map->free_func = free_func;
     return map;
+}
+
+HashMap *
+bh_hash_map_create(uint32 size, bool use_lock, HashFunc hash_func,
+                   KeyEqualFunc key_equal_func, KeyDestroyFunc key_destroy_func,
+                   ValueDestroyFunc value_destroy_func)
+{
+    return hash_map_create_internal(size, use_lock, hash_func, key_equal_func,
+                                    key_destroy_func, value_destroy_func,
+                                    hash_map_malloc, hash_map_free);
+}
+
+HashMap *
+bh_hash_map_create_with_allocator(
+    uint32 size, bool use_lock, HashFunc hash_func, KeyEqualFunc key_equal_func,
+    KeyDestroyFunc key_destroy_func, ValueDestroyFunc value_destroy_func,
+    HashMapMallocFunc malloc_func, HashMapFreeFunc free_func)
+{
+    return hash_map_create_internal(size, use_lock, hash_func, key_equal_func,
+                                    key_destroy_func, value_destroy_func,
+                                    malloc_func, free_func);
 }
 
 bool
@@ -103,7 +148,7 @@ bh_hash_map_insert(HashMap *map, void *key, void *value)
         elem = elem->next;
     }
 
-    if (!(elem = BH_MALLOC(sizeof(HashMapElem)))) {
+    if (!(elem = map->malloc_func(sizeof(HashMapElem)))) {
         LOG_ERROR("HashMap insert elem failed: alloc memory failed.\n");
         goto fail;
     }
@@ -229,7 +274,7 @@ bh_hash_map_remove(HashMap *map, void *key, void **p_old_key,
             else
                 prev->next = elem->next;
 
-            BH_FREE(elem);
+            map->free_func(elem);
 
             if (map->lock) {
                 os_mutex_unlock(map->lock);
@@ -252,6 +297,7 @@ bh_hash_map_destroy(HashMap *map)
 {
     uint32 index;
     HashMapElem *elem, *next;
+    HashMapFreeFunc free_func;
 
     if (!map) {
         LOG_ERROR("HashMap destroy failed: map is NULL.\n");
@@ -261,6 +307,8 @@ bh_hash_map_destroy(HashMap *map)
     if (map->lock) {
         os_mutex_lock(map->lock);
     }
+
+    free_func = map->free_func;
 
     for (index = 0; index < map->size; index++) {
         elem = map->elements[index];
@@ -273,7 +321,7 @@ bh_hash_map_destroy(HashMap *map)
             if (map->value_destroy_func) {
                 map->value_destroy_func(elem->value);
             }
-            BH_FREE(elem);
+            free_func(elem);
 
             elem = next;
         }
@@ -283,7 +331,7 @@ bh_hash_map_destroy(HashMap *map)
         os_mutex_unlock(map->lock);
         os_mutex_destroy(map->lock);
     }
-    BH_FREE(map);
+    free_func(map);
     return true;
 }
 

@@ -115,6 +115,9 @@ static WASMComponentTypeInstance primitive_type_error_context = {
 static void
 free_component_instance_decl(WASMComponentInstDecl *decl);
 
+static void
+free_component_decl(WASMComponentComponentDecl *decl);
+
 // Free helpers for nested component/instance/resource types
 static void
 free_component_types_entry(WASMComponentTypes *type);
@@ -210,28 +213,24 @@ parse_record_type(const uint8_t **payload, const uint8_t *end,
         }
 
         // Allocate the fields array
-        (*out)->def_val.record->fields =
-            wasm_runtime_malloc(sizeof(WASMComponentLabelValType) * count);
+        (*out)->def_val.record->fields = wasm_component_checked_calloc(
+            count, sizeof(WASMComponentLabelValType), p, end, 1, "record field",
+            error_buf, error_buf_size);
         if (!(*out)->def_val.record->fields) {
             wasm_runtime_free((*out)->def_val.record);
             (*out)->def_val.record = NULL;
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for record fields");
             return false;
         }
 
         (*out)->def_val.record->count = count;
 
-        // Initialize all fields to zero
-        memset((*out)->def_val.record->fields, 0,
-               sizeof(WASMComponentLabelValType) * count);
-
         // Parse each field
         for (uint32_t i = 0; i < count; i++) {
             if (!parse_labelvaltype(&p, end, &(*out)->def_val.record->fields[i],
                                     error_buf, error_buf_size)) {
-                // Clean up already parsed fields
-                for (uint32_t j = 0; j < i; j++) {
+                /* parse_labelvaltype may allocate part of the current field
+                 * before failing, so include i in the cleanup. */
+                for (uint32_t j = 0; j <= i; j++) {
                     free_labelvaltype(&(*out)->def_val.record->fields[j]);
                 }
                 wasm_runtime_free((*out)->def_val.record->fields);
@@ -286,28 +285,24 @@ parse_variant_type(const uint8_t **payload, const uint8_t *end,
         }
 
         // Allocate the cases array
-        (*out)->def_val.variant->cases =
-            wasm_runtime_malloc(sizeof(WASMComponentCaseValType) * count);
+        (*out)->def_val.variant->cases = wasm_component_checked_calloc(
+            count, sizeof(WASMComponentCaseValType), p, end, 1, "variant case",
+            error_buf, error_buf_size);
         if (!(*out)->def_val.variant->cases) {
             wasm_runtime_free((*out)->def_val.variant);
             (*out)->def_val.variant = NULL;
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for variant cases");
             return false;
         }
 
         (*out)->def_val.variant->count = count;
 
-        // Initialize all cases to zero
-        memset((*out)->def_val.variant->cases, 0,
-               sizeof(WASMComponentCaseValType) * count);
-
         // Parse each case
         for (uint32_t i = 0; i < count; i++) {
             if (!parse_case(&p, end, &(*out)->def_val.variant->cases[i],
                             error_buf, error_buf_size)) {
-                // Clean up already parsed cases
-                for (uint32_t j = 0; j < i; j++) {
+                /* parse_case may allocate part of the current case before
+                 * failing, so include i in the cleanup. */
+                for (uint32_t j = 0; j <= i; j++) {
                     free_case(&(*out)->def_val.variant->cases[j]);
                 }
                 wasm_runtime_free((*out)->def_val.variant->cases);
@@ -362,22 +357,16 @@ parse_tuple_type(const uint8_t **payload, const uint8_t *end,
         }
 
         // Allocate the element types array
-        (*out)->def_val.tuple->element_types =
-            wasm_runtime_malloc(sizeof(WASMComponentValueType) * count);
+        (*out)->def_val.tuple->element_types = wasm_component_checked_calloc(
+            count, sizeof(WASMComponentValueType), p, end, 1, "tuple element",
+            error_buf, error_buf_size);
         if (!(*out)->def_val.tuple->element_types) {
             wasm_runtime_free((*out)->def_val.tuple);
             (*out)->def_val.tuple = NULL;
-            set_error_buf_ex(
-                error_buf, error_buf_size,
-                "Failed to allocate memory for tuple element types");
             return false;
         }
 
         (*out)->def_val.tuple->count = count;
-
-        // Initialize all element types to zero
-        memset((*out)->def_val.tuple->element_types, 0,
-               sizeof(WASMComponentValueType) * count);
 
         // Parse each element type
         for (uint32_t i = 0; i < count; i++) {
@@ -436,29 +425,25 @@ parse_flags_type(const uint8_t **payload, const uint8_t *end,
         }
 
         // Allocate the labels array
-        (*out)->def_val.flag->flags =
-            wasm_runtime_malloc(sizeof(WASMComponentCoreName) * count);
+        (*out)->def_val.flag->flags = wasm_component_checked_calloc(
+            count, sizeof(WASMComponentCoreName), p, end, 1, "flag label",
+            error_buf, error_buf_size);
         if (!(*out)->def_val.flag->flags) {
             wasm_runtime_free((*out)->def_val.flag);
             (*out)->def_val.flag = NULL;
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for flag labels");
             return false;
         }
 
         (*out)->def_val.flag->count = count;
-
-        // Initialize all labels to zero
-        memset((*out)->def_val.flag->flags, 0,
-               sizeof(WASMComponentCoreName) * count);
 
         // Parse each label
         for (uint32_t i = 0; i < count; i++) {
             WASMComponentCoreName *temp_ptr = &(*out)->def_val.flag->flags[i];
             if (!parse_label_prime(&p, end, &temp_ptr, error_buf,
                                    error_buf_size)) {
-                // Clean up on error
-                for (uint32_t j = 0; j < i; j++) {
+                /* The current array element may already own its label string,
+                 * so include it in owner cleanup. */
+                for (uint32_t j = 0; j <= i; j++) {
                     free_label_prime(&(*out)->def_val.flag->flags[j]);
                 }
                 wasm_runtime_free((*out)->def_val.flag->flags);
@@ -513,21 +498,16 @@ parse_enum_type(const uint8_t **payload, const uint8_t *end,
         }
 
         // Allocate the labels array
-        (*out)->def_val.enum_type->labels =
-            wasm_runtime_malloc(sizeof(WASMComponentCoreName) * count);
+        (*out)->def_val.enum_type->labels = wasm_component_checked_calloc(
+            count, sizeof(WASMComponentCoreName), p, end, 1, "enum label",
+            error_buf, error_buf_size);
         if (!(*out)->def_val.enum_type->labels) {
             wasm_runtime_free((*out)->def_val.enum_type);
             (*out)->def_val.enum_type = NULL;
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for enum labels");
             return false;
         }
 
         (*out)->def_val.enum_type->count = count;
-
-        // Initialize all labels to zero
-        memset((*out)->def_val.enum_type->labels, 0,
-               sizeof(WASMComponentCoreName) * count);
 
         // Parse each label
         for (uint32_t i = 0; i < count; i++) {
@@ -535,8 +515,9 @@ parse_enum_type(const uint8_t **payload, const uint8_t *end,
                 &(*out)->def_val.enum_type->labels[i];
             if (!parse_label_prime(&p, end, &temp_ptr, error_buf,
                                    error_buf_size)) {
-                // Clean up on error
-                for (uint32_t j = 0; j < i; j++) {
+                /* The current array element may already own its label string,
+                 * so include it in owner cleanup. */
+                for (uint32_t j = 0; j <= i; j++) {
                     free_label_prime(&(*out)->def_val.enum_type->labels[j]);
                 }
                 wasm_runtime_free((*out)->def_val.enum_type->labels);
@@ -640,6 +621,13 @@ parse_result_type(const uint8_t **payload, const uint8_t *end,
 
     // Parse in Binary.md order: result t? then error u?
     // Optional result type (t?)
+    if (p >= end) {
+        wasm_runtime_free((*out)->def_val.result);
+        (*out)->def_val.result = NULL;
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Missing result optional tag");
+        return false;
+    }
     uint8_t has_result_type = *p++;
     if (has_result_type == WASM_COMP_OPTIONAL_TRUE) {
         (*out)->def_val.result->result_type =
@@ -665,6 +653,8 @@ parse_result_type(const uint8_t **payload, const uint8_t *end,
         }
     }
     else if (has_result_type != WASM_COMP_OPTIONAL_FALSE) {
+        wasm_runtime_free((*out)->def_val.result);
+        (*out)->def_val.result = NULL;
         set_error_buf_ex(error_buf, error_buf_size,
                          "Malformed binary: invalid optional tag 0x%02x",
                          has_result_type);
@@ -672,6 +662,16 @@ parse_result_type(const uint8_t **payload, const uint8_t *end,
     }
 
     // Optional error type (u?)
+    if (p >= end) {
+        if ((*out)->def_val.result->result_type) {
+            wasm_runtime_free((*out)->def_val.result->result_type);
+        }
+        wasm_runtime_free((*out)->def_val.result);
+        (*out)->def_val.result = NULL;
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Missing error optional tag");
+        return false;
+    }
     uint8_t has_error_type = *p++;
     if (has_error_type == WASM_COMP_OPTIONAL_TRUE) {
         (*out)->def_val.result->error_type =
@@ -702,6 +702,11 @@ parse_result_type(const uint8_t **payload, const uint8_t *end,
         }
     }
     else if (has_error_type != WASM_COMP_OPTIONAL_FALSE) {
+        if ((*out)->def_val.result->result_type) {
+            wasm_runtime_free((*out)->def_val.result->result_type);
+        }
+        wasm_runtime_free((*out)->def_val.result);
+        (*out)->def_val.result = NULL;
         set_error_buf_ex(error_buf, error_buf_size,
                          "Malformed binary: invalid optional tag 0x%02x",
                          has_error_type);
@@ -800,6 +805,11 @@ parse_stream_type(const uint8_t **payload, const uint8_t *end,
     }
 
     const uint8_t *p = *payload;
+    if (p >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Missing stream optional tag");
+        return false;
+    }
 
     // Allocate the stream structure
     (*out)->def_val.stream =
@@ -843,6 +853,8 @@ parse_stream_type(const uint8_t **payload, const uint8_t *end,
         }
     }
     else if (has_element_type != WASM_COMP_OPTIONAL_FALSE) {
+        wasm_runtime_free((*out)->def_val.stream);
+        (*out)->def_val.stream = NULL;
         set_error_buf_ex(error_buf, error_buf_size,
                          "Malformed binary: invalid optional tag 0x%02x",
                          has_element_type);
@@ -866,6 +878,11 @@ parse_future_type(const uint8_t **payload, const uint8_t *end,
     }
 
     const uint8_t *p = *payload;
+    if (p >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Missing future optional tag");
+        return false;
+    }
 
     // Allocate the future structure
     (*out)->def_val.future =
@@ -909,6 +926,8 @@ parse_future_type(const uint8_t **payload, const uint8_t *end,
         }
     }
     else if (has_element_type != WASM_COMP_OPTIONAL_FALSE) {
+        wasm_runtime_free((*out)->def_val.future);
+        (*out)->def_val.future = NULL;
         set_error_buf_ex(error_buf, error_buf_size,
                          "Malformed binary: invalid optional tag 0x%02x",
                          has_element_type);
@@ -1224,7 +1243,9 @@ parse_defvaltype(const uint8_t **payload, const uint8_t *end,
                  WASMComponentDefValType **out, char *error_buf,
                  uint32_t error_buf_size)
 {
-    if (!payload || !*payload || !out) {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing defined value type");
         return false;
     }
 
@@ -1418,11 +1439,10 @@ parse_param_list(const uint8_t **payload, const uint8_t *end,
 
     // Allocate memory for the param list
     if (param_count > 0) {
-        (*out)->params = wasm_runtime_malloc(sizeof(WASMComponentLabelValType)
-                                             * param_count);
+        (*out)->params = wasm_component_checked_calloc(
+            param_count, sizeof(WASMComponentLabelValType), p, end, 1,
+            "function parameter", error_buf, error_buf_size);
         if (!(*out)->params) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for param list");
             return false;
         }
 
@@ -1467,8 +1487,10 @@ parse_func_type(const uint8_t **payload, const uint8_t *end,
     // Parse the param list
     if (!parse_param_list(&p, end, &(*out)->params, error_buf,
                           error_buf_size)) {
-        set_error_buf_ex(error_buf, error_buf_size,
-                         "Failed to parse param list");
+        if (!error_buf || error_buf[0] == '\0') {
+            set_error_buf_ex(error_buf, error_buf_size,
+                             "Failed to parse param list");
+        }
         return false;
     }
 
@@ -1722,6 +1744,12 @@ parse_component_decl_export(const uint8_t **payload, const uint8_t *end,
         return false;
     }
 
+    /* Ownership of export_name now belongs to *out; on any later error
+     * path it is freed by the centralized cleanup
+     * (free_component_instance_decl -> free_component_export_name), which
+     * walks (*out)->export_name. Freeing it locally below as well caused a
+     * double-free / heap-use-after-free (found by the component-parser
+     * fuzz target). */
     (*out)->export_name = export_name;
 
     WASMComponentExternDesc *extern_desc =
@@ -1729,7 +1757,7 @@ parse_component_decl_export(const uint8_t **payload, const uint8_t *end,
     if (!extern_desc) {
         set_error_buf_ex(error_buf, error_buf_size,
                          "Failed to allocate memory for extern desc");
-        wasm_runtime_free(export_name);
+        /* export_name is owned by *out; the caller frees it. */
         return false;
     }
     memset(extern_desc, 0, sizeof(WASMComponentExternDesc));
@@ -1738,8 +1766,9 @@ parse_component_decl_export(const uint8_t **payload, const uint8_t *end,
     if (!parse_extern_desc(&p, end, extern_desc, error_buf, error_buf_size)) {
         set_error_buf_ex(error_buf, error_buf_size,
                          "Failed to parse extern desc");
+        /* extern_desc is not yet owned by *out -> free it here.
+         * export_name IS owned by *out -> the caller frees it. */
         wasm_runtime_free(extern_desc);
-        wasm_runtime_free(export_name);
         return false;
     }
 
@@ -1754,6 +1783,11 @@ parse_component_instance_decl(const uint8_t **payload, const uint8_t *end,
                               WASMComponentInstDecl **out, char *error_buf,
                               uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing instance declaration");
+        return false;
+    }
     const uint8_t *p = *payload;
 
     // Allocate memory for the instance decl
@@ -1821,6 +1855,11 @@ parse_component_decl(const uint8_t **payload, const uint8_t *end,
                      WASMComponentComponentDecl **out, char *error_buf,
                      uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !*out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing component declaration");
+        return false;
+    }
     const uint8_t *p = *payload;
 
     uint8_t tag = *p;
@@ -1874,11 +1913,10 @@ parse_component_type(const uint8_t **payload, const uint8_t *end,
 
     // Allocate memory for the component list
     if (component_count > 0) {
-        (*out)->component_decls = wasm_runtime_malloc(
-            sizeof(WASMComponentComponentDecl) * component_count);
+        (*out)->component_decls = wasm_component_checked_calloc(
+            component_count, sizeof(WASMComponentComponentDecl), p, end, 1,
+            "component type declaration", error_buf, error_buf_size);
         if (!(*out)->component_decls) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for component list");
             return false;
         }
 
@@ -1898,6 +1936,13 @@ parse_component_type(const uint8_t **payload, const uint8_t *end,
                                       error_buf_size)) {
                 set_error_buf_ex(error_buf, error_buf_size,
                                  "Failed to parse component %d", i);
+                /* parse_component_decl may have populated decl contents
+                 * (e.g. an import's import_name) before failing on a later
+                 * sub-parse such as the extern-desc; free those contents
+                 * first, mirroring the parse_component_instance_type fail
+                 * path. component_decls[i] is still zeroed, so the
+                 * centralized cleanup never reaches this transient shell. */
+                free_component_decl(component_decl);
                 wasm_runtime_free(component_decl);
                 return false;
             }
@@ -1951,11 +1996,10 @@ parse_component_instance_type(const uint8_t **payload, const uint8_t *end,
 
     // Allocate memory for the instance list
     if (instance_count > 0) {
-        instance_decls =
-            wasm_runtime_malloc(sizeof(WASMComponentInstDecl) * instance_count);
+        instance_decls = wasm_component_checked_calloc(
+            instance_count, sizeof(WASMComponentInstDecl), p, end, 1,
+            "component instance declaration", error_buf, error_buf_size);
         if (!instance_decls) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for instance list");
             goto fail;
         }
 
@@ -1987,14 +2031,18 @@ parse_component_instance_type(const uint8_t **payload, const uint8_t *end,
 
 fail:
     ret = false;
-    free_component_instance_decl(instance_decl);
-    wasm_runtime_free(instance_decl);
+    if (instance_decl) {
+        free_component_instance_decl(instance_decl);
+        wasm_runtime_free(instance_decl);
+    }
 
     for (uint32_t j = 0; j < populated; j++) {
         free_component_instance_decl(&instance_decls[j]);
     }
 
-    wasm_runtime_free(instance_decls);
+    if (instance_decls) {
+        wasm_runtime_free(instance_decls);
+    }
     wasm_runtime_free(*out);
     *out = NULL;
 done:
@@ -2006,6 +2054,11 @@ parse_resource_type_sync(const uint8_t **payload, const uint8_t *end,
                          WASMComponentResourceTypeSync **out, char *error_buf,
                          uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Missing sync resource destructor optional tag");
+        return false;
+    }
     const uint8_t *p = *payload;
 
     // Allocate memory for the resource type sync
@@ -2024,6 +2077,8 @@ parse_resource_type_sync(const uint8_t **payload, const uint8_t *end,
         uint64_t dtor_func_idx_leb = 0;
         if (!read_leb((uint8_t **)&p, end, 32, false, &dtor_func_idx_leb,
                       error_buf, error_buf_size)) {
+            wasm_runtime_free(*out);
+            *out = NULL;
             set_error_buf_ex(error_buf, error_buf_size,
                              "Failed to parse resource type sync");
             return false;
@@ -2032,6 +2087,8 @@ parse_resource_type_sync(const uint8_t **payload, const uint8_t *end,
         (*out)->dtor_func_idx = (uint32_t)dtor_func_idx_leb;
     }
     else if (has_result_type != WASM_COMP_OPTIONAL_FALSE) {
+        wasm_runtime_free(*out);
+        *out = NULL;
         set_error_buf_ex(error_buf, error_buf_size,
                          "Malformed binary: invalid optional tag 0x%02x",
                          has_result_type);
@@ -2047,6 +2104,11 @@ parse_resource_type_async(const uint8_t **payload, const uint8_t *end,
                           WASMComponentResourceTypeAsync **out, char *error_buf,
                           uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Missing async resource destructor");
+        return false;
+    }
     const uint8_t *p = *payload;
 
     // Allocate memory for the resource type async
@@ -2063,6 +2125,8 @@ parse_resource_type_async(const uint8_t **payload, const uint8_t *end,
     uint64_t dtor_func_idx_leb = 0;
     if (!read_leb((uint8_t **)&p, end, 32, false, &dtor_func_idx_leb, error_buf,
                   error_buf_size)) {
+        wasm_runtime_free(*out);
+        *out = NULL;
         set_error_buf_ex(error_buf, error_buf_size,
                          "Failed to parse resource type async");
         return false;
@@ -2070,12 +2134,21 @@ parse_resource_type_async(const uint8_t **payload, const uint8_t *end,
     (*out)->dtor_func_idx = (uint32_t)dtor_func_idx_leb;
 
     // Read optional cb?:<funcidx>?
+    if (p >= end) {
+        wasm_runtime_free(*out);
+        *out = NULL;
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Missing async resource callback optional tag");
+        return false;
+    }
     uint8_t has_result_type = *p++;
     if (has_result_type == WASM_COMP_OPTIONAL_TRUE) {
         // Read the cb funcidx
         uint64_t callback_func_idx_leb = 0;
         if (!read_leb((uint8_t **)&p, end, 32, false, &callback_func_idx_leb,
                       error_buf, error_buf_size)) {
+            wasm_runtime_free(*out);
+            *out = NULL;
             set_error_buf_ex(error_buf, error_buf_size,
                              "Failed to parse resource type async");
             return false;
@@ -2083,6 +2156,8 @@ parse_resource_type_async(const uint8_t **payload, const uint8_t *end,
         (*out)->callback_func_idx = (uint32_t)callback_func_idx_leb;
     }
     else if (has_result_type != WASM_COMP_OPTIONAL_FALSE) {
+        wasm_runtime_free(*out);
+        *out = NULL;
         set_error_buf_ex(error_buf, error_buf_size,
                          "Malformed binary: invalid optional tag 0x%02x",
                          has_result_type);
@@ -2098,6 +2173,12 @@ parse_resource_type(const uint8_t **payload, const uint8_t *end,
                     WASMComponentResourceType **out, char *error_buf,
                     uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || !end || *payload > end
+        || (size_t)(end - *payload) < 2) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Truncated resource type header");
+        return false;
+    }
     const uint8_t *p = *payload;
 
     // Allocate memory for the resource type
@@ -2114,9 +2195,10 @@ parse_resource_type(const uint8_t **payload, const uint8_t *end,
     (*out)->tag = tag;
 
     // Read the resource type rep
-    if (*p++ != WASM_COMP_RESOURCE_REP_I32) {
+    uint8_t rep = *p++;
+    if (rep != WASM_COMP_RESOURCE_REP_I32) {
         set_error_buf_ex(error_buf, error_buf_size,
-                         "Invalid resource type rep: 0x%02x", *p);
+                         "Invalid resource type rep: 0x%02x", rep);
         return false;
     }
 
@@ -2158,6 +2240,11 @@ parse_single_type(const uint8_t **payload, const uint8_t *end,
                   uint32_t error_buf_size)
 {
     const uint8_t *p = *payload;
+    if (p >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing component type");
+        return false;
+    }
     uint8_t tag = *p;
     WASMComponentTypesTag type_tag = get_type_tag(tag);
     out->tag = type_tag;
@@ -2269,25 +2356,18 @@ wasm_component_parse_types_section(const uint8_t **payload,
     out->count = type_count;
 
     if (type_count > 0) {
-        // Allocate the types array
-        out->types =
-            wasm_runtime_malloc(sizeof(WASMComponentTypes) * type_count);
+        out->types = wasm_component_checked_calloc(
+            type_count, sizeof(WASMComponentTypes), p, end, 1, "component type",
+            error_buf, error_buf_size);
         if (!out->types) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for types array");
             if (consumed_len)
                 *consumed_len = (uint32_t)(p - *payload);
             return false;
         }
 
-        // Initialize all types to zero
-        memset(out->types, 0, sizeof(WASMComponentTypes) * type_count);
-
         for (uint32_t i = 0; i < type_count; ++i) {
             if (!parse_single_type(&p, end, &out->types[i], error_buf,
                                    error_buf_size)) {
-                wasm_runtime_free(out->types);
-                out->types = NULL;
                 if (consumed_len)
                     *consumed_len = (uint32_t)(p - *payload);
                 return false;
@@ -2655,7 +2735,7 @@ fill_resource_type_instance(WASMComponentTypeInstance **types,
         }
         resource->dtor_method = dtor_func;
     }
-    resource->is_wasi = false;
+    resource->is_builtin_wasi = false;
     resource->impl = comp_instance;
     resource->drop_method = drop_method;
     resource->new_method = new_method;
@@ -2690,22 +2770,25 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
                        WASMComponentTypes *type_definition, char *error_buf,
                        uint32 error_buf_size)
 {
-    uint32 size = 0, val_idx = 0;
-    uint32 types_count = *curr_types_count;
-    if (!types) {
+    uint64 size_64 = 0;
+    uint32 size = 0, val_idx = 0, types_count;
+    if (!types || !curr_types_count || !defined_types || !type_definition
+        || !type_definition->type.def_val_type
+        || !wasm_get_def_val_type_size(type_definition->type.def_val_type,
+                                       &size_64)
+        || size_64 > UINT32_MAX || size_64 > defined_types_size) {
         set_error_buf_ex(error_buf, error_buf_size,
-                         "ERROR: invalid types index space\n");
+                         "Defined type layout is invalid or too large\n");
         return 0;
     }
+    size = (uint32)size_64;
+    types_count = *curr_types_count;
     WASMComponentTypeInstance *curr_type =
         (WASMComponentTypeInstance *)defined_types;
 
     switch (type_definition->type.def_val_type->tag) {
         case WASM_COMP_DEF_VAL_PRIMVAL: // pvt:<primvaltype>
             LOG_DEBUG("Fill primval type instance");
-            size = sizeof(WASMComponentTypeInstance);
-            if (size > defined_types_size)
-                goto fail;
             curr_type->type = COMPONENT_VAL_TYPE_PRIMVAL;
             curr_type->type_specific.primval =
                 type_definition->type.def_val_type->def_val.primval;
@@ -2716,12 +2799,6 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
             LOG_DEBUG("Fill record type instance");
             WASMComponentRecordType *record_definition =
                 type_definition->type.def_val_type->def_val.record;
-            size = sizeof(WASMComponentTypeInstance)
-                   + sizeof(WASMComponentRecordInstance)
-                   + (record_definition->count)
-                         * sizeof(WASMComponentLabelValTypeInstance);
-            if (size > defined_types_size)
-                goto fail;
             WASMComponentRecordInstance *record =
                 (WASMComponentRecordInstance *)((uint8_t *)defined_types
                                                 + sizeof(
@@ -2743,12 +2820,6 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
             LOG_DEBUG("Fill variant type instance");
             WASMComponentVariantType *variant_definition =
                 type_definition->type.def_val_type->def_val.variant;
-            size = sizeof(WASMComponentTypeInstance)
-                   + sizeof(WASMComponentVariantInstance)
-                   + variant_definition->count
-                         * sizeof(WASMComponentCaseValInstance);
-            if (size > defined_types_size)
-                goto fail;
             WASMComponentVariantInstance *variant =
                 (WASMComponentVariantInstance
                      *)((uint8_t *)defined_types
@@ -2770,10 +2841,6 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
             LOG_DEBUG("Fill list type instance");
             WASMComponentListType *list_definition =
                 type_definition->type.def_val_type->def_val.list;
-            size = sizeof(WASMComponentTypeInstance)
-                   + sizeof(WASMComponentListInstance);
-            if (size > defined_types_size)
-                goto fail;
             WASMComponentListInstance *list =
                 (WASMComponentListInstance *)((uint8_t *)defined_types
                                               + sizeof(
@@ -2787,10 +2854,6 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
             LOG_DEBUG("Fill fixed size list type instance");
             WASMComponentListLenType *list_len_definition =
                 type_definition->type.def_val_type->def_val.list_len;
-            size = sizeof(WASMComponentTypeInstance)
-                   + sizeof(WASMComponentListLenInstance);
-            if (size > defined_types_size)
-                goto fail;
             WASMComponentListLenInstance *list_len =
                 (WASMComponentListLenInstance
                      *)((uint8_t *)defined_types
@@ -2806,12 +2869,6 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
             LOG_DEBUG("Fill tuple type instance");
             WASMComponentTupleType *tuple_definition =
                 type_definition->type.def_val_type->def_val.tuple;
-            size =
-                sizeof(WASMComponentTypeInstance)
-                + sizeof(WASMComponentTupleInstance)
-                + tuple_definition->count * sizeof(WASMComponentTypeInstance *);
-            if (size > defined_types_size)
-                goto fail;
             WASMComponentTupleInstance *tuple =
                 (WASMComponentTupleInstance *)((uint8_t *)defined_types
                                                + sizeof(
@@ -2835,9 +2892,6 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
         // Flags type
         case WASM_COMP_DEF_VAL_FLAGS: // 0x6e l*:vec(<label'>)
             LOG_DEBUG("Fill flags type instance");
-            size = sizeof(WASMComponentTypeInstance);
-            if (size > defined_types_size)
-                goto fail;
             WASMComponentFlagType *flag =
                 type_definition->type.def_val_type->def_val.flag;
             curr_type->type = COMPONENT_VAL_TYPE_FLAGS;
@@ -2846,25 +2900,18 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
         // Enum type
         case WASM_COMP_DEF_VAL_ENUM: // 0x6d l*:vec(<label'>)
             LOG_DEBUG("Fill enum type instance");
-            size = sizeof(WASMComponentTypeInstance);
             WASMComponentEnumType *enum_definition =
                 type_definition->type.def_val_type->def_val.enum_type;
-            if (size > defined_types_size)
-                goto fail;
             curr_type->type = COMPONENT_VAL_TYPE_ENUM;
             curr_type->type_specific.enum_type = enum_definition;
             break;
         // Option type
         case WASM_COMP_DEF_VAL_OPTION: // 0x6b t:<valtype>
             LOG_DEBUG("Fill option type instance");
-            size = sizeof(WASMComponentTypeInstance)
-                   + sizeof(WASMComponentOptionInstance);
             WASMComponentOptionInstance *option =
                 (WASMComponentOptionInstance *)((uint8_t *)defined_types
                                                 + sizeof(
                                                     WASMComponentTypeInstance));
-            if (size > defined_types_size)
-                goto fail;
             WASMComponentOptionType *option_definition =
                 type_definition->type.def_val_type->def_val.option;
             assign_type_instance(&option->element_type,
@@ -2875,14 +2922,10 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
         // Result type
         case WASM_COMP_DEF_VAL_RESULT: // 0x6a t?:<valtype>? u?:<valtype>?
             LOG_DEBUG("Fill result type instance");
-            size = sizeof(WASMComponentTypeInstance)
-                   + sizeof(WASMComponentResultInstance);
             WASMComponentResultInstance *result =
                 (WASMComponentResultInstance *)((uint8_t *)defined_types
                                                 + sizeof(
                                                     WASMComponentTypeInstance));
-            if (size > defined_types_size)
-                goto fail;
             WASMComponentResultType *result_definition =
                 type_definition->type.def_val_type->def_val.result;
             assign_type_instance(&result->result_type,
@@ -2895,14 +2938,10 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
         // Handle types
         case WASM_COMP_DEF_VAL_OWN: // 0x69 i:<typeidx>
             LOG_DEBUG("Fill resource own type instance");
-            size = sizeof(WASMComponentTypeInstance)
-                   + sizeof(WASMComponentResourceHandleInstance);
             WASMComponentResourceHandleInstance *resource_own =
                 (WASMComponentResourceHandleInstance
                      *)((uint8_t *)defined_types
                         + sizeof(WASMComponentTypeInstance));
-            if (size > defined_types_size)
-                goto fail;
             WASMComponentOwnType *own_definition =
                 type_definition->type.def_val_type->def_val.owned;
             if (own_definition->type_idx >= *curr_types_count
@@ -2921,14 +2960,10 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
             break;
         case WASM_COMP_DEF_VAL_BORROW: // 0x68 i:<typeidx>
             LOG_DEBUG("Fill resource borrow type instance");
-            size = sizeof(WASMComponentTypeInstance)
-                   + sizeof(WASMComponentResourceHandleInstance);
             WASMComponentResourceHandleInstance *resource_borrow =
                 (WASMComponentResourceHandleInstance
                      *)((uint8_t *)defined_types
                         + sizeof(WASMComponentTypeInstance));
-            if (size > defined_types_size)
-                goto fail;
             WASMComponentBorrowType *borrow_definition =
                 type_definition->type.def_val_type->def_val.borrow;
             if (borrow_definition->type_idx >= *curr_types_count
@@ -2966,10 +3001,6 @@ fill_def_type_instance(WASMComponentTypeInstance **types,
                  // defined_types pointer can be incremented by this ammount,
                  // pointing to the next free location in defined types memory
                  // area
-fail:
-    set_error_buf_ex(error_buf, error_buf_size,
-                     "Defined types alocated memory exceeded\n");
-    return 0;
 }
 
 /// @brief Adds a new function signature type to defined types memory section +
@@ -2992,13 +3023,16 @@ fill_func_type_instance(WASMComponentTypeInstance **types, uint32 *types_count,
                         WASMComponentTypes *type_definition, char *error_buf,
                         uint32 error_buf_size)
 {
+    uint64 size_64 = 0;
     uint32 size = 0, val_idx = 0;
-    size = wasm_get_func_type_size(type_definition->type.func_type);
-    if (size > defined_types_size) {
+    if (!type_definition
+        || !wasm_get_func_type_size(type_definition->type.func_type, &size_64)
+        || size_64 > UINT32_MAX || size_64 > defined_types_size) {
         set_error_buf_ex(error_buf, error_buf_size,
-                         "Defined types alocated memory exceeded");
+                         "Function type layout is invalid or too large");
         return 0;
     }
+    size = (uint32)size_64;
 
     // Allocation in memory:
     /*
@@ -3066,14 +3100,18 @@ fill_instance_type_instance(WASMComponentTypeInstance **types,
                             uint32 error_buf_size)
 {
     WASMComponentInstanceDeclTypeSize instance_decl_size = { 0 };
+    uint64 size_64 = 0;
     uint32 size = 0, val_idx = 0, curr_type_size = 0;
-    size += wasm_get_inst_decl_size(type_definition->type.instance_type,
-                                    &instance_decl_size);
-    if (size > defined_types_size) {
+    if (!type_definition
+        || !wasm_get_inst_decl_size(type_definition->type.instance_type,
+                                    &instance_decl_size, &size_64)
+        || size_64 > UINT32_MAX || size_64 > defined_types_size
+        || instance_decl_size.types_size > UINT32_MAX) {
         set_error_buf_ex(error_buf, error_buf_size,
-                         "Defined types alocated memory exceeded");
+                         "Instance type layout is invalid or too large");
         return 0;
     }
+    size = (uint32)size_64;
     LOG_DEBUG("Fill instance type instance: %d definitions, total size %d",
               type_definition->type.instance_type->count, size);
     WASMComponentInstDecl *instance_decl = NULL;
@@ -3120,6 +3158,9 @@ fill_instance_type_instance(WASMComponentTypeInstance **types,
     inst_type_instance->exports_count = 0;
     inst_type_instance->exports = inst_type_instance_exports;
     inst_type_instance->defined_core_funcs = inst_type_instance_core_funcs;
+    inst_type_instance->owned_types_begin = inst_type_instance_defined_types;
+    inst_type_instance->owned_types_size =
+        (uint32)instance_decl_size.types_size;
     for (val_idx = 0; val_idx < instance_decl_size.func_count
                                     + instance_decl_size.resource_count;
          val_idx++) {
@@ -3160,8 +3201,8 @@ fill_instance_type_instance(WASMComponentTypeInstance **types,
                         inst_type_instance->types,
                         &inst_type_instance->types_count,
                         inst_type_instance_defined_types,
-                        instance_decl_size.types_size, instance_decl->decl.type,
-                        error_buf, error_buf_size);
+                        (uint32)instance_decl_size.types_size,
+                        instance_decl->decl.type, error_buf, error_buf_size);
                     if (!curr_type_size) {
                         return 0;
                     }
@@ -3174,8 +3215,8 @@ fill_instance_type_instance(WASMComponentTypeInstance **types,
                         inst_type_instance->types,
                         &inst_type_instance->types_count,
                         inst_type_instance_defined_types,
-                        instance_decl_size.types_size, instance_decl->decl.type,
-                        error_buf, error_buf_size);
+                        (uint32)instance_decl_size.types_size,
+                        instance_decl->decl.type, error_buf, error_buf_size);
                     if (!curr_type_size) {
                         return 0;
                     }
@@ -3185,6 +3226,7 @@ fill_instance_type_instance(WASMComponentTypeInstance **types,
                 }
                 break;
             case WASM_COMP_COMPONENT_DECL_INSTANCE_ALIAS:
+            {
                 WASMComponentAliasDefinition *alias = instance_decl->decl.alias;
                 if (instance_decl->decl.alias->alias_target_type
                     != WASM_COMP_ALIAS_TARGET_OUTER) {
@@ -3234,6 +3276,7 @@ fill_instance_type_instance(WASMComponentTypeInstance **types,
                         break;
                 }
                 break;
+            }
 
             case WASM_COMP_COMPONENT_DECL_INSTANCE_EXPORTDECL:
                 inst_type_instance->exports[inst_type_instance->exports_count]
@@ -3344,7 +3387,7 @@ fill_instance_type_instance(WASMComponentTypeInstance **types,
                             ->exports[inst_type_instance->exports_count]
                             .exp.func_type =
                             inst_type_instance
-                                ->funcs[inst_type_instance->func_count];
+                                ->funcs[inst_type_instance->func_count - 1];
                         inst_type_instance->exports_count++;
                         break;
                     default:

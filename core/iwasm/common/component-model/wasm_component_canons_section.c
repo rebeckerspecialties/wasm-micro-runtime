@@ -108,6 +108,11 @@ parse_canon_opt(const uint8_t **payload, const uint8_t *end,
 {
     const uint8_t *p = *payload;
 
+    if (p >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing canon option");
+        return false;
+    }
     uint8_t tag = *p++;
     out->tag = tag;
     switch (tag) {
@@ -192,6 +197,7 @@ parse_canon_opts(const uint8_t **payload, const uint8_t *end,
                          "Failed to allocate memory for canon opts");
         return false;
     }
+    memset(*out, 0, sizeof(WASMComponentCanonOpts));
 
     uint64_t canon_opts_count = 0;
     if (!read_leb((uint8_t **)&p, end, 32, false, &canon_opts_count, error_buf,
@@ -203,11 +209,10 @@ parse_canon_opts(const uint8_t **payload, const uint8_t *end,
     (*out)->canon_opts_count = (uint32_t)canon_opts_count;
 
     if (canon_opts_count > 0) {
-        (*out)->canon_opts = wasm_runtime_malloc(sizeof(WASMComponentCanonOpt)
-                                                 * canon_opts_count);
+        (*out)->canon_opts = wasm_component_checked_calloc(
+            (uint32_t)canon_opts_count, sizeof(WASMComponentCanonOpt), p, end,
+            1, "canonical option", error_buf, error_buf_size);
         if (!(*out)->canon_opts) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for canon opts");
             free_canon_opts_struct(*out);
             *out = NULL;
             return false;
@@ -268,12 +273,17 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
 {
     const uint8_t *p = *payload;
 
+    if (p >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing canon");
+        return false;
+    }
     uint8_t tag = *p++;
     out->tag = tag;
     switch (tag) {
         case WASM_COMP_CANON_LIFT:
         { // 0x00 0x00 f:<core:funcidx> opts:<opts> ft:<typeidx>
-            if (*p != 0x00) {
+            if (p >= end || *p != 0x00) {
                 set_error_buf_ex(error_buf, error_buf_size,
                                  "Invalid canon tag: %02x", tag);
                 return false;
@@ -314,7 +324,7 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
 
         case WASM_COMP_CANON_LOWER:
         { // 0x01 0x00 f:<funcidx> opts:<opts>
-            if (*p != 0x00) {
+            if (p >= end || *p != 0x00) {
                 set_error_buf_ex(error_buf, error_buf_size,
                                  "Invalid canon tag: %02x", tag);
                 return false;
@@ -427,7 +437,7 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
 
         case WASM_COMP_CANON_CONTEXT_GET:
         { // 0x0a 0x7f i:<u32>
-            if (*p != 0x7f) {
+            if (p >= end || *p != 0x7f) {
                 set_error_buf_ex(error_buf, error_buf_size,
                                  "Invalid canon tag: %02x", tag);
                 return false;
@@ -448,7 +458,7 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
 
         case WASM_COMP_CANON_CONTEXT_SET:
         { // 0x0b 0x7f i:<u32>
-            if (*p != 0x7f) {
+            if (p >= end || *p != 0x7f) {
                 set_error_buf_ex(error_buf, error_buf_size,
                                  "Invalid canon tag: %02x", tag);
                 return false;
@@ -469,6 +479,11 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
 
         case WASM_COMP_CANON_YIELD:
         { // 0x0c cancel?:<cancel?>
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing cancel tag");
+                return false;
+            }
             uint8_t b = *p++;
             if (b == WASM_COMP_OPTIONAL_TRUE) {
                 out->canon_data.yield.cancellable = true;
@@ -486,6 +501,11 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
 
         case WASM_COMP_CANON_SUBTASK_CANCEL:
         { // 0x06 async?:<async?>
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing async tag");
+                return false;
+            }
             uint8_t b = *p++;
             if (b == WASM_COMP_OPTIONAL_TRUE) {
                 out->canon_data.subtask_cancel.async = true;
@@ -567,6 +587,11 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
             out->canon_data.stream_cancel_read_write.stream_type_idx =
                 (uint32_t)type_idx;
 
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing stream async tag");
+                return false;
+            }
             uint8_t b = *p++;
             if (b == WASM_COMP_OPTIONAL_TRUE) {
                 out->canon_data.stream_cancel_read_write.async = true;
@@ -593,6 +618,11 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
             out->canon_data.stream_cancel_read_write.stream_type_idx =
                 (uint32_t)type_idx;
 
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing stream async tag");
+                return false;
+            }
             uint8_t b = *p++;
             if (b == WASM_COMP_OPTIONAL_TRUE) {
                 out->canon_data.stream_cancel_read_write.async = true;
@@ -692,6 +722,11 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
             out->canon_data.future_cancel_read_write.future_type_idx =
                 (uint32_t)type_idx;
 
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing future async tag");
+                return false;
+            }
             uint8_t b = *p++;
             if (b == WASM_COMP_OPTIONAL_TRUE) {
                 out->canon_data.future_cancel_read_write.async = true;
@@ -718,6 +753,11 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
             out->canon_data.future_cancel_read_write.future_type_idx =
                 (uint32_t)type_idx;
 
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing future async tag");
+                return false;
+            }
             uint8_t b = *p++;
             if (b == WASM_COMP_OPTIONAL_TRUE) {
                 out->canon_data.future_cancel_read_write.async = true;
@@ -780,6 +820,11 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
 
         case WASM_COMP_CANON_WAITABLE_SET_WAIT:
         { // 0x20 cancel?:<cancel?> m:<core:memidx>
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing waitable cancel tag");
+                return false;
+            }
             uint8_t b = *p++;
             if (b == WASM_COMP_OPTIONAL_TRUE) {
                 out->canon_data.waitable_set_wait_poll.cancellable = true;
@@ -808,6 +853,11 @@ parse_single_canon(const uint8_t **payload, const uint8_t *end,
 
         case WASM_COMP_CANON_WAITABLE_SET_POLL:
         { // 0x21 cancel?:<cancel?> m:<core:memidx>
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing waitable cancel tag");
+                return false;
+            }
             uint8_t b = *p++;
             if (b == WASM_COMP_OPTIONAL_TRUE) {
                 out->canon_data.waitable_set_wait_poll.cancellable = true;
@@ -923,18 +973,14 @@ wasm_component_parse_canons_section(const uint8_t **payload,
     out->count = (uint32_t)canon_count;
 
     if (canon_count > 0) {
-        out->canons =
-            wasm_runtime_malloc(sizeof(WASMComponentCanon) * canon_count);
+        out->canons = wasm_component_checked_calloc(
+            (uint32_t)canon_count, sizeof(WASMComponentCanon), p, end, 1,
+            "canonical definition", error_buf, error_buf_size);
         if (!out->canons) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for canons");
             if (consumed_len)
                 *consumed_len = (uint32_t)(p - *payload);
             return false;
         }
-
-        // Initialize all canons to zero to avoid garbage data
-        memset(out->canons, 0, sizeof(WASMComponentCanon) * canon_count);
 
         for (uint32_t i = 0; i < canon_count; ++i) {
             // Check bounds before reading tag
@@ -948,15 +994,10 @@ wasm_component_parse_canons_section(const uint8_t **payload,
 
             if (!parse_single_canon(&p, end, &out->canons[i], error_buf,
                                     error_buf_size)) {
-                set_error_buf_ex(error_buf, error_buf_size,
-                                 "Failed to parse canon");
-                // Free previously parsed canons to avoid leaks
-                for (uint32_t j = 0; j < i; ++j) {
-                    free_single_canon_allocs(&out->canons[j]);
+                if (!error_buf || error_buf[0] == '\0') {
+                    set_error_buf_ex(error_buf, error_buf_size,
+                                     "Failed to parse canon");
                 }
-                wasm_runtime_free(out->canons);
-                out->canons = NULL;
-                out->count = 0;
                 if (consumed_len)
                     *consumed_len = (uint32_t)(p - *payload);
                 return false;
@@ -973,104 +1014,20 @@ wasm_component_parse_canons_section(const uint8_t **payload,
 void
 wasm_component_free_canons_section(WASMComponentSection *section)
 {
-    if (!section || !section->parsed.canon_section
-        || !section->parsed.canon_section->canons) {
+    if (!section || !section->parsed.canon_section) {
         return;
     }
 
     WASMComponentCanonSection *canons_section = section->parsed.canon_section;
 
-    for (uint32_t i = 0; i < canons_section->count; i++) {
-        WASMComponentCanon *canon = &canons_section->canons[i];
-
-        // Free canon options for each canon that has them
-        switch (canon->tag) {
-            case WASM_COMP_CANON_LIFT:
-                if (canon->canon_data.lift.canon_opts) {
-                    if (canon->canon_data.lift.canon_opts->canon_opts) {
-                        wasm_runtime_free(
-                            canon->canon_data.lift.canon_opts->canon_opts);
-                    }
-                    wasm_runtime_free(canon->canon_data.lift.canon_opts);
-                }
-                break;
-
-            case WASM_COMP_CANON_LOWER:
-                if (canon->canon_data.lower.canon_opts) {
-                    if (canon->canon_data.lower.canon_opts->canon_opts) {
-                        wasm_runtime_free(
-                            canon->canon_data.lower.canon_opts->canon_opts);
-                    }
-                    wasm_runtime_free(canon->canon_data.lower.canon_opts);
-                }
-                break;
-
-            case WASM_COMP_CANON_TASK_RETURN:
-                if (canon->canon_data.task_return.result_list) {
-                    if (canon->canon_data.task_return.result_list->results) {
-                        wasm_runtime_free(
-                            canon->canon_data.task_return.result_list->results);
-                    }
-                    wasm_runtime_free(
-                        canon->canon_data.task_return.result_list);
-                }
-                if (canon->canon_data.task_return.canon_opts) {
-                    if (canon->canon_data.task_return.canon_opts->canon_opts) {
-                        wasm_runtime_free(canon->canon_data.task_return
-                                              .canon_opts->canon_opts);
-                    }
-                    wasm_runtime_free(canon->canon_data.task_return.canon_opts);
-                }
-                break;
-
-            case WASM_COMP_CANON_STREAM_READ:
-            case WASM_COMP_CANON_STREAM_WRITE:
-                if (canon->canon_data.stream_read_write.canon_opts) {
-                    if (canon->canon_data.stream_read_write.canon_opts
-                            ->canon_opts) {
-                        wasm_runtime_free(canon->canon_data.stream_read_write
-                                              .canon_opts->canon_opts);
-                    }
-                    wasm_runtime_free(
-                        canon->canon_data.stream_read_write.canon_opts);
-                }
-                break;
-
-            case WASM_COMP_CANON_FUTURE_READ:
-            case WASM_COMP_CANON_FUTURE_WRITE:
-                if (canon->canon_data.future_read_write.canon_opts) {
-                    if (canon->canon_data.future_read_write.canon_opts
-                            ->canon_opts) {
-                        wasm_runtime_free(canon->canon_data.future_read_write
-                                              .canon_opts->canon_opts);
-                    }
-                    wasm_runtime_free(
-                        canon->canon_data.future_read_write.canon_opts);
-                }
-                break;
-
-            case WASM_COMP_CANON_ERROR_CONTEXT_NEW:
-            case WASM_COMP_CANON_ERROR_CONTEXT_DEBUG:
-                if (canon->canon_data.error_context_new_debug.canon_opts) {
-                    if (canon->canon_data.error_context_new_debug.canon_opts
-                            ->canon_opts) {
-                        wasm_runtime_free(
-                            canon->canon_data.error_context_new_debug
-                                .canon_opts->canon_opts);
-                    }
-                    wasm_runtime_free(
-                        canon->canon_data.error_context_new_debug.canon_opts);
-                }
-                break;
-
-            default:
-                // Other canon types don't have nested allocations
-                break;
-        }
+    for (uint32_t i = 0; i < canons_section->count && canons_section->canons;
+         i++) {
+        free_single_canon_allocs(&canons_section->canons[i]);
     }
 
     // Free the canons array itself
-    wasm_runtime_free(canons_section->canons);
+    if (canons_section->canons)
+        wasm_runtime_free(canons_section->canons);
     canons_section->canons = NULL;
     canons_section->count = 0;
     // Free the section struct and null the pointer for consistency with other

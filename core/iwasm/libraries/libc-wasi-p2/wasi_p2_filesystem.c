@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  */
 
-#include "wasi_p2_filesystem.h"
+#include "wasi_p2_filesystem_quota.h"
 
 #include <stdio.h>
 #include <time.h>
@@ -13,12 +13,320 @@
 #include <string.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <bh_common.h>
+#if !defined(__APPLE__)
 #include <sys/syscall.h>
 #include <linux/openat2.h>
+#endif
 
 #include "wasi_p2_common.h"
+#include "wasi_p2_io.h"
+
+#if defined(__APPLE__)
+/* Darwin/BSD names the nanosecond-resolution stat timestamp fields
+ * st_*timespec rather than POSIX-2008's st_*tim. Both are 'struct timespec',
+ * so a textual rename keeps every st_atim.tv_nsec etc. site working unchanged.
+ */
+#define st_atim st_atimespec
+#define st_mtim st_mtimespec
+#define st_ctim st_ctimespec
+/* macOS has no fdatasync(); fsync() flushes both data and metadata, which is a
+ * conformant (stronger-than-required) superset of fdatasync semantics. */
+#define fdatasync fsync
+#endif
+
+/*
+ * Path-taking filesystem methods are capability operations: a descriptor is
+ * the root of the namespace visible to the guest.  POSIX *at() calls do not
+ * provide that guarantee on their own because absolute paths ignore the
+ * descriptor, ".." can walk above it, and an intermediate symlink can redirect
+ * resolution elsewhere.
+ *
+ * Keep path policy in one place.  Linux opens a parent with openat2(2)'s
+ * RESOLVE_BENEATH/RESOLVE_NO_SYMLINKS policy.  Apple platforms provide the
+ * equivalent O_NOFOLLOW_ANY flag.  Once the parent directory is held by file
+ * descriptor, the final *at() operation cannot be redirected by renaming an
+ * ancestor.  Operations that intentionally inspect a final symlink (lstat,
+ * readlink, unlink, or renaming the link itself) remain possible without ever
+ * following that link.
+ */
+typedef struct wasi_beneath_path_ref_t {
+    int parent_fd;
+    WasiP2NativeFdQuotaLease parent_fd_lease;
+    char *storage;
+    const char *leaf;
+    int parent_depth;
+    bool trailing_slash;
+} wasi_beneath_path_ref_t;
+
+static int
+wasi_sandbox_error(int error)
+{
+    /* openat2 reports a beneath escape as EXDEV, while both openat2 and
+     * O_NOFOLLOW_ANY report prohibited symlink traversal as ELOOP.  Expose a
+     * stable capability error to WASI callers. */
+    return error == EXDEV || error == ELOOP ? EPERM : error;
+}
+
+static int
+wasi_validate_beneath_path(const char *path, int initial_depth,
+                           int *final_depth)
+{
+    int depth = initial_depth;
+    size_t path_len;
+
+    if (!path) {
+        return EINVAL;
+    }
+    path_len = strnlen(path, (size_t)PATH_MAX + 1);
+    if (path_len == 0) {
+        return EINVAL;
+    }
+    if (path_len > PATH_MAX) {
+        return ENAMETOOLONG;
+    }
+    if (path[0] == '/') {
+        return EPERM;
+    }
+
+    for (const char *segment = path; segment && *segment;) {
+        const char *slash = strchr(segment, '/');
+        size_t segment_len =
+            slash ? (size_t)(slash - segment) : strlen(segment);
+
+        if (segment_len == 2 && segment[0] == '.' && segment[1] == '.') {
+            if (depth == 0) {
+                return EPERM;
+            }
+            depth--;
+        }
+        else if (!(segment_len == 0
+                   || (segment_len == 1 && segment[0] == '.'))) {
+            depth++;
+        }
+        segment = slash ? slash + 1 : NULL;
+    }
+
+    if (final_depth) {
+        *final_depth = depth;
+    }
+    return WASI_ERROR_CODE_SUCCESS;
+}
+
+static int
+wasi_open_beneath_directory(int parent_fd, const char *path)
+{
+#if defined(__APPLE__)
+    return openat(parent_fd, path,
+                  O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY);
+#else
+    struct open_how how = { 0 };
+    how.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+    return syscall(SYS_openat2, parent_fd, path, &how, sizeof(how));
+#endif
+}
+
+static void
+wasi_beneath_path_ref_destroy(wasi_beneath_path_ref_t *ref)
+{
+    if (!ref) {
+        return;
+    }
+    if (ref->parent_fd >= 0) {
+        close(ref->parent_fd);
+    }
+    wasi_p2_native_fd_quota_release(&ref->parent_fd_lease);
+    wasm_runtime_free(ref->storage);
+    memset(ref, 0, sizeof(*ref));
+    ref->parent_fd = -1;
+}
+
+static int
+wasi_beneath_path_ref_init(wasm_exec_env_t exec_env, wasi_descriptor_t root_fd,
+                           const char *path, wasi_beneath_path_ref_t *ref)
+{
+    int *directory_fds = NULL;
+    WasiP2NativeFdQuotaLease *directory_fd_leases = NULL;
+    size_t directory_fd_count = 0;
+    size_t path_len;
+    char *cursor;
+    int error;
+
+    if (!ref) {
+        return EINVAL;
+    }
+    memset(ref, 0, sizeof(*ref));
+    ref->parent_fd = -1;
+
+    error = wasi_validate_beneath_path(path, 0, NULL);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        return error;
+    }
+
+    path_len = strlen(path);
+    if (path_len >= UINT_MAX) {
+        return ENAMETOOLONG;
+    }
+    ref->storage = wasm_runtime_malloc(path_len + 1);
+    if (!ref->storage) {
+        return ENOMEM;
+    }
+    memcpy(ref->storage, path, path_len + 1);
+    ref->trailing_slash = path[path_len - 1] == '/';
+
+    directory_fds =
+        wasm_runtime_malloc((uint32_t)((path_len + 1) * sizeof(int)));
+    if (!directory_fds) {
+        error = ENOMEM;
+        goto fail;
+    }
+
+    directory_fd_leases = wasm_runtime_malloc(
+        (uint32_t)((path_len + 1) * sizeof(WasiP2NativeFdQuotaLease)));
+    if (!directory_fd_leases) {
+        error = ENOMEM;
+        goto fail;
+    }
+    memset(directory_fd_leases, 0,
+           (path_len + 1) * sizeof(WasiP2NativeFdQuotaLease));
+
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1,
+                                         &directory_fd_leases[0])) {
+        error = EDQUOT;
+        goto fail;
+    }
+    directory_fds[0] = wasi_open_beneath_directory(root_fd, ".");
+    if (directory_fds[0] < 0) {
+        error = wasi_sandbox_error(errno);
+        wasi_p2_native_fd_quota_release(&directory_fd_leases[0]);
+        goto fail;
+    }
+    directory_fd_count = 1;
+
+    /* Keep each ancestor descriptor until the path is resolved.  A contained
+     * ".." pops this stack instead of asking the kernel to traverse a mutable
+     * parent relationship, so a concurrent rename cannot redirect it above
+     * root_fd.  Real components are opened before they can be canceled by a
+     * later "..", preserving openat2's existence/type/no-symlink semantics. */
+    cursor = ref->storage;
+    while (*cursor) {
+        char *segment, *segment_end, *next_segment;
+        bool is_last;
+
+        while (*cursor == '/') {
+            cursor++;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+
+        segment = cursor;
+        segment_end = segment;
+        while (*segment_end && *segment_end != '/') {
+            segment_end++;
+        }
+        next_segment = segment_end;
+        while (*next_segment == '/') {
+            next_segment++;
+        }
+        is_last = *next_segment == '\0';
+        if (*segment_end) {
+            *segment_end = '\0';
+        }
+
+        if (is_last) {
+            if (strcmp(segment, "..") == 0) {
+                directory_fd_count--;
+                close(directory_fds[directory_fd_count]);
+                wasi_p2_native_fd_quota_release(
+                    &directory_fd_leases[directory_fd_count]);
+                segment[0] = '.';
+                segment[1] = '\0';
+            }
+            ref->leaf = segment;
+            break;
+        }
+
+        if (strcmp(segment, ".") == 0) {
+            cursor = next_segment;
+            continue;
+        }
+        if (strcmp(segment, "..") == 0) {
+            directory_fd_count--;
+            close(directory_fds[directory_fd_count]);
+            wasi_p2_native_fd_quota_release(
+                &directory_fd_leases[directory_fd_count]);
+            cursor = next_segment;
+            continue;
+        }
+
+        if (!wasi_p2_native_fd_quota_reserve(
+                exec_env, 1, &directory_fd_leases[directory_fd_count])) {
+            error = EDQUOT;
+            goto fail;
+        }
+        int child_fd = wasi_open_beneath_directory(
+            directory_fds[directory_fd_count - 1], segment);
+        if (child_fd < 0) {
+            error = wasi_sandbox_error(errno);
+            wasi_p2_native_fd_quota_release(
+                &directory_fd_leases[directory_fd_count]);
+            goto fail;
+        }
+        directory_fds[directory_fd_count++] = child_fd;
+        cursor = next_segment;
+    }
+
+    if (!ref->leaf || directory_fd_count == 0) {
+        error = EINVAL;
+        goto fail;
+    }
+
+    ref->parent_fd = directory_fds[--directory_fd_count];
+    ref->parent_fd_lease = directory_fd_leases[directory_fd_count];
+    memset(&directory_fd_leases[directory_fd_count], 0,
+           sizeof(directory_fd_leases[directory_fd_count]));
+    ref->parent_depth = (int)directory_fd_count;
+    while (directory_fd_count > 0) {
+        directory_fd_count--;
+        close(directory_fds[directory_fd_count]);
+        wasi_p2_native_fd_quota_release(
+            &directory_fd_leases[directory_fd_count]);
+    }
+    wasm_runtime_free(directory_fds);
+    wasm_runtime_free(directory_fd_leases);
+    return WASI_ERROR_CODE_SUCCESS;
+
+fail:
+    while (directory_fd_count > 0) {
+        directory_fd_count--;
+        close(directory_fds[directory_fd_count]);
+        wasi_p2_native_fd_quota_release(
+            &directory_fd_leases[directory_fd_count]);
+    }
+    wasm_runtime_free(directory_fds);
+    wasm_runtime_free(directory_fd_leases);
+    wasi_beneath_path_ref_destroy(ref);
+    return error;
+}
+
+static bool
+wasi_beneath_path_ref_leaf_is_dot(const wasi_beneath_path_ref_t *ref)
+{
+    return ref && (strcmp(ref->leaf, ".") == 0 || strcmp(ref->leaf, "..") == 0);
+}
+
+static int
+wasi_beneath_path_ref_lstat(const wasi_beneath_path_ref_t *ref, struct stat *st)
+{
+    if (fstatat(ref->parent_fd, ref->leaf, st, AT_SYMLINK_NOFOLLOW) < 0) {
+        return wasi_sandbox_error(errno);
+    }
+    return WASI_ERROR_CODE_SUCCESS;
+}
 
 void
 filesystem_descriptor_dtor(void *data)
@@ -60,21 +368,19 @@ wasi_filesystem_seek_via_stream(wasi_descriptor_t fd, wasi_filesize_t offset,
         return;
     }
 
-    // Duplicate the descriptor to get a new one with an independent seek
-    // position. The new descriptor shares the same underlying file description.
-    int new_fd = dup(fd);
-    if (new_fd < 0) {
-        *err = errno;
+    if (offset > INT64_MAX || lseek(fd, 0, SEEK_CUR) < 0) {
+        *err = offset > INT64_MAX ? EOVERFLOW : errno;
         *ret = -1;
         return;
     }
 
-    // Seek the *new* descriptor to the specified absolute offset.
-    if (lseek(new_fd, offset, SEEK_SET) < 0) {
+    /* The StreamResourceType tracks its own logical position and all file
+       stream I/O uses pread/pwrite.  The duplicate owns the file lifetime but
+       never mutates the descriptor's shared kernel cursor. */
+    int new_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (new_fd < 0) {
         *err = errno;
         *ret = -1;
-        // Important: clean up the duplicated descriptor on failure.
-        close(new_fd);
         return;
     }
 
@@ -166,18 +472,10 @@ wasi_filesystem_append_via_stream(wasi_descriptor_t fd,
         return;
     }
 
-    // Duplicate the descriptor to create an independent stream handle.
-    int new_fd = dup(fd);
+    // Duplicate only for independent lifetime; append behavior is tracked in
+    // StreamResourceType and applied per write without changing shared flags.
+    int new_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (new_fd < 0) {
-        *err = errno;
-        *ret = -1;
-        return;
-    }
-
-    // Set the O_APPEND flag on the *new* descriptor. All subsequent writes
-    // to this stream will automatically go to the end of the file.
-    if (fcntl(new_fd, F_SETFL, file_flags | O_APPEND) < 0) {
-        close(new_fd); // Clean up the new descriptor on failure.
         *err = errno;
         *ret = -1;
         return;
@@ -308,28 +606,31 @@ wasi_filesystem_stat(wasi_descriptor_t fd, wasi_descriptor_stat_t *ret,
  * result.
  * @param[out] err Pointer to store the resulting WASI error code.
  */
-void
-wasi_filesystem_stat_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
-                        const char *path, wasi_descriptor_stat_t *ret, int *err)
+static void
+wasi_filesystem_stat_at_impl(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+                             wasi_path_flags_t path_flags, const char *path,
+                             wasi_descriptor_stat_t *ret, int *err)
 {
+    wasi_beneath_path_ref_t path_ref;
     if (!err || !ret || !path) {
         if (err)
             *err = EINVAL;
         return;
     }
     struct stat st;
-    int flags = 0;
 
-    // Translate WASI path flags to POSIX `fstatat` flags.
-    // If WASI's `symlink-follow` flag is NOT set, we must use POSIX's
-    // `AT_SYMLINK_NOFOLLOW` to prevent following the link.
-    if (!(path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW)) {
-        flags |= AT_SYMLINK_NOFOLLOW;
+    *err = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
+    if (*err != WASI_ERROR_CODE_SUCCESS) {
+        return;
     }
 
-    // Use fstatat to get file status relative to the base directory descriptor.
-    if (fstatat(fd, path, &st, flags) < 0) {
-        *err = errno;
+    *err = wasi_beneath_path_ref_lstat(&path_ref, &st);
+    wasi_beneath_path_ref_destroy(&path_ref);
+    if (*err != WASI_ERROR_CODE_SUCCESS) {
+        return;
+    }
+    if ((path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW) && S_ISLNK(st.st_mode)) {
+        *err = EPERM;
         return;
     }
 
@@ -337,6 +638,23 @@ wasi_filesystem_stat_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     // format.
     stat_to_wasi(&st, ret);
     *err = 0;
+}
+
+void
+wasi_filesystem_stat_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
+                        const char *path, wasi_descriptor_stat_t *ret, int *err)
+{
+    wasi_filesystem_stat_at_impl(NULL, fd, path_flags, path, ret, err);
+}
+
+void
+wasi_filesystem_stat_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                      wasi_descriptor_t fd,
+                                      wasi_path_flags_t path_flags,
+                                      const char *path,
+                                      wasi_descriptor_stat_t *ret, int *err)
+{
+    wasi_filesystem_stat_at_impl(exec_env, fd, path_flags, path, ret, err);
 }
 
 /**
@@ -403,6 +721,17 @@ int
 wasi_filesystem_advise(wasi_descriptor_t fd, wasi_filesize_t offset,
                        wasi_filesize_t length, wasi_advice_t advice)
 {
+#if defined(__APPLE__)
+    /* macOS/iOS have no posix_fadvise. The advice is purely an optional
+     * performance hint to the kernel, so ignoring it is conformant behavior.
+     * (F_RDADVISE/F_NOCACHE exist but do not map cleanly onto the WASI advice
+     * enum, so we treat advise as a successful no-op.) */
+    (void)fd;
+    (void)offset;
+    (void)length;
+    (void)advice;
+    return WASI_ERROR_CODE_SUCCESS;
+#else
     int advice_posix = 0;
 
     // Translate the abstract WASI advice enum to the corresponding POSIX
@@ -436,6 +765,7 @@ wasi_filesystem_advise(wasi_descriptor_t fd, wasi_filesize_t offset,
     }
 
     return WASI_ERROR_CODE_SUCCESS;
+#endif
 }
 
 /**
@@ -553,20 +883,29 @@ wasi_filesystem_read(wasi_descriptor_t fd, wasi_filesize_t length,
 
     ret->buf = NULL;
     ret->buf_len = 0;
+    *end_of_stream = false;
+
+    /* wasm_runtime_malloc takes uint32_t, while pread returns ssize_t and
+       accepts a signed file offset. Reject every lossy conversion before
+       allocating or entering the kernel. */
+    if (length > UINT32_MAX || length > (uint64_t)SSIZE_MAX
+        || offset > (uint64_t)INT64_MAX) {
+        *err = EOVERFLOW;
+        return;
+    }
 
     if (length == 0) {
-        *end_of_stream = false;
         *err = 0;
         return;
     }
 
-    uint8_t *buf = wasm_runtime_malloc(length);
+    uint8_t *buf = wasm_runtime_malloc((uint32_t)length);
     if (!buf) {
         *err = ENOMEM;
         return;
     }
 
-    ssize_t s = pread(fd, buf, length, offset);
+    ssize_t s = pread(fd, buf, (size_t)length, (off_t)offset);
     if (s < 0) {
         wasm_runtime_free(buf);
         *err = errno;
@@ -576,7 +915,7 @@ wasi_filesystem_read(wasi_descriptor_t fd, wasi_filesize_t length,
     if ((uint64_t)s < length) {
         *end_of_stream = true;
         if (s > 0) {
-            uint8_t *new_buf = wasm_runtime_realloc(buf, s);
+            uint8_t *new_buf = wasm_runtime_realloc(buf, (uint32_t)s);
             if (!new_buf) {
                 wasm_runtime_free(buf);
                 *err = ENOMEM;
@@ -624,12 +963,22 @@ wasi_filesystem_write(wasi_descriptor_t fd, const uint8_t *buf,
         return;
     }
 
-    // Use pwrite to write to a specific offset without changing the
-    // file descriptor's own cursor.
-    ssize_t s = pwrite(fd, buf, buf_len, offset);
+    *ret = 0;
+    if (buf_len > (uint64_t)SSIZE_MAX || offset > (uint64_t)INT64_MAX) {
+        *err = EOVERFLOW;
+        return;
+    }
+
+    /* Serialize positional descriptor writes with logical file streams and
+       truncation. In particular, an append stream must observe either the
+       file state before this write or after it, never an interleaving between
+       its EOF lookup and pwrite. */
+    wasi_p2_file_io_lock();
+    ssize_t s = pwrite(fd, buf, (size_t)buf_len, (off_t)offset);
+    int saved_error = s < 0 ? errno : 0;
+    wasi_p2_file_io_unlock();
     if (s < 0) {
-        *err = errno;
-        *ret = 0;
+        *err = saved_error;
         return;
     }
 
@@ -658,10 +1007,12 @@ wasi_filesystem_read_directory(wasi_descriptor_t fd,
         return;
     }
 
-    // Duplicate the file descriptor to create an independent handle for the new
-    // directory stream. This prevents iteration on the new stream from
-    // interfering with the original descriptor's state.
-    int new_fd = dup(fd);
+    /* dup()/F_DUPFD share one open-file description and therefore one kernel
+       directory offset. Open "." relative to the capability instead, yielding
+       a fresh OFD that cannot escape the supplied directory. This new_fd is
+       deliberately the single ownership-transfer seam for a future FD lease:
+       once opened, either fdopendir owns it or this function closes it. */
+    int new_fd = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (new_fd < 0) {
         *err = errno;
         *ret = NULL;
@@ -672,8 +1023,9 @@ wasi_filesystem_read_directory(wasi_descriptor_t fd,
     // POSIX object used for reading directory entries.
     DIR *dir = fdopendir(new_fd);
     if (!dir) {
-        close(new_fd); // Clean up the duplicated descriptor on failure.
-        *err = errno;
+        int saved_error = errno;
+        close(new_fd); // Clean up the fresh descriptor on failure.
+        *err = saved_error;
         *ret = NULL;
         return;
     }
@@ -717,12 +1069,17 @@ wasi_filesystem_sync(wasi_descriptor_t fd)
  * @param data_modification_timestamp The new data modification timestamp.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_set_times_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
-                             const char *path,
-                             wasi_new_timestamp_t data_access_timestamp,
-                             wasi_new_timestamp_t data_modification_timestamp)
+static int
+wasi_filesystem_set_times_at_impl(
+    wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+    wasi_path_flags_t path_flags, const char *path,
+    wasi_new_timestamp_t data_access_timestamp,
+    wasi_new_timestamp_t data_modification_timestamp)
 {
+    wasi_beneath_path_ref_t path_ref;
+    struct stat st;
+    int error;
+
     if (!path) {
         return EINVAL;
     }
@@ -732,18 +1089,54 @@ wasi_filesystem_set_times_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     wasi_to_timespec(data_access_timestamp, &times[0]);
     wasi_to_timespec(data_modification_timestamp, &times[1]);
 
-    int flags = 0;
-    // Translate WASI path flags to POSIX `utimensat` flags.
-    // If WASI's `symlink-follow` is NOT set, use POSIX's `AT_SYMLINK_NOFOLLOW`.
-    if (!(path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW)) {
-        flags |= AT_SYMLINK_NOFOLLOW;
+    error = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        return error;
+    }
+    error = wasi_beneath_path_ref_lstat(&path_ref, &st);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        wasi_beneath_path_ref_destroy(&path_ref);
+        return error;
+    }
+    if ((path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW) && S_ISLNK(st.st_mode)) {
+        wasi_beneath_path_ref_destroy(&path_ref);
+        return EPERM;
     }
 
-    // Call utimensat to set timestamps on the specified path relative to fd.
-    if (utimensat(fd, path, times, flags) < 0) {
-        return errno;
+    /* Never ask the kernel to follow the final component.  When the caller
+     * requested follow semantics, the lstat above accepted only a non-link;
+     * keeping AT_SYMLINK_NOFOLLOW also closes a link-swap race. */
+    if (utimensat(path_ref.parent_fd, path_ref.leaf, times, AT_SYMLINK_NOFOLLOW)
+        < 0) {
+        error = wasi_sandbox_error(errno);
+        wasi_beneath_path_ref_destroy(&path_ref);
+        return error;
     }
+    wasi_beneath_path_ref_destroy(&path_ref);
     return WASI_ERROR_CODE_SUCCESS;
+}
+
+int
+wasi_filesystem_set_times_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
+                             const char *path,
+                             wasi_new_timestamp_t data_access_timestamp,
+                             wasi_new_timestamp_t data_modification_timestamp)
+{
+    return wasi_filesystem_set_times_at_impl(NULL, fd, path_flags, path,
+                                             data_access_timestamp,
+                                             data_modification_timestamp);
+}
+
+int
+wasi_filesystem_set_times_at_with_fd_quota(
+    wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+    wasi_path_flags_t path_flags, const char *path,
+    wasi_new_timestamp_t data_access_timestamp,
+    wasi_new_timestamp_t data_modification_timestamp)
+{
+    return wasi_filesystem_set_times_at_impl(exec_env, fd, path_flags, path,
+                                             data_access_timestamp,
+                                             data_modification_timestamp);
 }
 
 /**
@@ -759,29 +1152,81 @@ wasi_filesystem_set_times_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
  * `new_fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
+static int
+wasi_filesystem_link_at_impl(wasm_exec_env_t exec_env, wasi_descriptor_t old_fd,
+                             wasi_path_flags_t old_path_flags,
+                             const char *old_path, wasi_descriptor_t new_fd,
+                             const char *new_path)
+{
+    wasi_beneath_path_ref_t old_ref, new_ref;
+    struct stat old_stat;
+    int error;
+
+    if (!old_path || !new_path) {
+        return EINVAL;
+    }
+    error = wasi_beneath_path_ref_init(exec_env, old_fd, old_path, &old_ref);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        return error;
+    }
+    error = wasi_beneath_path_ref_init(exec_env, new_fd, new_path, &new_ref);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        wasi_beneath_path_ref_destroy(&old_ref);
+        return error;
+    }
+
+    if (wasi_beneath_path_ref_leaf_is_dot(&old_ref)
+        || wasi_beneath_path_ref_leaf_is_dot(&new_ref) || old_ref.trailing_slash
+        || new_ref.trailing_slash) {
+        error = EINVAL;
+        goto done;
+    }
+    error = wasi_beneath_path_ref_lstat(&old_ref, &old_stat);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        goto done;
+    }
+    if ((old_path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW)
+        && S_ISLNK(old_stat.st_mode)) {
+        error = EPERM;
+        goto done;
+    }
+
+    /* flags=0 links a final symlink itself when follow was not requested.  It
+     * never traverses the link, including if an attacker swaps it after the
+     * lstat above. */
+    if (linkat(old_ref.parent_fd, old_ref.leaf, new_ref.parent_fd, new_ref.leaf,
+               0)
+        < 0) {
+        error = wasi_sandbox_error(errno);
+        goto done;
+    }
+    error = WASI_ERROR_CODE_SUCCESS;
+
+done:
+    wasi_beneath_path_ref_destroy(&new_ref);
+    wasi_beneath_path_ref_destroy(&old_ref);
+    return error;
+}
+
 int
 wasi_filesystem_link_at(wasi_descriptor_t old_fd,
                         wasi_path_flags_t old_path_flags, const char *old_path,
                         wasi_descriptor_t new_fd, const char *new_path)
 {
-    if (!old_path || !new_path) {
-        return EINVAL;
-    }
-    int flags = 0;
+    return wasi_filesystem_link_at_impl(NULL, old_fd, old_path_flags, old_path,
+                                        new_fd, new_path);
+}
 
-    // Translate WASI path flags to POSIX `linkat` flags.
-    // If `symlink-follow` is specified, use `AT_SYMLINK_FOLLOW` to make
-    // `linkat` operate on the target of the symbolic link.
-    if (old_path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW) {
-        flags |= AT_SYMLINK_FOLLOW;
-    }
-
-    // Call linkat to create a hard link from the source path to the new path.
-    if (linkat(old_fd, old_path, new_fd, new_path, flags) < 0) {
-        return errno;
-    }
-
-    return WASI_ERROR_CODE_SUCCESS;
+int
+wasi_filesystem_link_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                      wasi_descriptor_t old_fd,
+                                      wasi_path_flags_t old_path_flags,
+                                      const char *old_path,
+                                      wasi_descriptor_t new_fd,
+                                      const char *new_path)
+{
+    return wasi_filesystem_link_at_impl(exec_env, old_fd, old_path_flags,
+                                        old_path, new_fd, new_path);
 }
 
 /**
@@ -798,16 +1243,23 @@ wasi_filesystem_link_at(wasi_descriptor_t old_fd,
  * @param[out] ret Pointer to store the new file descriptor.
  * @param[out] err Pointer to store the resulting WASI error code.
  */
-void
-wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
-                        const char *path, wasi_open_flags_t open_flags,
-                        wasi_descriptor_flags_t flags, mode_t mode,
-                        wasi_descriptor_t *ret, int *err)
+static void
+wasi_filesystem_open_at_impl(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+                             wasi_path_flags_t path_flags, const char *path,
+                             wasi_open_flags_t open_flags,
+                             wasi_descriptor_flags_t flags, mode_t mode,
+                             wasi_descriptor_t *ret,
+                             WasiP2NativeFdQuotaLease *out_fd_lease, int *err)
 {
+    wasi_beneath_path_ref_t path_ref;
+    WasiP2NativeFdQuotaLease fd_lease = { 0 };
+
     if (ret)
         *ret = -1;
+    if (out_fd_lease)
+        memset(out_fd_lease, 0, sizeof(*out_fd_lease));
 
-    if (!path || !ret || !err) {
+    if (!path || !ret || !err || (exec_env && !out_fd_lease)) {
         if (err)
             *err = EINVAL;
         if (ret)
@@ -817,27 +1269,27 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
 
     *ret = -1;
 
-    if (!(path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW)) {
-        struct stat st;
-        if (fstatat(fd, path, &st, AT_SYMLINK_NOFOLLOW) == 0) {
-            if (S_ISLNK(st.st_mode)) {
-                if (open_flags & WASI_OPEN_FLAGS_DIRECTORY) {
-                    *err = ENOENT;
-                }
-                else {
-                    *err = ELOOP;
-                }
-                *ret = -1;
-                return;
-            }
-        }
+    *err = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
+    if (*err != WASI_ERROR_CODE_SUCCESS) {
+        return;
+    }
+    if (!wasi_p2_native_fd_quota_reserve(exec_env, 1, &fd_lease)) {
+        *err = EDQUOT;
+        wasi_beneath_path_ref_destroy(&path_ref);
+        return;
     }
 
     int internal_flags = O_CLOEXEC;
 
+#if defined(__APPLE__)
+    /* O_NOFOLLOW_ANY below already covers the final component.  Darwin
+     * rejects combining O_NOFOLLOW_ANY with O_NOFOLLOW as EINVAL. */
+    (void)path_flags;
+#else
     if (!(path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW)) {
         internal_flags |= O_NOFOLLOW;
     }
+#endif
 
     // Translate WASI open-flags to POSIX O_ flags.
     if (open_flags & WASI_OPEN_FLAGS_CREATE) {
@@ -851,6 +1303,9 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     }
     if (open_flags & WASI_OPEN_FLAGS_TRUNCATE) {
         internal_flags |= O_TRUNC;
+    }
+    if (path_ref.trailing_slash) {
+        internal_flags |= O_DIRECTORY;
     }
 
     // Translate WASI descriptor-flags (access rights) to POSIX O_ flags.
@@ -879,23 +1334,85 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     }
 #endif
 
-    struct open_how how = {0};
-    how.flags = internal_flags;
-    how.mode = (how.flags & (O_CREAT)) ? mode : 0;
-    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
-    int r = syscall(SYS_openat2, fd, path, &how, sizeof(how));
+#if defined(__APPLE__)
+    /* The held parent was reached component-by-component without following
+     * symlinks.  O_NOFOLLOW_ANY protects the remaining final component. */
+    if (internal_flags & O_TRUNC) {
+        wasi_p2_file_io_lock();
+    }
+    int r = openat(path_ref.parent_fd, path_ref.leaf,
+                   internal_flags | O_NOFOLLOW_ANY,
+                   (internal_flags & O_CREAT) ? mode : 0);
+    int saved_error = r < 0 ? errno : 0;
+    if (internal_flags & O_TRUNC) {
+        wasi_p2_file_io_unlock();
+    }
     if (r < 0) {
-        if(errno == EXDEV){
-            *err = EPERM;
-        }
-        else{
-            *err = errno;
-        }
+        /* Preserve ELOOP for the final-link error required by open-at while
+         * still normalizing a beneath escape to the WASI capability error. */
+        *err = saved_error == EXDEV ? EPERM : saved_error;
         *ret = -1;
+        wasi_p2_native_fd_quota_release(&fd_lease);
+        wasi_beneath_path_ref_destroy(&path_ref);
         return;
     }
     *err = 0;
     *ret = r;
+    if (out_fd_lease) {
+        *out_fd_lease = fd_lease;
+        memset(&fd_lease, 0, sizeof(fd_lease));
+    }
+    wasi_beneath_path_ref_destroy(&path_ref);
+#else
+    struct open_how how = { 0 };
+    how.flags = internal_flags;
+    how.mode = (how.flags & (O_CREAT)) ? mode : 0;
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+    if (internal_flags & O_TRUNC) {
+        wasi_p2_file_io_lock();
+    }
+    int r = syscall(SYS_openat2, path_ref.parent_fd, path_ref.leaf, &how,
+                    sizeof(how));
+    int saved_error = r < 0 ? errno : 0;
+    if (internal_flags & O_TRUNC) {
+        wasi_p2_file_io_unlock();
+    }
+    if (r < 0) {
+        *err = wasi_sandbox_error(saved_error);
+        *ret = -1;
+        wasi_p2_native_fd_quota_release(&fd_lease);
+        wasi_beneath_path_ref_destroy(&path_ref);
+        return;
+    }
+    *err = 0;
+    *ret = r;
+    if (out_fd_lease) {
+        *out_fd_lease = fd_lease;
+        memset(&fd_lease, 0, sizeof(fd_lease));
+    }
+    wasi_beneath_path_ref_destroy(&path_ref);
+#endif
+}
+
+void
+wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
+                        const char *path, wasi_open_flags_t open_flags,
+                        wasi_descriptor_flags_t flags, mode_t mode,
+                        wasi_descriptor_t *ret, int *err)
+{
+    wasi_filesystem_open_at_impl(NULL, fd, path_flags, path, open_flags, flags,
+                                 mode, ret, NULL, err);
+}
+
+void
+wasi_filesystem_open_at_with_fd_quota(
+    wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+    wasi_path_flags_t path_flags, const char *path,
+    wasi_open_flags_t open_flags, wasi_descriptor_flags_t flags, mode_t mode,
+    wasi_descriptor_t *ret, WasiP2NativeFdQuotaLease *out_fd_lease, int *err)
+{
+    wasi_filesystem_open_at_impl(exec_env, fd, path_flags, path, open_flags,
+                                 flags, mode, ret, out_fd_lease, err);
 }
 
 /**
@@ -909,15 +1426,29 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
  *               The caller is responsible for freeing this buffer.
  * @param[out] err Pointer to store the resulting WASI error code.
  */
-void
-wasi_filesystem_readlink_at(wasi_descriptor_t fd, const char *path, char **ret,
-                            int *err)
+static void
+wasi_filesystem_readlink_at_impl(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+                                 const char *path, char **ret, int *err)
 {
+    wasi_beneath_path_ref_t path_ref;
+
     if (!path || !ret || !err) {
         if (err)
             *err = EINVAL;
         return;
     }
+    *ret = NULL;
+    *err = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
+    if (*err != WASI_ERROR_CODE_SUCCESS) {
+        return;
+    }
+    if (wasi_beneath_path_ref_leaf_is_dot(&path_ref)
+        || path_ref.trailing_slash) {
+        wasi_beneath_path_ref_destroy(&path_ref);
+        *err = EINVAL;
+        return;
+    }
+
     char *buf = NULL;
     // Start with a reasonable initial buffer size.
     size_t buf_size = 128;
@@ -930,16 +1461,18 @@ wasi_filesystem_readlink_at(wasi_descriptor_t fd, const char *path, char **ret,
             wasm_runtime_free(buf);
             *err = ENOMEM;
             *ret = NULL;
+            wasi_beneath_path_ref_destroy(&path_ref);
             return;
         }
         buf = new_buf;
 
         // Attempt to read the symbolic link's target path.
-        s = readlinkat(fd, path, buf, buf_size);
+        s = readlinkat(path_ref.parent_fd, path_ref.leaf, buf, buf_size);
         if (s < 0) {
             wasm_runtime_free(buf);
-            *err = errno;
+            *err = wasi_sandbox_error(errno);
             *ret = NULL;
+            wasi_beneath_path_ref_destroy(&path_ref);
             return;
         }
 
@@ -958,6 +1491,23 @@ wasi_filesystem_readlink_at(wasi_descriptor_t fd, const char *path, char **ret,
     buf[s] = '\0';
     *err = 0;
     *ret = buf;
+    wasi_beneath_path_ref_destroy(&path_ref);
+}
+
+void
+wasi_filesystem_readlink_at(wasi_descriptor_t fd, const char *path, char **ret,
+                            int *err)
+{
+    wasi_filesystem_readlink_at_impl(NULL, fd, path, ret, err);
+}
+
+void
+wasi_filesystem_readlink_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                          wasi_descriptor_t fd,
+                                          const char *path, char **ret,
+                                          int *err)
+{
+    wasi_filesystem_readlink_at_impl(exec_env, fd, path, ret, err);
 }
 
 /**
@@ -1090,28 +1640,33 @@ wasi_filesystem_metadata_hash(wasi_descriptor_t fd,
  * result.
  * @param[out] err Pointer to store the resulting WASI error code.
  */
-void
-wasi_filesystem_metadata_hash_at(wasi_descriptor_t fd,
-                                 wasi_path_flags_t path_flags, const char *path,
-                                 wasi_metadata_hash_value_t *ret, int *err)
+static void
+wasi_filesystem_metadata_hash_at_impl(wasm_exec_env_t exec_env,
+                                      wasi_descriptor_t fd,
+                                      wasi_path_flags_t path_flags,
+                                      const char *path,
+                                      wasi_metadata_hash_value_t *ret, int *err)
 {
+    wasi_beneath_path_ref_t path_ref;
+
     if (!path || !ret || !err) {
         if (err)
             *err = EINVAL;
         return;
     }
     struct stat st;
-    int flags = 0;
 
-    // Translate WASI path flags to POSIX `fstatat` flags.
-    // If WASI's `symlink-follow` is NOT set, use POSIX's `AT_SYMLINK_NOFOLLOW`.
-    if (!(path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW)) {
-        flags |= AT_SYMLINK_NOFOLLOW;
+    *err = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
+    if (*err != WASI_ERROR_CODE_SUCCESS) {
+        return;
     }
-
-    // Use fstatat to get file status relative to the base directory descriptor.
-    if (fstatat(fd, path, &st, flags) < 0) {
-        *err = errno;
+    *err = wasi_beneath_path_ref_lstat(&path_ref, &st);
+    wasi_beneath_path_ref_destroy(&path_ref);
+    if (*err != WASI_ERROR_CODE_SUCCESS) {
+        return;
+    }
+    if ((path_flags & WASI_PATH_FLAGS_SYMLINK_FOLLOW) && S_ISLNK(st.st_mode)) {
+        *err = EPERM;
         return;
     }
 
@@ -1119,6 +1674,26 @@ wasi_filesystem_metadata_hash_at(wasi_descriptor_t fd,
     // 128-bit WASI metadata hash.
     stat_to_metadata_hash(&st, ret);
     *err = 0;
+}
+
+void
+wasi_filesystem_metadata_hash_at(wasi_descriptor_t fd,
+                                 wasi_path_flags_t path_flags, const char *path,
+                                 wasi_metadata_hash_value_t *ret, int *err)
+{
+    wasi_filesystem_metadata_hash_at_impl(NULL, fd, path_flags, path, ret, err);
+}
+
+void
+wasi_filesystem_metadata_hash_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                               wasi_descriptor_t fd,
+                                               wasi_path_flags_t path_flags,
+                                               const char *path,
+                                               wasi_metadata_hash_value_t *ret,
+                                               int *err)
+{
+    wasi_filesystem_metadata_hash_at_impl(exec_env, fd, path_flags, path, ret,
+                                          err);
 }
 
 /**
@@ -1308,8 +1883,10 @@ wasi_filesystem_get_flags(wasi_descriptor_t fd, wasi_descriptor_flags_t *ret,
     // Translate POSIX synchronization flags to their WASI equivalents.
     if (flags & O_DSYNC)
         f |= WASI_DESCRIPTOR_FLAGS_DATA_INTEGRITY_SYNC;
+#ifdef O_RSYNC
     if (flags & O_RSYNC)
         f |= WASI_DESCRIPTOR_FLAGS_REQUESTED_WRITE_SYNC;
+#endif
     if (flags & O_SYNC)
         f |= WASI_DESCRIPTOR_FLAGS_FILE_INTEGRITY_SYNC;
 
@@ -1329,10 +1906,19 @@ wasi_filesystem_get_flags(wasi_descriptor_t fd, wasi_descriptor_flags_t *ret,
 int
 wasi_filesystem_set_size(wasi_descriptor_t fd, wasi_filesize_t size)
 {
-    // Call the underlying POSIX ftruncate function to set the file size.
-    if (ftruncate(fd, size) < 0) {
+    if (size > (uint64_t)INT64_MAX) {
+        return EOVERFLOW;
+    }
+
+    /* Keep ftruncate atomic with respect to append-stream EOF selection and
+       positional descriptor/stream writes. */
+    wasi_p2_file_io_lock();
+    int truncate_result = ftruncate(fd, (off_t)size);
+    int saved_error = truncate_result < 0 ? errno : 0;
+    wasi_p2_file_io_unlock();
+    if (truncate_result < 0) {
         // If it fails, convert the OS-specific errno to a WASI error code.
-        return errno;
+        return saved_error;
     }
     return WASI_ERROR_CODE_SUCCESS;
 }
@@ -1347,20 +1933,50 @@ wasi_filesystem_set_size(wasi_descriptor_t fd, wasi_filesize_t size)
  * `fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_create_directory_at(wasi_descriptor_t fd, const char *path)
+static int
+wasi_filesystem_create_directory_at_impl(wasm_exec_env_t exec_env,
+                                         wasi_descriptor_t fd, const char *path)
 {
+    wasi_beneath_path_ref_t path_ref;
+    int error;
+
     if (!path) {
         return EINVAL;
     }
 
-    // Call the underlying POSIX mkdirat function. The mode is hardcoded
-    // as the WIT interface does not specify a mode parameter.
-    if (mkdirat(fd, path, 0777) < 0) {
-        return errno;
+    error = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        return error;
+    }
+    if (wasi_beneath_path_ref_leaf_is_dot(&path_ref)) {
+        error = EINVAL;
+        goto done;
     }
 
-    return WASI_ERROR_CODE_SUCCESS;
+    // The mode is hardcoded because the WIT interface has no mode parameter.
+    if (mkdirat(path_ref.parent_fd, path_ref.leaf, 0777) < 0) {
+        error = wasi_sandbox_error(errno);
+        goto done;
+    }
+    error = WASI_ERROR_CODE_SUCCESS;
+
+done:
+    wasi_beneath_path_ref_destroy(&path_ref);
+    return error;
+}
+
+int
+wasi_filesystem_create_directory_at(wasi_descriptor_t fd, const char *path)
+{
+    return wasi_filesystem_create_directory_at_impl(NULL, fd, path);
+}
+
+int
+wasi_filesystem_create_directory_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                                  wasi_descriptor_t fd,
+                                                  const char *path)
+{
+    return wasi_filesystem_create_directory_at_impl(exec_env, fd, path);
 }
 
 /**
@@ -1372,20 +1988,49 @@ wasi_filesystem_create_directory_at(wasi_descriptor_t fd, const char *path)
  * @param path The path of the directory to remove, relative to `fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_remove_directory_at(wasi_descriptor_t fd, const char *path)
+static int
+wasi_filesystem_remove_directory_at_impl(wasm_exec_env_t exec_env,
+                                         wasi_descriptor_t fd, const char *path)
 {
+    wasi_beneath_path_ref_t path_ref;
+    int error;
+
     if (!path) {
         return EINVAL;
     }
 
-    // Call the underlying POSIX unlinkat function with the AT_REMOVEDIR flag,
-    // which makes it behave like rmdir for directory removal.
-    if (unlinkat(fd, path, AT_REMOVEDIR) < 0) {
-        return errno;
+    error = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        return error;
+    }
+    if (wasi_beneath_path_ref_leaf_is_dot(&path_ref)) {
+        error = EINVAL;
+        goto done;
     }
 
-    return WASI_ERROR_CODE_SUCCESS;
+    if (unlinkat(path_ref.parent_fd, path_ref.leaf, AT_REMOVEDIR) < 0) {
+        error = wasi_sandbox_error(errno);
+        goto done;
+    }
+    error = WASI_ERROR_CODE_SUCCESS;
+
+done:
+    wasi_beneath_path_ref_destroy(&path_ref);
+    return error;
+}
+
+int
+wasi_filesystem_remove_directory_at(wasi_descriptor_t fd, const char *path)
+{
+    return wasi_filesystem_remove_directory_at_impl(NULL, fd, path);
+}
+
+int
+wasi_filesystem_remove_directory_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                                  wasi_descriptor_t fd,
+                                                  const char *path)
+{
+    return wasi_filesystem_remove_directory_at_impl(exec_env, fd, path);
 }
 
 /**
@@ -1397,20 +2042,50 @@ wasi_filesystem_remove_directory_at(wasi_descriptor_t fd, const char *path)
  * @param path The path of the file to remove, relative to `fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_unlink_file_at(wasi_descriptor_t fd, const char *path)
+static int
+wasi_filesystem_unlink_file_at_impl(wasm_exec_env_t exec_env,
+                                    wasi_descriptor_t fd, const char *path)
 {
+    wasi_beneath_path_ref_t path_ref;
+    int error;
+
     if (!path) {
         return EINVAL;
     }
 
-    // Call the underlying POSIX unlinkat function with a flag of 0
-    // to specify file removal.
-    if (unlinkat(fd, path, 0) < 0) {
-        return errno;
+    error = wasi_beneath_path_ref_init(exec_env, fd, path, &path_ref);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        return error;
+    }
+    if (wasi_beneath_path_ref_leaf_is_dot(&path_ref)
+        || path_ref.trailing_slash) {
+        error = EINVAL;
+        goto done;
     }
 
-    return WASI_ERROR_CODE_SUCCESS;
+    if (unlinkat(path_ref.parent_fd, path_ref.leaf, 0) < 0) {
+        error = wasi_sandbox_error(errno);
+        goto done;
+    }
+    error = WASI_ERROR_CODE_SUCCESS;
+
+done:
+    wasi_beneath_path_ref_destroy(&path_ref);
+    return error;
+}
+
+int
+wasi_filesystem_unlink_file_at(wasi_descriptor_t fd, const char *path)
+{
+    return wasi_filesystem_unlink_file_at_impl(NULL, fd, path);
+}
+
+int
+wasi_filesystem_unlink_file_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                             wasi_descriptor_t fd,
+                                             const char *path)
+{
+    return wasi_filesystem_unlink_file_at_impl(exec_env, fd, path);
 }
 
 /**
@@ -1424,21 +2099,65 @@ wasi_filesystem_unlink_file_at(wasi_descriptor_t fd, const char *path)
  * @param new_path The new path for the object, relative to `new_fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_rename_at(wasi_descriptor_t old_fd, const char *old_path,
-                          wasi_descriptor_t new_fd, const char *new_path)
+static int
+wasi_filesystem_rename_at_impl(wasm_exec_env_t exec_env,
+                               wasi_descriptor_t old_fd, const char *old_path,
+                               wasi_descriptor_t new_fd, const char *new_path)
 {
+    wasi_beneath_path_ref_t old_ref, new_ref;
+    int error;
+
     if (!old_path || !new_path) {
         return EINVAL;
     }
 
-    // Call the underlying POSIX renameat function to atomically rename/move the
-    // object.
-    if (renameat(old_fd, old_path, new_fd, new_path) < 0) {
-        return errno;
+    error = wasi_beneath_path_ref_init(exec_env, old_fd, old_path, &old_ref);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        return error;
+    }
+    error = wasi_beneath_path_ref_init(exec_env, new_fd, new_path, &new_ref);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        wasi_beneath_path_ref_destroy(&old_ref);
+        return error;
+    }
+    if (wasi_beneath_path_ref_leaf_is_dot(&old_ref)
+        || wasi_beneath_path_ref_leaf_is_dot(&new_ref) || old_ref.trailing_slash
+        || new_ref.trailing_slash) {
+        error = EINVAL;
+        goto done;
     }
 
-    return WASI_ERROR_CODE_SUCCESS;
+    if (renameat(old_ref.parent_fd, old_ref.leaf, new_ref.parent_fd,
+                 new_ref.leaf)
+        < 0) {
+        error = wasi_sandbox_error(errno);
+        goto done;
+    }
+    error = WASI_ERROR_CODE_SUCCESS;
+
+done:
+    wasi_beneath_path_ref_destroy(&new_ref);
+    wasi_beneath_path_ref_destroy(&old_ref);
+    return error;
+}
+
+int
+wasi_filesystem_rename_at(wasi_descriptor_t old_fd, const char *old_path,
+                          wasi_descriptor_t new_fd, const char *new_path)
+{
+    return wasi_filesystem_rename_at_impl(NULL, old_fd, old_path, new_fd,
+                                          new_path);
+}
+
+int
+wasi_filesystem_rename_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                        wasi_descriptor_t old_fd,
+                                        const char *old_path,
+                                        wasi_descriptor_t new_fd,
+                                        const char *new_path)
+{
+    return wasi_filesystem_rename_at_impl(exec_env, old_fd, old_path, new_fd,
+                                          new_path);
 }
 
 /**
@@ -1453,18 +2172,57 @@ wasi_filesystem_rename_at(wasi_descriptor_t old_fd, const char *old_path,
  * relative to `fd`.
  * @return A WASI error code, `SUCCESS` on success.
  */
-int
-wasi_filesystem_symlink_at(wasi_descriptor_t fd, const char *old_path,
-                           const char *new_path)
+static int
+wasi_filesystem_symlink_at_impl(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
+                                const char *old_path, const char *new_path)
 {
+    wasi_beneath_path_ref_t new_ref;
+    int error;
+
     if (!old_path || !new_path) {
         return EINVAL;
     }
 
-    // Call the underlying POSIX symlinkat function to create the symbolic link.
-    if (symlinkat(old_path, fd, new_path) < 0) {
-        return errno;
+    error = wasi_beneath_path_ref_init(exec_env, fd, new_path, &new_ref);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        return error;
+    }
+    if (wasi_beneath_path_ref_leaf_is_dot(&new_ref) || new_ref.trailing_slash) {
+        error = EINVAL;
+        goto done;
     }
 
-    return WASI_ERROR_CODE_SUCCESS;
+    /* A relative symlink target is interpreted from the new link's parent.
+     * Seed validation with that parent's depth so "../peer" can stay inside a
+     * nested preopen while an absolute or root-escaping target is rejected. */
+    error = wasi_validate_beneath_path(old_path, new_ref.parent_depth, NULL);
+    if (error != WASI_ERROR_CODE_SUCCESS) {
+        goto done;
+    }
+
+    if (symlinkat(old_path, new_ref.parent_fd, new_ref.leaf) < 0) {
+        error = wasi_sandbox_error(errno);
+        goto done;
+    }
+    error = WASI_ERROR_CODE_SUCCESS;
+
+done:
+    wasi_beneath_path_ref_destroy(&new_ref);
+    return error;
+}
+
+int
+wasi_filesystem_symlink_at(wasi_descriptor_t fd, const char *old_path,
+                           const char *new_path)
+{
+    return wasi_filesystem_symlink_at_impl(NULL, fd, old_path, new_path);
+}
+
+int
+wasi_filesystem_symlink_at_with_fd_quota(wasm_exec_env_t exec_env,
+                                         wasi_descriptor_t fd,
+                                         const char *old_path,
+                                         const char *new_path)
+{
+    return wasi_filesystem_symlink_at_impl(exec_env, fd, old_path, new_path);
 }

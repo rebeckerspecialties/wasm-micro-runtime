@@ -7,9 +7,36 @@
 
 #include <stdlib.h>
 #include <errno.h>
+#include <limits.h>
+#include <sys/types.h>
+#include <unistd.h>
+#if !defined(__APPLE__)
 #include <sys/random.h>
+#endif
 #include <pthread.h>
 #include "wasm_export.h"
+
+#if defined(__APPLE__)
+/*
+ * Apple platforms (macOS/iOS/tvOS/watchOS/visionOS) do not provide the Linux
+ * getrandom() syscall. arc4random_buf() is available across Apple's supported
+ * SDKs and provides cryptographically secure random bytes without an extra
+ * framework dependency. Wrap it in a getrandom()-style shim so the call sites
+ * below keep their ssize_t/loop semantics unchanged.
+ */
+static ssize_t
+getrandom(void *buf, size_t buflen, unsigned int flags)
+{
+    size_t chunk = buflen;
+
+    (void)flags;
+    if (chunk > SSIZE_MAX) {
+        chunk = SSIZE_MAX;
+    }
+    arc4random_buf(buf, chunk);
+    return (ssize_t)chunk;
+}
+#endif
 
 // wasi:random
 
@@ -30,6 +57,12 @@ wasi_random_get_random_bytes(uint64_t len, wasi_list_u8_t *ret)
     size_t offset = 0;
 
     if (!ret) {
+        return;
+    }
+
+    if (len == 0) {
+        ret->buf = NULL;
+        ret->buf_len = 0;
         return;
     }
 
@@ -95,14 +128,12 @@ static pthread_mutex_t insecure_seed_mutex = PTHREAD_MUTEX_INITIALIZER;
  *          cryptographically-secure random number generator.
  */
 static void
-ensure_insecure_seed_initialized()
+ensure_insecure_seed_initialized_locked(void)
 {
-    pthread_mutex_lock(&insecure_seed_mutex);
     if (!insecure_seed_initialized) {
         insecure_seed = (unsigned int)wasi_random_get_random_u64();
         insecure_seed_initialized = true;
     }
-    pthread_mutex_unlock(&insecure_seed_mutex);
 }
 
 /**
@@ -122,16 +153,23 @@ wasi_random_get_insecure_random_bytes(uint64_t len, wasi_list_u8_t *ret)
         return;
     }
 
-    ensure_insecure_seed_initialized();
+    if (len == 0) {
+        ret->buf = NULL;
+        ret->buf_len = 0;
+        return;
+    }
 
     ret->buf = wasm_runtime_malloc(len);
     if (!ret->buf) {
         ret->buf_len = 0;
         return;
     }
+    pthread_mutex_lock(&insecure_seed_mutex);
+    ensure_insecure_seed_initialized_locked();
     for (uint64_t i = 0; i < len; i++) {
         ret->buf[i] = rand_r(&insecure_seed);
     }
+    pthread_mutex_unlock(&insecure_seed_mutex);
     ret->buf_len = len;
 }
 
@@ -144,13 +182,15 @@ wasi_random_get_insecure_random_bytes(uint64_t len, wasi_list_u8_t *ret)
 uint64_t
 wasi_random_get_insecure_random_u64(void)
 {
-    ensure_insecure_seed_initialized();
-
     uint64_t val;
     uint8_t *p = (uint8_t *)&val;
+
+    pthread_mutex_lock(&insecure_seed_mutex);
+    ensure_insecure_seed_initialized_locked();
     for (size_t i = 0; i < sizeof(val); i++) {
         p[i] = rand_r(&insecure_seed);
     }
+    pthread_mutex_unlock(&insecure_seed_mutex);
     return val;
 }
 

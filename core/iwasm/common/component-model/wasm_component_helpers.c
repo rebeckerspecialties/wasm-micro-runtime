@@ -28,11 +28,69 @@ set_error_buf_ex(char *error_buf, uint32_t error_buf_size, const char *format,
     }
 }
 
+void *
+wasm_component_checked_calloc(uint32_t count, uint32_t element_size,
+                              const uint8_t *payload, const uint8_t *end,
+                              uint32_t min_element_size,
+                              const char *description, char *error_buf,
+                              uint32_t error_buf_size)
+{
+    uint64_t allocation_size;
+    void *result;
+
+    if (count == 0 || element_size == 0) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Invalid %s array dimensions",
+                         description ? description : "component parser");
+        return NULL;
+    }
+
+    if (payload || end) {
+        if (!payload || !end || payload > end) {
+            set_error_buf_ex(error_buf, error_buf_size,
+                             "Invalid payload bounds for %s array",
+                             description ? description : "component parser");
+            return NULL;
+        }
+        if (min_element_size > 0
+            && (uint64_t)count > (uint64_t)(end - payload) / min_element_size) {
+            set_error_buf_ex(error_buf, error_buf_size,
+                             "%s count %u exceeds remaining payload",
+                             description ? description : "Component parser",
+                             count);
+            return NULL;
+        }
+    }
+
+    allocation_size = (uint64_t)count * element_size;
+    if (allocation_size > UINT32_MAX) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "%s array is too large (%u elements)",
+                         description ? description : "Component parser", count);
+        return NULL;
+    }
+
+    result = wasm_runtime_malloc((uint32_t)allocation_size);
+    if (!result) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Failed to allocate %s array",
+                         description ? description : "component parser");
+        return NULL;
+    }
+    memset(result, 0, (uint32_t)allocation_size);
+    return result;
+}
+
 bool
 parse_result_list(const uint8_t **payload, const uint8_t *end,
                   WASMComponentResultList **out, char *error_buf,
                   uint32_t error_buf_size)
 {
+    if (!payload || !*payload || !out || *payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing result list");
+        return false;
+    }
     const uint8_t *p = *payload;
 
     // Allocate memory for the result list structure
@@ -74,6 +132,11 @@ parse_result_list(const uint8_t **payload, const uint8_t *end,
         {
             (*out)->results = NULL;
             // Binary.md encodes empty resultlist as 0x01 0x00
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing empty result list terminator");
+                return false;
+            }
             uint8_t terminator = *p++;
             if (terminator != 0x00) {
                 set_error_buf_ex(error_buf, error_buf_size,
@@ -99,12 +162,18 @@ bool
 parse_sort(const uint8_t **payload, const uint8_t *end, WASMComponentSort *out,
            char *error_buf, uint32_t error_buf_size, bool is_core)
 {
-    if (!payload || !*payload || !out || !end) {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
         set_error_buf_ex(error_buf, error_buf_size,
-                         "Invalid payload or output pointer");
+                         "Unexpected end while parsing sort");
         return false;
     }
     const uint8_t *p = *payload;
+
+    if (p >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end of buffer when parsing sort");
+        return false;
+    }
 
     if (!is_core) {
         // Read the first byte, which is the main sort
@@ -197,6 +266,7 @@ parse_sort_idx(const uint8_t **payload, const uint8_t *end,
         parse_sort(payload, end, out->sort, error_buf, error_buf_size, is_core);
     if (!status) {
         wasm_runtime_free(out->sort);
+        out->sort = NULL;
         return false;
     }
 
@@ -205,6 +275,7 @@ parse_sort_idx(const uint8_t **payload, const uint8_t *end,
     if (!read_leb((uint8_t **)payload, end, 32, false, &idx_leb, error_buf,
                   error_buf_size)) {
         wasm_runtime_free(out->sort);
+        out->sort = NULL;
         return false;
     }
 
@@ -225,6 +296,12 @@ parse_extern_desc(const uint8_t **payload, const uint8_t *end,
 
     const uint8_t *p = *payload;
 
+    if (p >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Unexpected end while parsing extern descriptor");
+        return false;
+    }
+
     out->type = *p++;
 
     switch (out->type) {
@@ -232,6 +309,11 @@ parse_extern_desc(const uint8_t **payload, const uint8_t *end,
         {
             // 0x00 0x11 i:<core:typeidx> => (core module (type i))
             // Read type_specific byte (should be 0x11)
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing core module descriptor type");
+                return false;
+            }
             uint8_t type_specific = *p++;
             if (type_specific != 0x11) {
                 *payload = p; // Update pointer even on error
@@ -267,6 +349,11 @@ parse_extern_desc(const uint8_t **payload, const uint8_t *end,
             // valuebound ::= 0x00 i:<valueidx> => (eq i)
             //             | 0x01 t:<valtype> => t
             // Read value bound tag (0x00 = eq, 0x01 = type)
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing value bound tag");
+                return false;
+            }
             uint8_t value_bound_tag = *p++;
             out->extern_desc.value.value_bound =
                 wasm_runtime_malloc(sizeof(WASMComponentValueBound));
@@ -286,6 +373,7 @@ parse_extern_desc(const uint8_t **payload, const uint8_t *end,
                     if (!read_leb((uint8_t **)&p, end, 32, false, &value_idx,
                                   error_buf, error_buf_size)) {
                         wasm_runtime_free(out->extern_desc.value.value_bound);
+                        out->extern_desc.value.value_bound = NULL;
                         *payload = p; // Update pointer even on error
                         return false;
                     }
@@ -304,6 +392,7 @@ parse_extern_desc(const uint8_t **payload, const uint8_t *end,
                             error_buf, error_buf_size,
                             "Failed to allocate memory for value_type");
                         wasm_runtime_free(out->extern_desc.value.value_bound);
+                        out->extern_desc.value.value_bound = NULL;
                         *payload = p; // Update pointer even on error
                         return false;
                     }
@@ -315,7 +404,10 @@ parse_extern_desc(const uint8_t **payload, const uint8_t *end,
                                        error_buf, error_buf_size)) {
                         wasm_runtime_free(out->extern_desc.value.value_bound
                                               ->bound.value_type);
+                        out->extern_desc.value.value_bound->bound.value_type =
+                            NULL;
                         wasm_runtime_free(out->extern_desc.value.value_bound);
+                        out->extern_desc.value.value_bound = NULL;
                         *payload = p; // Update pointer even on error
                         return false;
                     }
@@ -327,6 +419,7 @@ parse_extern_desc(const uint8_t **payload, const uint8_t *end,
                                      "Unknown value bound tag: 0x%02X",
                                      value_bound_tag);
                     wasm_runtime_free(out->extern_desc.value.value_bound);
+                    out->extern_desc.value.value_bound = NULL;
                     *payload = p; // Update pointer even on error
                     return false;
                 }
@@ -338,6 +431,11 @@ parse_extern_desc(const uint8_t **payload, const uint8_t *end,
             // Parse typebound for extern_desc type
             // typebound ::= 0x00 i:<typeidx> => (eq i)
             //            | 0x01            => (sub resource)
+            if (p >= end) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "Missing type bound tag");
+                return false;
+            }
             uint8_t type_bound_tag = *p++;
             out->extern_desc.type.type_bound =
                 wasm_runtime_malloc(sizeof(WASMComponentTypeBound));
@@ -357,6 +455,7 @@ parse_extern_desc(const uint8_t **payload, const uint8_t *end,
                 if (!read_leb((uint8_t **)&p, end, 32, false, &type_idx,
                               error_buf, error_buf_size)) {
                     wasm_runtime_free(out->extern_desc.type.type_bound);
+                    out->extern_desc.type.type_bound = NULL;
                     *payload = p; // Update pointer even on error
                     return false;
                 }
@@ -369,6 +468,7 @@ parse_extern_desc(const uint8_t **payload, const uint8_t *end,
                                  "Invalid typebound tag: 0x%02x",
                                  type_bound_tag);
                 wasm_runtime_free(out->extern_desc.type.type_bound);
+                out->extern_desc.type.type_bound = NULL;
                 *payload = p;
                 return false;
             }
@@ -565,9 +665,9 @@ parse_component_import_name(const uint8_t **payload, const uint8_t *end,
                             WASMComponentImportName *out, char *error_buf,
                             uint32_t error_buf_size)
 {
-    if (!payload || !*payload || !out || !end) {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
         set_error_buf_ex(error_buf, error_buf_size,
-                         "Invalid payload or output pointer");
+                         "Unexpected end while parsing import name");
         return false;
     }
 
@@ -657,9 +757,9 @@ parse_component_export_name(const uint8_t **payload, const uint8_t *end,
                             WASMComponentExportName *out, char *error_buf,
                             uint32_t error_buf_size)
 {
-    if (!payload || !*payload || !out || !end) {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
         set_error_buf_ex(error_buf, error_buf_size,
-                         "Invalid payload or output pointer");
+                         "Unexpected end while parsing export name");
         return false;
     }
 
@@ -874,9 +974,9 @@ parse_valtype(const uint8_t **payload, const uint8_t *end,
               WASMComponentValueType *out, char *error_buf,
               uint32_t error_buf_size)
 {
-    if (!payload || !*payload || !out || !end) {
+    if (!payload || !*payload || !out || !end || *payload >= end) {
         set_error_buf_ex(error_buf, error_buf_size,
-                         "Invalid payload or output pointer");
+                         "Unexpected end while parsing value type");
         return false;
     }
 
@@ -922,8 +1022,6 @@ parse_labelvaltype(const uint8_t **payload, const uint8_t *end,
     // Parse the value type (required)
     out->value_type = wasm_runtime_malloc(sizeof(WASMComponentValueType));
     if (!out->value_type) {
-        free_core_name(out->label);
-        wasm_runtime_free(out->label);
         set_error_buf_ex(error_buf, error_buf_size,
                          "Failed to allocate memory for label value type");
         return false;
@@ -931,11 +1029,6 @@ parse_labelvaltype(const uint8_t **payload, const uint8_t *end,
     memset(out->value_type, 0, sizeof(WASMComponentValueType));
     if (!parse_valtype(payload, end, out->value_type, error_buf,
                        error_buf_size)) {
-        wasm_runtime_free(out->value_type);
-        out->value_type = NULL;
-        free_core_name(out->label);
-        wasm_runtime_free(out->label);
-        out->label = NULL;
         return false;
     }
 
@@ -960,6 +1053,11 @@ parse_case(const uint8_t **payload, const uint8_t *end,
     }
 
     // Parse optional valtype
+    if (*payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "Missing case optional value type tag");
+        return false;
+    }
     uint8_t optional_tag = *(*payload)++;
 
     if (optional_tag == WASM_COMP_OPTIONAL_TRUE) {
@@ -968,14 +1066,11 @@ parse_case(const uint8_t **payload, const uint8_t *end,
         if (!out->value_type) {
             set_error_buf_ex(error_buf, error_buf_size,
                              "Failed to allocate memory for case value type");
-            free_core_name(out->label);
             return false;
         }
 
         if (!parse_valtype(payload, end, out->value_type, error_buf,
                            error_buf_size)) {
-            wasm_runtime_free(out->value_type);
-            free_core_name(out->label);
             return false;
         }
     }
@@ -991,15 +1086,15 @@ parse_case(const uint8_t **payload, const uint8_t *end,
     }
 
     // Parse the ending 0x00
+    if (*payload >= end) {
+        set_error_buf_ex(error_buf, error_buf_size, "Missing case terminator");
+        return false;
+    }
     uint8_t ending_byte = *(*payload)++;
     if (ending_byte != WASM_COMP_CASE_END) {
         set_error_buf_ex(error_buf, error_buf_size,
                          "Expected 0x00 at end of case, got 0x%02x",
                          ending_byte);
-        if (out->value_type) {
-            wasm_runtime_free(out->value_type);
-        }
-        free_core_name(out->label);
         return false;
     }
 
@@ -1046,8 +1141,6 @@ parse_label_prime(const uint8_t **payload, const uint8_t *end,
     // Allocate and copy the label string
     (*out)->name = wasm_runtime_malloc(len + 1);
     if (!(*out)->name) {
-        wasm_runtime_free(*out);
-        *out = NULL;
         set_error_buf_ex(error_buf, error_buf_size,
                          "Failed to allocate memory for label string");
         return false;
@@ -1135,17 +1228,12 @@ parse_label_prime_vector(const uint8_t **payload, const uint8_t *end,
     uint32_t count = (uint32_t)count_leb;
 
     if (count > 0) {
-        // Allocate the labels array
-        *out_labels =
-            wasm_runtime_malloc(sizeof(WASMComponentCoreName) * count);
+        *out_labels = wasm_component_checked_calloc(
+            count, sizeof(WASMComponentCoreName), p, end, 1, "component label",
+            error_buf, error_buf_size);
         if (!*out_labels) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for labels array");
             return false;
         }
-
-        // Initialize to zero
-        memset(*out_labels, 0, sizeof(WASMComponentCoreName) * count);
 
         // Parse each label
         for (uint32_t i = 0; i < count; i++) {

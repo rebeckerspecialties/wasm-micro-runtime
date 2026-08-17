@@ -13,6 +13,7 @@
 #include "../wave-parser/wave_adapter.h"
 #include "wasm_component_task.h"
 #include "wasm_export.h"
+#include "wasm_allocation_quota.h"
 
 static bool
 check_main_func_type(const WASMFuncType *type, bool is_memory64)
@@ -59,6 +60,669 @@ wasm_component_set_exception(WASMComponentInstance *comp_inst,
     }
     else {
         comp_inst->cur_exception[0] = '\0';
+    }
+}
+
+/*
+ * A prepared call owns all scratch storage required to bridge wasm_val_t to
+ * the interpreter's cell ABI.  This is deliberately opaque to embedders: a
+ * generated binding resolves it once and can then call without WAVE parsing,
+ * WIT-value allocation, or per-call runtime allocation.
+ */
+struct WASMComponentPreparedCall {
+    WASMComponentInstance *component_inst;
+    WASMFunctionInstance *core_func;
+    WASMExecEnv *exec_env;
+    WASMFunctionInstance *post_return_func;
+    WASMExecEnv *post_return_exec_env;
+    uint32 param_count;
+    uint32 result_count;
+    uint32 param_cell_count;
+    uint32 result_cell_count;
+    wasm_valkind_t param_kinds[MAX_FLAT_TYPES];
+    wasm_valkind_t result_kinds[MAX_FLAT_TYPES];
+    uint32 argv_cells[MAX_FLAT_TYPES * 2];
+    korp_tid owner_thread;
+    bool call_active;
+    bool post_return_pending;
+};
+
+static bool
+prepared_call_owner_graph_is_valid(
+    const WASMComponentPreparedCall *prepared_call)
+{
+    if (!prepared_call || !prepared_call->component_inst
+        || !prepared_call->core_func || !prepared_call->exec_env
+        || !prepared_call->core_func->module_instance
+        || !wasm_allocation_quota_allocations_share_owner(
+            prepared_call, prepared_call->component_inst)
+        || !wasm_allocation_quota_allocations_share_owner(
+            prepared_call, prepared_call->core_func->module_instance)
+        || !wasm_allocation_quota_allocations_share_owner(
+            prepared_call, prepared_call->exec_env)) {
+        return false;
+    }
+    if (prepared_call->post_return_func
+        && (!prepared_call->post_return_exec_env
+            || !prepared_call->post_return_func->module_instance
+            || !wasm_allocation_quota_allocations_share_owner(
+                prepared_call, prepared_call->post_return_func->module_instance)
+            || !wasm_allocation_quota_allocations_share_owner(
+                prepared_call, prepared_call->post_return_exec_env))) {
+        return false;
+    }
+    return true;
+}
+
+static bool
+prepared_call_is_on_owner_thread(const WASMComponentPreparedCall *prepared_call)
+{
+    return prepared_call && prepared_call->owner_thread == os_self_thread();
+}
+
+static void
+set_prepared_call_error(WASMComponentInstance *component_inst, char *error_buf,
+                        uint32 error_buf_size, const char *message)
+{
+    if (component_inst) {
+        wasm_component_set_exception(component_inst, message);
+    }
+    if (error_buf && error_buf_size > 0) {
+        snprintf(error_buf, error_buf_size, "%s", message);
+    }
+}
+
+static bool
+prepared_call_kind(uint8 value_type, wasm_valkind_t *kind, uint32 *cell_count)
+{
+    switch (value_type) {
+        case VALUE_TYPE_I32:
+            *kind = WASM_I32;
+            *cell_count = 1;
+            return true;
+        case VALUE_TYPE_I64:
+            *kind = WASM_I64;
+            *cell_count = 2;
+            return true;
+        case VALUE_TYPE_F32:
+            *kind = WASM_F32;
+            *cell_count = 1;
+            return true;
+        case VALUE_TYPE_F64:
+            *kind = WASM_F64;
+            *cell_count = 2;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool
+prepare_flat_signature(WASMFuncType *type, wasm_valkind_t param_kinds[],
+                       wasm_valkind_t result_kinds[], uint32 *param_cells,
+                       uint32 *result_cells)
+{
+    uint32 i, cells;
+
+    if (!type || type->param_count > MAX_FLAT_TYPES
+        || type->result_count > MAX_FLAT_TYPES) {
+        return false;
+    }
+
+    *param_cells = 0;
+    for (i = 0; i < type->param_count; i++) {
+        if (!prepared_call_kind(type->types[i], &param_kinds[i], &cells)) {
+            return false;
+        }
+        *param_cells += cells;
+    }
+
+    *result_cells = 0;
+    for (i = 0; i < type->result_count; i++) {
+        if (!prepared_call_kind(type->types[type->param_count + i],
+                                &result_kinds[i], &cells)) {
+            return false;
+        }
+        *result_cells += cells;
+    }
+
+    return *param_cells == type->param_cell_num
+           && *result_cells == type->ret_cell_num
+           && *param_cells <= MAX_FLAT_TYPES * 2
+           && *result_cells <= MAX_FLAT_TYPES * 2;
+}
+
+static WASMComponentPreparedCall *
+prepare_export_call(WASMComponentInstance *component_inst,
+                    const char *interface_name, const char *export_name,
+                    char *error_buf, uint32 error_buf_size)
+{
+    WASMAllocationQuotaScope quota_scope;
+    WASMComponentFunctionInstance *target_func;
+    WASMComponentPreparedCall *prepared_call = NULL;
+    WASMComponentPreparedCall *result = NULL;
+    WASMFuncType *type, *post_return_type;
+    uint32 module_type, post_param_cells = 0, post_result_cells = 0;
+    wasm_valkind_t post_param_kinds[MAX_FLAT_TYPES];
+    wasm_valkind_t post_result_kinds[MAX_FLAT_TYPES];
+    bool operation_active = false;
+
+    if (!component_inst || !export_name) {
+        set_prepared_call_error(component_inst, error_buf, error_buf_size,
+                                "component: invalid prepared call arguments");
+        return NULL;
+    }
+    if (!wasm_component_instance_begin_operation(component_inst)) {
+        set_prepared_call_error(component_inst, error_buf, error_buf_size,
+                                "component: instance is being destroyed");
+        return NULL;
+    }
+    operation_active = true;
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&quota_scope,
+                                                          component_inst)) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: prepared call allocation owner could not be "
+            "established");
+        wasm_component_instance_end_operation(component_inst);
+        return NULL;
+    }
+
+    target_func =
+        interface_name
+            ? wasm_component_lookup_function_qualified(
+                component_inst, interface_name, export_name)
+            : wasm_component_lookup_function(component_inst, export_name);
+    if (!target_func || !target_func->core_func
+        || !target_func->core_func->module_instance) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            interface_name
+                ? "component: qualified prepared export lookup failed"
+                : "component: prepared export lookup failed");
+        goto fail;
+    }
+    if (!wasm_allocation_quota_allocations_share_owner(
+            component_inst, target_func->core_func->module_instance)) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: prepared export has a different allocation owner");
+        goto fail;
+    }
+
+    if (target_func->canon_options && target_func->canon_options->async) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: prepared calls require a synchronous export");
+        goto fail;
+    }
+
+    prepared_call = wasm_runtime_malloc(sizeof(*prepared_call));
+    if (!prepared_call) {
+        set_prepared_call_error(component_inst, error_buf, error_buf_size,
+                                "component: failed to allocate prepared call");
+        goto fail;
+    }
+    memset(prepared_call, 0, sizeof(*prepared_call));
+
+    prepared_call->component_inst = component_inst;
+    prepared_call->core_func = target_func->core_func;
+    module_type = target_func->core_func->module_instance->module_type;
+    type = wasm_runtime_get_function_type(target_func->core_func, module_type);
+    if (!prepare_flat_signature(type, prepared_call->param_kinds,
+                                prepared_call->result_kinds,
+                                &prepared_call->param_cell_count,
+                                &prepared_call->result_cell_count)) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: export has a non-flat or unsupported core signature");
+        goto fail;
+    }
+    prepared_call->param_count = type->param_count;
+    prepared_call->result_count = type->result_count;
+
+    prepared_call->exec_env = wasm_runtime_get_exec_env_singleton(
+        (WASMModuleInstanceCommon *)target_func->core_func->module_instance);
+    if (!prepared_call->exec_env) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: failed to create prepared execution environment");
+        goto fail;
+    }
+
+    if (target_func->canon_options
+        && target_func->canon_options->post_return_func) {
+        prepared_call->post_return_func =
+            target_func->canon_options->post_return_func;
+        if (!prepared_call->post_return_func->module_instance
+            || !wasm_allocation_quota_allocations_share_owner(
+                component_inst,
+                prepared_call->post_return_func->module_instance)) {
+            set_prepared_call_error(
+                component_inst, error_buf, error_buf_size,
+                "component: post-return has a different allocation owner");
+            goto fail;
+        }
+        module_type =
+            prepared_call->post_return_func->module_instance->module_type;
+        post_return_type = wasm_runtime_get_function_type(
+            prepared_call->post_return_func, module_type);
+        if (!prepare_flat_signature(post_return_type, post_param_kinds,
+                                    post_result_kinds, &post_param_cells,
+                                    &post_result_cells)
+            || post_return_type->param_count != prepared_call->result_count
+            || post_return_type->result_count != 0
+            || post_param_cells != prepared_call->result_cell_count
+            || post_result_cells != 0
+            || memcmp(post_param_kinds, prepared_call->result_kinds,
+                      prepared_call->result_count
+                          * sizeof(prepared_call->result_kinds[0]))
+                   != 0) {
+            set_prepared_call_error(component_inst, error_buf, error_buf_size,
+                                    "component: post-return signature does not "
+                                    "match export results");
+            goto fail;
+        }
+        prepared_call->post_return_exec_env =
+            wasm_runtime_get_exec_env_singleton(
+                (WASMModuleInstanceCommon *)
+                    prepared_call->post_return_func->module_instance);
+        if (!prepared_call->post_return_exec_env) {
+            set_prepared_call_error(component_inst, error_buf, error_buf_size,
+                                    "component: failed to create post-return "
+                                    "execution environment");
+            goto fail;
+        }
+    }
+
+    prepared_call->owner_thread = os_self_thread();
+    if (!prepared_call_owner_graph_is_valid(prepared_call)) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: prepared call allocation owner graph is inconsistent");
+        goto fail;
+    }
+    if (!wasm_component_instance_register_prepared_call(component_inst)) {
+        set_prepared_call_error(component_inst, error_buf, error_buf_size,
+                                "component: prepared call lifetime could not "
+                                "be registered");
+        goto fail;
+    }
+
+    wasm_component_set_exception(component_inst, NULL);
+    if (error_buf && error_buf_size > 0) {
+        error_buf[0] = '\0';
+    }
+    result = prepared_call;
+    prepared_call = NULL;
+
+fail:
+    if (prepared_call) {
+        wasm_runtime_free(prepared_call);
+    }
+    wasm_allocation_quota_scope_leave(&quota_scope);
+    if (operation_active) {
+        wasm_component_instance_end_operation(component_inst);
+    }
+    return result;
+}
+
+WASMComponentPreparedCall *
+wasm_component_prepare_export_call(WASMComponentInstance *component_inst,
+                                   const char *export_name, char *error_buf,
+                                   uint32 error_buf_size)
+{
+    return prepare_export_call(component_inst, NULL, export_name, error_buf,
+                               error_buf_size);
+}
+
+WASMComponentPreparedCall *
+wasm_component_prepare_export_call_qualified(
+    WASMComponentInstance *component_inst, const char *interface_name,
+    const char *export_name, char *error_buf, uint32 error_buf_size)
+{
+    if (!interface_name) {
+        set_prepared_call_error(
+            component_inst, error_buf, error_buf_size,
+            "component: invalid qualified prepared call arguments");
+        return NULL;
+    }
+    return prepare_export_call(component_inst, interface_name, export_name,
+                               error_buf, error_buf_size);
+}
+
+static bool
+prepared_values_to_cells(WASMComponentPreparedCall *prepared_call,
+                         const wasm_val_t values[], uint32 value_count,
+                         const wasm_valkind_t kinds[])
+{
+    uint32 i, cell_index = 0;
+
+    for (i = 0; i < value_count; i++) {
+        if (values[i].kind != kinds[i]) {
+            wasm_component_set_exception(
+                prepared_call->component_inst,
+                "component: prepared call value kind does not match signature");
+            return false;
+        }
+        switch (kinds[i]) {
+            case WASM_I32:
+                prepared_call->argv_cells[cell_index++] =
+                    (uint32)values[i].of.i32;
+                break;
+            case WASM_I64:
+            {
+                union {
+                    uint64 val;
+                    uint32 parts[2];
+                } value;
+                value.val = (uint64)values[i].of.i64;
+                prepared_call->argv_cells[cell_index++] = value.parts[0];
+                prepared_call->argv_cells[cell_index++] = value.parts[1];
+                break;
+            }
+            case WASM_F32:
+            {
+                union {
+                    float32 val;
+                    uint32 part;
+                } value;
+                value.val = values[i].of.f32;
+                prepared_call->argv_cells[cell_index++] = value.part;
+                break;
+            }
+            case WASM_F64:
+            {
+                union {
+                    float64 val;
+                    uint32 parts[2];
+                } value;
+                value.val = values[i].of.f64;
+                prepared_call->argv_cells[cell_index++] = value.parts[0];
+                prepared_call->argv_cells[cell_index++] = value.parts[1];
+                break;
+            }
+            default:
+                bh_assert(0);
+                return false;
+        }
+    }
+    return true;
+}
+
+static void
+prepared_cells_to_results(const WASMComponentPreparedCall *prepared_call,
+                          wasm_val_t results[])
+{
+    uint32 i, cell_index = 0;
+
+    for (i = 0; i < prepared_call->result_count; i++) {
+        results[i].kind = prepared_call->result_kinds[i];
+        switch (prepared_call->result_kinds[i]) {
+            case WASM_I32:
+                results[i].of.i32 =
+                    (int32)prepared_call->argv_cells[cell_index++];
+                break;
+            case WASM_I64:
+            {
+                union {
+                    uint64 val;
+                    uint32 parts[2];
+                } value;
+                value.parts[0] = prepared_call->argv_cells[cell_index++];
+                value.parts[1] = prepared_call->argv_cells[cell_index++];
+                results[i].of.i64 = (int64)value.val;
+                break;
+            }
+            case WASM_F32:
+            {
+                union {
+                    float32 val;
+                    uint32 part;
+                } value;
+                value.part = prepared_call->argv_cells[cell_index++];
+                results[i].of.f32 = value.val;
+                break;
+            }
+            case WASM_F64:
+            {
+                union {
+                    float64 val;
+                    uint32 parts[2];
+                } value;
+                value.parts[0] = prepared_call->argv_cells[cell_index++];
+                value.parts[1] = prepared_call->argv_cells[cell_index++];
+                results[i].of.f64 = value.val;
+                break;
+            }
+            default:
+                bh_assert(0);
+                break;
+        }
+    }
+}
+
+bool
+wasm_component_prepared_call_requires_post_return(
+    const WASMComponentPreparedCall *prepared_call)
+{
+    return prepared_call && prepared_call->post_return_func;
+}
+
+bool
+wasm_component_call_prepared(WASMComponentPreparedCall *prepared_call,
+                             uint32 num_results, wasm_val_t results[],
+                             uint32 num_args, const wasm_val_t args[])
+{
+    WASMAllocationQuotaBorrowedScope quota_scope;
+    const char *exception;
+    bool success = false;
+    bool operation_active = false;
+
+    if (!prepared_call
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &quota_scope, prepared_call)) {
+        return false;
+    }
+    if (!prepared_call_is_on_owner_thread(prepared_call)) {
+        LOG_ERROR("component: prepared call used from a different thread");
+        goto done;
+    }
+    if (!wasm_component_instance_begin_operation(
+            prepared_call->component_inst)) {
+        wasm_component_set_exception(prepared_call->component_inst,
+                                     "component: instance is being destroyed");
+        goto done;
+    }
+    operation_active = true;
+    if (!prepared_call_owner_graph_is_valid(prepared_call)) {
+        wasm_component_set_exception(
+            prepared_call->component_inst,
+            "component: prepared call owner graph is no longer valid");
+        goto done;
+    }
+    if (prepared_call->call_active) {
+        wasm_component_set_exception(prepared_call->component_inst,
+                                     "component: prepared call is already "
+                                     "active");
+        goto done;
+    }
+    if (prepared_call->post_return_pending) {
+        wasm_component_set_exception(
+            prepared_call->component_inst,
+            "component: post-return is required before the next prepared call");
+        goto done;
+    }
+    prepared_call->call_active = true;
+    if (num_args != prepared_call->param_count
+        || num_results != prepared_call->result_count || (num_args > 0 && !args)
+        || (num_results > 0 && !results)) {
+        wasm_component_set_exception(prepared_call->component_inst,
+                                     "component: prepared call argument/result "
+                                     "count does not match signature");
+        goto done;
+    }
+    if (!prepared_values_to_cells(prepared_call, args, num_args,
+                                  prepared_call->param_kinds)) {
+        goto done;
+    }
+
+    wasm_component_set_exception(prepared_call->component_inst, NULL);
+    if (!wasm_runtime_call_wasm(
+            prepared_call->exec_env,
+            (WASMFunctionInstanceCommon *)prepared_call->core_func,
+            prepared_call->param_cell_count, prepared_call->argv_cells)) {
+        exception = wasm_runtime_get_exception(
+            (WASMModuleInstanceCommon *)
+                prepared_call->core_func->module_instance);
+        wasm_component_set_exception(
+            prepared_call->component_inst,
+            exception ? exception : "component: prepared core call failed");
+        goto done;
+    }
+
+    prepared_cells_to_results(prepared_call, results);
+    prepared_call->post_return_pending =
+        prepared_call->post_return_func != NULL;
+    success = true;
+
+done:
+    if (operation_active) {
+        prepared_call->call_active = false;
+    }
+    wasm_allocation_quota_borrowed_scope_leave(&quota_scope);
+    if (operation_active) {
+        wasm_component_instance_end_operation(prepared_call->component_inst);
+    }
+    return success;
+}
+
+bool
+wasm_component_prepared_call_post_return(
+    WASMComponentPreparedCall *prepared_call)
+{
+    WASMAllocationQuotaBorrowedScope quota_scope;
+    const char *exception;
+    bool success = false;
+    bool operation_active = false;
+
+    if (!prepared_call
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &quota_scope, prepared_call)) {
+        return false;
+    }
+    if (!prepared_call_is_on_owner_thread(prepared_call)) {
+        LOG_ERROR("component: prepared post-return used from a different "
+                  "thread");
+        goto done;
+    }
+    if (!wasm_component_instance_begin_operation(
+            prepared_call->component_inst)) {
+        wasm_component_set_exception(prepared_call->component_inst,
+                                     "component: instance is being destroyed");
+        goto done;
+    }
+    operation_active = true;
+    if (!prepared_call_owner_graph_is_valid(prepared_call)) {
+        wasm_component_set_exception(
+            prepared_call->component_inst,
+            "component: prepared post-return owner graph is no longer valid");
+        goto done;
+    }
+    if (prepared_call->call_active) {
+        wasm_component_set_exception(prepared_call->component_inst,
+                                     "component: prepared call is already "
+                                     "active");
+        goto done;
+    }
+    if (!prepared_call->post_return_pending) {
+        success = true;
+        goto done;
+    }
+
+    prepared_call->call_active = true;
+    /* A post-return invocation is consumed even when it traps. */
+    prepared_call->post_return_pending = false;
+    wasm_component_set_exception(prepared_call->component_inst, NULL);
+    if (!wasm_runtime_call_wasm(
+            prepared_call->post_return_exec_env,
+            (WASMFunctionInstanceCommon *)prepared_call->post_return_func,
+            prepared_call->result_cell_count, prepared_call->argv_cells)) {
+        exception = wasm_runtime_get_exception(
+            (WASMModuleInstanceCommon *)
+                prepared_call->post_return_func->module_instance);
+        wasm_component_set_exception(
+            prepared_call->component_inst,
+            exception ? exception : "component: post-return failed");
+        goto done;
+    }
+    success = true;
+
+done:
+    if (operation_active) {
+        prepared_call->call_active = false;
+    }
+    wasm_allocation_quota_borrowed_scope_leave(&quota_scope);
+    if (operation_active) {
+        wasm_component_instance_end_operation(prepared_call->component_inst);
+    }
+    return success;
+}
+
+void
+wasm_component_destroy_prepared_call(WASMComponentPreparedCall *prepared_call)
+{
+    WASMAllocationQuotaScope quota_scope;
+    WASMComponentInstance *component_inst = NULL;
+    bool operation_active = false;
+
+    if (!prepared_call) {
+        return;
+    }
+    if (!wasm_allocation_quota_scope_enter_for_allocation(&quota_scope,
+                                                          prepared_call)) {
+        LOG_ERROR("component: prepared call allocation owner could not be "
+                  "established for destroy");
+        return;
+    }
+    if (!prepared_call_is_on_owner_thread(prepared_call)) {
+        LOG_ERROR("component: refusing to destroy a prepared call from a "
+                  "different thread");
+        goto done;
+    }
+    component_inst = prepared_call->component_inst;
+    if (!wasm_component_instance_begin_operation(component_inst)) {
+        LOG_ERROR("component: refusing to destroy a prepared call while its "
+                  "instance is being destroyed");
+        goto done;
+    }
+    operation_active = true;
+    if (!prepared_call_owner_graph_is_valid(prepared_call)) {
+        LOG_ERROR("component: refusing to destroy a prepared call with an "
+                  "invalid owner graph");
+        goto done;
+    }
+    if (prepared_call->call_active) {
+        LOG_ERROR("component: refusing to destroy an active prepared call");
+        goto done;
+    }
+    if (prepared_call->post_return_pending) {
+        wasm_component_set_exception(
+            prepared_call->component_inst,
+            "component: post-return is required before prepared-call destroy");
+        goto done;
+    }
+
+    if (!wasm_component_instance_unregister_prepared_call(component_inst)) {
+        LOG_ERROR("component: prepared-call lifetime counter underflow");
+        goto done;
+    }
+    wasm_runtime_free(prepared_call);
+
+done:
+    wasm_allocation_quota_scope_leave(&quota_scope);
+    if (operation_active) {
+        wasm_component_instance_end_operation(component_inst);
     }
 }
 
@@ -307,6 +971,113 @@ print_return_values(wit_value_t lifted_results)
     os_printf("\n");
 }
 
+/*
+ * The WAVE command-line adapter has no host-resource ownership channel.  It
+ * can print ordinary values, but accepting own/borrow values would either
+ * fabricate an invalid input handle or consume an output handle with nowhere
+ * to publish/drop its representation.  Reject such signatures before the
+ * component is called so resource-free WAVE use remains unchanged.
+ */
+static bool
+wave_type_contains_resource(const WASMComponentTypeInstance *type, uint32 depth)
+{
+    uint32 i;
+
+    if (!type || depth > MAX_DEPTH_RECURSION) {
+        return type != NULL;
+    }
+
+    switch (type->type) {
+        case COMPONENT_VAL_TYPE_RESOURCE_SYNC:
+        case COMPONENT_VAL_TYPE_RESOURCE_ASYNC:
+        case COMPONENT_VAL_TYPE_OWN:
+        case COMPONENT_VAL_TYPE_BORROW:
+            return true;
+        case COMPONENT_VAL_TYPE_RECORD:
+            if (type->type_specific.record) {
+                for (i = 0; i < type->type_specific.record->count; i++) {
+                    if (wave_type_contains_resource(
+                            type->type_specific.record->fields[i].type,
+                            depth + 1)) {
+                        return true;
+                    }
+                }
+            }
+            break;
+        case COMPONENT_VAL_TYPE_VARIANT:
+            if (type->type_specific.variant) {
+                for (i = 0; i < type->type_specific.variant->count; i++) {
+                    if (wave_type_contains_resource(
+                            type->type_specific.variant->cases[i].value_type,
+                            depth + 1)) {
+                        return true;
+                    }
+                }
+            }
+            break;
+        case COMPONENT_VAL_TYPE_LIST:
+            return type->type_specific.list
+                   && wave_type_contains_resource(
+                       type->type_specific.list->element_type, depth + 1);
+        case COMPONENT_VAL_TYPE_FIXED_SIZE_LIST:
+            return type->type_specific.list_len
+                   && wave_type_contains_resource(
+                       type->type_specific.list_len->element_type, depth + 1);
+        case COMPONENT_VAL_TYPE_TUPLE:
+            if (type->type_specific.tuple) {
+                for (i = 0; i < type->type_specific.tuple->count; i++) {
+                    if (wave_type_contains_resource(
+                            type->type_specific.tuple->element_types[i],
+                            depth + 1)) {
+                        return true;
+                    }
+                }
+            }
+            break;
+        case COMPONENT_VAL_TYPE_OPTION:
+            return type->type_specific.option
+                   && wave_type_contains_resource(
+                       type->type_specific.option->element_type, depth + 1);
+        case COMPONENT_VAL_TYPE_RESULT:
+            return type->type_specific.result
+                   && (wave_type_contains_resource(
+                           type->type_specific.result->result_type, depth + 1)
+                       || wave_type_contains_resource(
+                           type->type_specific.result->error_type, depth + 1));
+        default:
+            break;
+    }
+    return false;
+}
+
+bool
+wasm_component_application_wave_type_supported(
+    const WASMComponentTypeInstance *type)
+{
+    return !wave_type_contains_resource(type, 0);
+}
+
+static bool
+wave_func_contains_resource(const WASMComponentFuncTypeInstance *func_type)
+{
+    uint32 i;
+
+    if (!func_type) {
+        return false;
+    }
+    if (func_type->params) {
+        for (i = 0; i < func_type->params->count; i++) {
+            if (!wasm_component_application_wave_type_supported(
+                    func_type->params->params[i].type)) {
+                return true;
+            }
+        }
+    }
+    return func_type->results
+           && !wasm_component_application_wave_type_supported(
+               func_type->results->result);
+}
+
 static bool
 execute_component_func(WASMComponentInstance *component_inst, char *argv,
                        uint32 *argc1, uint32 **argv1)
@@ -343,6 +1114,13 @@ execute_component_func(WASMComponentInstance *component_inst, char *argv,
         goto fail;
     }
 
+    if (wave_func_contains_resource(target_func->func_type)) {
+        wasm_component_set_exception(
+            component_inst,
+            "WAVE invocation does not support resource-bearing signatures");
+        goto fail;
+    }
+
     if (!wave_parse_invocation_str(argv, &inv)) {
         snprintf(buf, sizeof(buf),
                  "Parsing component function definition failed");
@@ -366,8 +1144,8 @@ execute_component_func(WASMComponentInstance *component_inst, char *argv,
         goto fail;
     }
 
-    LOG_DEBUG("Executing WASM component function: %s with %d arguments\n",
-              inv.func_name);
+    LOG_DEBUG("Executing WASM component function: %s with %u arguments\n",
+              inv.func_name, inv.arg_count);
 
     CanonicalOptions *lower_opts = target_func->canon_options;
     WASMComponentFuncTypeInstance *ft = target_func->func_type;
@@ -670,7 +1448,7 @@ execute_component_main(WASMComponentInstance *component_inst, int32 argc,
     uint32 *argv_offsets = NULL, module_type = 0;
     bool ret = false, is_import_func = true, is_memory64 = false;
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
     /* In wasi mode, we should call the function named "_start"
        which initializes the wasi environment and then calls
        the actual main function. Directly calling main function
@@ -699,7 +1477,7 @@ execute_component_main(WASMComponentInstance *component_inst, int32 argc,
         }
         return ret;
     }
-#endif /* end of WASM_ENABLE_LIBC_WASI */
+#endif /* end of WASM_ENABLE_LIBC_WASI_P2 */
 
     func = wasm_component_lookup_function(
         component_inst,
@@ -840,22 +1618,60 @@ bool
 wasm_component_application_execute_main(WASMComponentInstance *component_inst,
                                         int32 argc, char *argv[])
 {
+    WASMAllocationQuotaBorrowedScope quota_scope;
     bool ret = false;
+    bool operation_active = false;
+
+    if (!component_inst
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &quota_scope, component_inst)) {
+        return false;
+    }
+    if (!wasm_component_instance_begin_operation(component_inst)) {
+        wasm_component_set_exception(component_inst,
+                                     "component: instance is being destroyed");
+        goto done;
+    }
+    operation_active = true;
     ret = execute_component_main(component_inst, argc, argv);
-    return (ret && !wasm_component_runtime_get_exception(component_inst))
-               ? true
-               : false;
+    ret = ret && !wasm_component_runtime_get_exception(component_inst);
+
+done:
+    wasm_allocation_quota_borrowed_scope_leave(&quota_scope);
+    if (operation_active) {
+        wasm_component_instance_end_operation(component_inst);
+    }
+    return ret;
 }
 
 bool
 wasm_component_application_execute_func(WASMComponentInstance *component_inst,
                                         char *argv)
 {
+    WASMAllocationQuotaBorrowedScope quota_scope;
     bool ret = false;
+    bool operation_active = false;
+
+    if (!component_inst
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &quota_scope, component_inst)) {
+        return false;
+    }
+    if (!wasm_component_instance_begin_operation(component_inst)) {
+        wasm_component_set_exception(component_inst,
+                                     "component: instance is being destroyed");
+        goto done;
+    }
+    operation_active = true;
     ret = execute_component_func(component_inst, argv, NULL, NULL);
-    return (ret && !wasm_component_runtime_get_exception(component_inst))
-               ? true
-               : false;
+    ret = ret && !wasm_component_runtime_get_exception(component_inst);
+
+done:
+    wasm_allocation_quota_borrowed_scope_leave(&quota_scope);
+    if (operation_active) {
+        wasm_component_instance_end_operation(component_inst);
+    }
+    return ret;
 }
 
 bool
@@ -863,11 +1679,30 @@ wasm_component_application_execute_func_ex(
     WASMComponentInstance *component_inst, char *argv, uint32 *argc1,
     uint32 **argv1)
 {
+    WASMAllocationQuotaBorrowedScope quota_scope;
     bool ret = false;
+    bool operation_active = false;
+
+    if (!component_inst
+        || !wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+            &quota_scope, component_inst)) {
+        return false;
+    }
+    if (!wasm_component_instance_begin_operation(component_inst)) {
+        wasm_component_set_exception(component_inst,
+                                     "component: instance is being destroyed");
+        goto done;
+    }
+    operation_active = true;
     ret = execute_component_func(component_inst, argv, argc1, argv1);
-    return (ret && !wasm_component_runtime_get_exception(component_inst))
-               ? true
-               : false;
+    ret = ret && !wasm_component_runtime_get_exception(component_inst);
+
+done:
+    wasm_allocation_quota_borrowed_scope_leave(&quota_scope);
+    if (operation_active) {
+        wasm_component_instance_end_operation(component_inst);
+    }
+    return ret;
 }
 
 #endif /* WASM_ENABLE_COMPONENT_MODEL != 0*/

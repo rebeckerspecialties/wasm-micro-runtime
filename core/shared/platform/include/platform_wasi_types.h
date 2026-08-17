@@ -36,7 +36,8 @@ extern "C" {
 
 /* There is no need to check the WASI layout if we're using uvwasi or libc-wasi
  * is not enabled at all. */
-#if WASM_ENABLE_UVWASI != 0 || WASM_ENABLE_LIBC_WASI == 0
+#if WASM_ENABLE_UVWASI != 0 \
+    || (WASM_ENABLE_LIBC_WASI == 0 && WASM_ENABLE_LIBC_WASI_P2 == 0)
 #define assert_wasi_layout(expr, message) /* nothing */
 #else
 #define assert_wasi_layout(expr, message) _Static_assert(expr, message)

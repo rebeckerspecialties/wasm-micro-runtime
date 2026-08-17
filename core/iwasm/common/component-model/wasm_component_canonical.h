@@ -12,6 +12,7 @@ extern "C" {
 
 #include "wasm_runtime.h"
 #include "wasm_canonical_abi.h"
+#include "wasm_component_resource_table.h"
 
 #define trap_if(condition)                           \
     do {                                             \
@@ -62,6 +63,72 @@ typedef struct LiftLowerContext {
         Subtask *subtask; // Used by lift_borrow
     } borrow_scope;
 } LiftLowerContext;
+
+typedef struct CanonicalResourceTransferScope {
+    uint64_t cookie;
+    uint32_t depth;
+    uint32_t nesting;
+    bool outer;
+    bool active;
+} CanonicalResourceTransferScope;
+
+typedef struct CanonicalResourceTransferSavepoint {
+    uint64_t cookie;
+    uint32_t depth;
+    WASMComponentTableTransactionSavepoint table_savepoint;
+    bool active;
+} CanonicalResourceTransferSavepoint;
+
+bool
+canonical_resource_transfer_scope_enter(CanonicalResourceTransferScope *scope,
+                                        LiftLowerContext *cx,
+                                        WASMComponentTableTransactionMode mode);
+
+bool
+canonical_resource_transfer_scope_leave(CanonicalResourceTransferScope *scope,
+                                        bool success);
+
+bool
+canonical_resource_transfer_scope_can_commit(
+    const CanonicalResourceTransferScope *scope);
+
+bool
+canonical_resource_transfer_savepoint_begin(
+    CanonicalResourceTransferSavepoint *savepoint, LiftLowerContext *cx);
+
+bool
+canonical_resource_transfer_savepoint_can_commit(
+    const CanonicalResourceTransferSavepoint *savepoint);
+
+bool
+canonical_resource_transfer_savepoint_commit(
+    CanonicalResourceTransferSavepoint *savepoint);
+
+bool
+canonical_resource_transfer_savepoint_rollback(
+    CanonicalResourceTransferSavepoint *savepoint);
+
+bool
+canonical_resource_transfer_scope_rebind_single_owned_rep(
+    const CanonicalResourceTransferScope *scope, uint32_t expected_rep,
+    uint32_t replacement_rep);
+
+/* Abort an outer result-lift and drop each unpublished owned representation. */
+bool
+canonical_resource_transfer_scope_discard(
+    CanonicalResourceTransferScope *scope);
+
+bool
+canonical_resource_transfer_reserve_lift(LiftLowerContext *cx, uint32_t index);
+
+bool
+canonical_resource_transfer_record_lower(LiftLowerContext *cx, uint32_t index);
+
+void
+canonical_resource_transfer_unwind_to(const void *unwind_target);
+
+void
+canonical_resource_transfer_unwind_current(void);
 
 /**
  * @brief Sets a pending exception message in the component instance.

@@ -12,31 +12,109 @@
 #include "../../../product-mini/platforms/common/libc_wasi.h"
 #include "component-model/wasm_component_canonical.h"
 
+static bool
+wit_value_array_allocation_fits(uint64_t count)
+{
+    return count <= UINT32_MAX && count <= UINT32_MAX / sizeof(wit_value_t);
+}
+
+static void
+free_wit_value_array(wit_value_t *elems, uint32_t constructed)
+{
+    if (!elems)
+        return;
+
+    while (constructed > 0)
+        free_wit_value(elems[--constructed]);
+    wasm_runtime_free(elems);
+}
+
+static void
+free_environment(wasi_tuple_string_string_t *environment, uint32_t count)
+{
+    if (!environment)
+        return;
+
+    for (uint32_t i = 0; i < count; i++) {
+        wasm_runtime_free(environment[i].key);
+        wasm_runtime_free(environment[i].value);
+    }
+    wasm_runtime_free(environment);
+}
+
+static wit_value_t
+make_string_value(wasm_exec_env_t exec_env, const char *utf8)
+{
+    StringEncoding encoding;
+    uint8_t *encoded = NULL;
+    uint32_t encoded_len = 0;
+    uint32_t encoded_code_units = 0;
+    size_t utf8_len;
+    wit_value_t result;
+
+    if (!exec_env || !exec_env->cx || !utf8)
+        return NULL;
+    utf8_len = strlen(utf8);
+    if (utf8_len > UINT32_MAX)
+        return NULL;
+
+    encoding = wasm_get_string_encoding(exec_env);
+    if (!encode_string(exec_env->cx, utf8, (uint32_t)utf8_len, encoding,
+                       &encoded, &encoded_len, &encoded_code_units)) {
+        return NULL;
+    }
+    result = wit_string_ctor((char *)encoded, encoded_len, encoded_code_units,
+                             encoding);
+    if (encoded != (const uint8_t *)utf8)
+        wasm_runtime_free(encoded);
+    return result;
+}
+
+static wit_value_t
+make_optional_owned_resource(uint32_t rep)
+{
+    wit_value_t resource = wit_resource_ctor(rep);
+    wit_value_t option;
+
+    if (!resource)
+        return NULL;
+    option = wit_option_ctor(resource);
+    if (!option)
+        free_wit_value(resource);
+    return option;
+}
+
 // Helper function to covert environment variable list tuple to wit_value_t
 static wit_value_t
-get_environ_val(wasi_tuple_string_string_t *environment_entry,
-                uint32_t environ_count, wasm_exec_env_t exec_env)
+get_environ_val(const wasi_tuple_string_string_t *environment_entry,
+                wasm_exec_env_t exec_env)
 {
-    wit_value_t *elems =
-        (wit_value_t *)wasm_runtime_malloc(2 * sizeof(wit_value_t));
+    wit_value_t *elems;
+    wit_value_t result;
 
-    StringEncoding encoding = wasm_get_string_encoding(exec_env);
-    uint8_t *encoded_str_key = NULL, *encoded_str_val = NULL;
-    uint32_t encoded_str_len_key = 0, encoded_str_len_val = 0;
-    uint32_t encoded_code_units_key = 0, encoded_code_units_val = 0;
-    encode_string(exec_env->cx, environment_entry->key,
-                  strlen(environment_entry->key), encoding, &encoded_str_key,
-                  &encoded_str_len_key, &encoded_code_units_key);
-    encode_string(exec_env->cx, environment_entry->value,
-                  strlen(environment_entry->value), encoding, &encoded_str_val,
-                  &encoded_str_len_val, &encoded_code_units_val);
+    if (!environment_entry || !environment_entry->key
+        || !environment_entry->value)
+        return NULL;
+    elems = wasm_runtime_malloc(2 * sizeof(wit_value_t));
+    if (!elems)
+        return NULL;
 
-    elems[0] = wit_string_ctor((char *)encoded_str_key, encoded_str_len_key,
-                               encoded_code_units_key, encoding);
-    elems[1] = wit_string_ctor((char *)encoded_str_val, encoded_str_len_val,
-                               encoded_code_units_val, encoding);
-    wit_value_t result_tuple = wit_tuple_ctor(elems, 2);
-    return result_tuple;
+    elems[0] = make_string_value(exec_env, environment_entry->key);
+    if (!elems[0]) {
+        wasm_runtime_free(elems);
+        return NULL;
+    }
+    elems[1] = make_string_value(exec_env, environment_entry->value);
+    if (!elems[1]) {
+        free_wit_value(elems[0]);
+        wasm_runtime_free(elems);
+        return NULL;
+    }
+
+    result = wit_tuple_ctor(elems, 2);
+    if (!result)
+        free_wit_value_array(elems, 2);
+    return result;
 }
 
 static bool
@@ -77,18 +155,26 @@ wasi_cli_get_environment_wrapper(wasm_exec_env_t exec_env, uint32_t offset_addr)
     wit_value_t result = NULL;
     wit_value_t *aux_list = NULL;
     uint32_t total_env_count = 0;
+    uint32_t max_env_count = 0;
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         result = wit_list_ctor(NULL, 0);
         goto end;
     }
 
-    wasi_environ_count = wasi_ctx->argv_environ->environ_count;
-    wasi_environ = wasi_cli_environment_split_str(
-        wasi_ctx->argv_environ->environ_list, wasi_environ_count);
+    if (wasi_ctx->argv_environ) {
+        wasi_environ_count = wasi_ctx->argv_environ->environ_count;
+        wasi_environ = wasi_cli_environment_split_str(
+            wasi_ctx->argv_environ->environ_list, wasi_environ_count);
+        if (wasi_environ_count > 0 && !wasi_environ)
+            goto construction_failed;
+    }
 
     if (wasi_ctx->wasi_options->inherit_env) {
         host_environ = wasi_cli_get_environment(&host_environ_count);
+        if (host_environ_count > 0 && !host_environ)
+            goto construction_failed;
     }
 
     if (!host_environ && !wasi_environ) {
@@ -96,12 +182,17 @@ wasi_cli_get_environment_wrapper(wasm_exec_env_t exec_env, uint32_t offset_addr)
         goto end;
     }
 
-    if (host_environ_count + wasi_environ_count > 0) {
-        aux_list = (wit_value_t *)wasm_runtime_malloc(
-            (host_environ_count + wasi_environ_count) * sizeof(wit_value_t));
+    if (host_environ_count > UINT32_MAX - wasi_environ_count)
+        goto construction_failed;
+    max_env_count = host_environ_count + wasi_environ_count;
+    if (!wit_value_array_allocation_fits(max_env_count))
+        goto construction_failed;
+
+    if (max_env_count > 0) {
+        aux_list = (wit_value_t *)wasm_runtime_malloc(max_env_count
+                                                      * sizeof(wit_value_t));
         if (!aux_list) {
-            result = wit_list_ctor(NULL, 0);
-            goto end;
+            goto construction_failed;
         }
 
         for (uint32_t index = 0; index < host_environ_count; index++) {
@@ -109,39 +200,51 @@ wasi_cli_get_environment_wrapper(wasm_exec_env_t exec_env, uint32_t offset_addr)
                                      wasi_environ_count)) {
                 continue;
             }
-            aux_list[total_env_count] = get_environ_val(
-                &host_environ[index], host_environ_count, exec_env);
+            aux_list[total_env_count] =
+                get_environ_val(&host_environ[index], exec_env);
+            if (!aux_list[total_env_count])
+                goto construction_failed;
             total_env_count++;
         }
 
         for (uint32_t index = 0; index < wasi_environ_count; index++) {
-            aux_list[total_env_count] = get_environ_val(
-                &wasi_environ[index], wasi_environ_count, exec_env);
+            aux_list[total_env_count] =
+                get_environ_val(&wasi_environ[index], exec_env);
+            if (!aux_list[total_env_count])
+                goto construction_failed;
             total_env_count++;
         }
         result = wit_list_ctor(aux_list, total_env_count);
+        if (!result)
+            goto construction_failed;
+        aux_list = NULL;
+        total_env_count = 0;
     }
     else {
         result = wit_list_ctor(NULL, 0);
     }
+    goto end;
+
+construction_failed:
+    if (wasm_runtime_get_exception((wasm_module_inst_t)exec_env->module_inst)
+        == NULL) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "failed to construct CLI environment");
+    }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
-    if (host_environ) {
-        for (uint32_t j = 0; j < host_environ_count; j++) {
-            wasm_runtime_free(host_environ[j].key);
-            wasm_runtime_free(host_environ[j].value);
-        }
-        wasm_runtime_free(host_environ);
+    free_wit_value_array(aux_list, total_env_count);
+    free_environment(host_environ, host_environ_count);
+    free_environment(wasi_environ, wasi_environ_count);
+    if (!result
+        && wasm_runtime_get_exception((wasm_module_inst_t)exec_env->module_inst)
+               == NULL) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "failed to construct CLI environment");
     }
-    if (wasi_environ) {
-        for (uint32_t j = 0; j < wasi_environ_count; j++) {
-            wasm_runtime_free(wasi_environ[j].key);
-            wasm_runtime_free(wasi_environ[j].value);
-        }
-        wasm_runtime_free(wasi_environ);
-    }
-
+    if (result)
+        (void)store(exec_env->cx, offset_addr, func_type->results->result,
+                    result);
     free_wit_value(result);
 }
 
@@ -162,17 +265,21 @@ wasi_cli_get_arguments_wrapper(wasm_exec_env_t exec_env, uint32_t offset_addr)
     const WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(module_inst);
     wit_value_t result = NULL;
     wit_value_t *aux_list = NULL;
+    uint32_t constructed = 0;
 
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         result = wit_list_ctor(NULL, 0);
         goto end;
     }
 
-    argc = wasi_ctx->argv_environ->argc;
-    argv = wasi_ctx->argv_environ->argv_list;
+    if (wasi_ctx->argv_environ) {
+        argc = wasi_ctx->argv_environ->argc;
+        argv = wasi_ctx->argv_environ->argv_list;
+    }
 
     if (!argv) {
         result = wit_list_ctor(NULL, 0);
@@ -180,34 +287,48 @@ wasi_cli_get_arguments_wrapper(wasm_exec_env_t exec_env, uint32_t offset_addr)
     }
 
     if (argc > 0) {
+        if (!wit_value_array_allocation_fits(argc))
+            goto construction_failed;
         aux_list =
             (wit_value_t *)wasm_runtime_malloc(argc * sizeof(wit_value_t));
-        if (!aux_list) {
-            result = wit_list_ctor(NULL, 0);
-            goto end;
-        }
+        if (!aux_list)
+            goto construction_failed;
 
-        StringEncoding encoding = wasm_get_string_encoding(exec_env);
-        for (uint32_t index = 0; index < argc; index++) {
-            uint8_t *encoded_str = NULL;
-            uint32_t encoded_str_len = 0;
-            uint32_t encoded_code_units = 0;
-            encode_string(exec_env->cx, argv[index], strlen(argv[index]),
-                          encoding, &encoded_str, &encoded_str_len,
-                          &encoded_code_units);
-            aux_list[index] =
-                wit_string_ctor((char *)encoded_str, encoded_str_len,
-                                encoded_code_units, encoding);
+        for (; constructed < argc; constructed++) {
+            aux_list[constructed] =
+                make_string_value(exec_env, argv[constructed]);
+            if (!aux_list[constructed])
+                goto construction_failed;
         }
         result = wit_list_ctor(aux_list, argc);
+        if (!result)
+            goto construction_failed;
+        aux_list = NULL;
+        constructed = 0;
     }
     else {
         result = wit_list_ctor(NULL, 0);
-        goto end;
+    }
+    goto end;
+
+construction_failed:
+    if (wasm_runtime_get_exception((wasm_module_inst_t)exec_env->module_inst)
+        == NULL) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "failed to construct CLI arguments");
     }
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result, result);
+    free_wit_value_array(aux_list, constructed);
+    if (!result
+        && wasm_runtime_get_exception((wasm_module_inst_t)exec_env->module_inst)
+               == NULL) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "failed to construct CLI arguments");
+    }
+    if (result)
+        (void)store(exec_env->cx, offset_addr, func_type->results->result,
+                    result);
     free_wit_value(result);
 }
 
@@ -223,12 +344,14 @@ wasi_cli_initial_cwd_wrapper(wasm_exec_env_t exec_env, uint32_t offset_addr)
     wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
     const WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(module_inst);
     wit_value_t optional_result = NULL;
+    wit_value_t string_result = NULL;
     char *cwd = NULL;
 
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         optional_result = wit_option_ctor(NULL);
         goto end;
     }
@@ -240,19 +363,25 @@ wasi_cli_initial_cwd_wrapper(wasm_exec_env_t exec_env, uint32_t offset_addr)
         optional_result = wit_option_ctor(NULL);
         goto end;
     }
-    StringEncoding encoding = wasm_get_string_encoding(exec_env);
-    uint8_t *encoded_str = NULL;
-    uint32_t encoded_str_len = 0;
-    uint32_t encoded_code_units = 0;
-    encode_string(exec_env->cx, cwd, strlen(cwd), encoding, &encoded_str,
-                  &encoded_str_len, &encoded_code_units);
-    wit_value_t string_result = wit_string_ctor(
-        (char *)encoded_str, encoded_str_len, encoded_code_units, encoding);
+    string_result = make_string_value(exec_env, cwd);
+    if (!string_result)
+        goto end;
     optional_result = wit_option_ctor(string_result);
+    if (optional_result)
+        string_result = NULL;
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result,
-          optional_result);
+    free_wit_value(string_result);
+    if (!optional_result
+        && wasm_runtime_get_exception((wasm_module_inst_t)exec_env->module_inst)
+               == NULL) {
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "failed to construct initial cwd");
+    }
+    if (optional_result)
+        (void)store(exec_env->cx, offset_addr, func_type->results->result,
+                    optional_result);
+    free_wit_value(optional_result);
     if (cwd)
         wasm_runtime_free(cwd);
 }
@@ -265,7 +394,16 @@ end:
 void
 wasi_cli_exit_wrapper(wasm_exec_env_t exec_env, int32_t status)
 {
-    wasi_cli_exit(status);
+    WASMModuleInstanceCommon *module_inst =
+        wasm_runtime_get_module_inst(exec_env);
+    WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(module_inst);
+
+    /* Match Preview 1 proc_exit: terminate this guest invocation by exception
+       and let the embedding application recover.  Calling libc exit() here
+       would let an untrusted component terminate the entire host process. */
+    if (wasi_ctx)
+        wasi_ctx->exit_code = (uint32_t)status;
+    wasm_runtime_set_exception(module_inst, "wasi proc exit");
 }
 
 /**
@@ -282,7 +420,8 @@ wasi_cli_get_stdin_wrapper(wasm_exec_env_t exec_env)
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         return 0;
     }
 
@@ -300,6 +439,9 @@ wasi_cli_get_stdin_wrapper(wasm_exec_env_t exec_env)
 
     ((StreamResourceType *)hr->data)->fd = _stdin;
     ((StreamResourceType *)hr->data)->type = STREAM_TYPE_GENERIC;
+    ((StreamResourceType *)hr->data)->position = 0;
+    ((StreamResourceType *)hr->data)->position_valid = false;
+    ((StreamResourceType *)hr->data)->append = false;
 
     uint32_t index_rep = host_resource_table_add(hr_table, hr);
     if (index_rep < 1) {
@@ -309,11 +451,12 @@ wasi_cli_get_stdin_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
 
     return (int32_t)index_rep;
 }
@@ -333,7 +476,8 @@ wasi_cli_get_stdout_wrapper(wasm_exec_env_t exec_env)
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         return 0;
     }
 
@@ -351,6 +495,9 @@ wasi_cli_get_stdout_wrapper(wasm_exec_env_t exec_env)
 
     ((StreamResourceType *)hr->data)->fd = _stdout;
     ((StreamResourceType *)hr->data)->type = STREAM_TYPE_GENERIC;
+    ((StreamResourceType *)hr->data)->position = 0;
+    ((StreamResourceType *)hr->data)->position_valid = false;
+    ((StreamResourceType *)hr->data)->append = false;
 
     uint32_t index_rep = host_resource_table_add(hr_table, hr);
     if (index_rep < 1) {
@@ -360,11 +507,12 @@ wasi_cli_get_stdout_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
 
     return (int32_t)index_rep;
 }
@@ -383,7 +531,8 @@ wasi_cli_get_stderr_wrapper(wasm_exec_env_t exec_env)
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         return 0;
     }
 
@@ -401,6 +550,9 @@ wasi_cli_get_stderr_wrapper(wasm_exec_env_t exec_env)
 
     ((StreamResourceType *)hr->data)->fd = _stderr;
     ((StreamResourceType *)hr->data)->type = STREAM_TYPE_GENERIC;
+    ((StreamResourceType *)hr->data)->position = 0;
+    ((StreamResourceType *)hr->data)->position_valid = false;
+    ((StreamResourceType *)hr->data)->append = false;
 
     uint32_t index_rep = host_resource_table_add(hr_table, hr);
     if (index_rep < 1) {
@@ -410,11 +562,12 @@ wasi_cli_get_stderr_wrapper(wasm_exec_env_t exec_env)
         return 0;
     }
 
-    wit_value_t out_val = wit_u32_ctor(index_rep);
-    lower_own(exec_env->cx,
-              func_type->results->result[0].type_specific.resource_handle,
-              out_val, &index_rep);
-    free_wit_value(out_val);
+    if (!lower_owned_host_resource(
+            exec_env,
+            func_type->results->result[0].type_specific.resource_handle,
+            hr_table, index_rep, &index_rep)) {
+        return 0;
+    }
 
     return (int32_t)index_rep;
 }
@@ -432,19 +585,20 @@ wasi_cli_get_terminal_stdin_wrapper(wasm_exec_env_t exec_env,
 {
     bool is_some;
     wit_value_t optional_result = NULL;
-    wasi_terminal_input_t handle = wasi_cli_get_terminal_stdin(&is_some);
+    uint32_t owned_rep = 0;
+    wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
+    const WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(module_inst);
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    if (!is_some) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         optional_result = wit_option_ctor(NULL);
         goto end;
     }
 
-    wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
-    const WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(module_inst);
-
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    wasi_terminal_input_t handle = wasi_cli_get_terminal_stdin(&is_some);
+    if (!is_some) {
         optional_result = wit_option_ctor(NULL);
         goto end;
     }
@@ -470,13 +624,22 @@ wasi_cli_get_terminal_stdin_wrapper(wasm_exec_env_t exec_env,
         optional_result = wit_option_ctor(NULL);
         goto end;
     }
+    owned_rep = index_rep;
 
-    wit_value_t wrapped_index_rep = wit_u32_ctor(index_rep);
-    optional_result = wit_option_ctor(wrapped_index_rep);
+    optional_result = make_optional_owned_resource(index_rep);
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result,
-          optional_result);
+    if (!optional_result) {
+        wasi_p2_cleanup_failed_owned_host_resources(exec_env, &owned_rep,
+                                                    owned_rep ? 1 : 0);
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "failed to allocate terminal input option");
+    }
+    else {
+        (void)wasi_p2_store_owned_host_resource_result(
+            exec_env, offset_addr, func_type->results->result, optional_result,
+            &owned_rep, owned_rep ? 1 : 0);
+    }
     free_wit_value(optional_result);
 }
 
@@ -493,13 +656,15 @@ wasi_cli_get_terminal_stdout_wrapper(wasm_exec_env_t exec_env,
 {
     bool is_some;
     wit_value_t optional_result = NULL;
+    uint32_t owned_rep = 0;
 
     wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
     const WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(module_inst);
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         optional_result = wit_option_ctor(NULL);
         goto end;
     }
@@ -533,13 +698,22 @@ wasi_cli_get_terminal_stdout_wrapper(wasm_exec_env_t exec_env,
         optional_result = wit_option_ctor(NULL);
         goto end;
     }
+    owned_rep = (uint32_t)index_rep;
 
-    wit_value_t wrapped_index_rep = wit_u32_ctor(index_rep);
-    optional_result = wit_option_ctor(wrapped_index_rep);
+    optional_result = make_optional_owned_resource((uint32_t)index_rep);
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result,
-          optional_result);
+    if (!optional_result) {
+        wasi_p2_cleanup_failed_owned_host_resources(exec_env, &owned_rep,
+                                                    owned_rep ? 1 : 0);
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "failed to allocate terminal output option");
+    }
+    else {
+        (void)wasi_p2_store_owned_host_resource_result(
+            exec_env, offset_addr, func_type->results->result, optional_result,
+            &owned_rep, owned_rep ? 1 : 0);
+    }
     free_wit_value(optional_result);
 }
 
@@ -556,13 +730,15 @@ wasi_cli_get_terminal_stderr_wrapper(wasm_exec_env_t exec_env,
 {
     bool is_some;
     wit_value_t optional_result = NULL;
+    uint32_t owned_rep = 0;
 
     wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
     const WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(module_inst);
     WASMComponentFuncTypeInstance *func_type =
         wasm_get_component_func_type(exec_env);
 
-    if (!wasi_ctx->wasi_options->cli || !wasi_ctx->wasi_options->common) {
+    if (!wasi_ctx || !wasi_ctx->wasi_options || !wasi_ctx->wasi_options->cli
+        || !wasi_ctx->wasi_options->common) {
         optional_result = wit_option_ctor(NULL);
         goto end;
     }
@@ -596,12 +772,21 @@ wasi_cli_get_terminal_stderr_wrapper(wasm_exec_env_t exec_env,
         optional_result = wit_option_ctor(NULL);
         goto end;
     }
+    owned_rep = index_rep;
 
-    wit_value_t wrapped_index_rep = wit_u32_ctor(index_rep);
-    optional_result = wit_option_ctor(wrapped_index_rep);
+    optional_result = make_optional_owned_resource(index_rep);
 
 end:
-    store(exec_env->cx, offset_addr, func_type->results->result,
-          optional_result);
+    if (!optional_result) {
+        wasi_p2_cleanup_failed_owned_host_resources(exec_env, &owned_rep,
+                                                    owned_rep ? 1 : 0);
+        wasm_runtime_set_exception(exec_env->module_inst,
+                                   "failed to allocate terminal error option");
+    }
+    else {
+        (void)wasi_p2_store_owned_host_resource_result(
+            exec_env, offset_addr, func_type->results->result, optional_result,
+            &owned_rep, owned_rep ? 1 : 0);
+    }
     free_wit_value(optional_result);
 }

@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "lib_export.h"
+#include "wasm_load_args.h"
 
 #ifndef WASM_RUNTIME_API_EXTERN
 #if defined(_MSC_BUILD)
@@ -126,8 +127,78 @@ struct WASMModuleInstanceCommon;
 typedef struct WASMModuleInstanceCommon *wasm_module_inst_t;
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
+struct WASMComponent;
+typedef struct WASMComponent WASMComponent;
 struct WASMComponentInstance;
 typedef struct WASMComponentInstance WASMComponentInstance;
+struct WASMComponentPreparedCall;
+typedef struct WASMComponentPreparedCall WASMComponentPreparedCall;
+typedef bool (*wasm_component_host_resource_drop_callback_t)(
+    void *attachment, uint32_t representation);
+
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
+/** Maximum bytes passed to one callback-backed input-stream operation. */
+#define WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES (64U * 1024U)
+
+typedef enum wasm_component_wasi_input_stream_status_t {
+    WASM_COMPONENT_WASI_INPUT_STREAM_OK = 0,
+    WASM_COMPONENT_WASI_INPUT_STREAM_CLOSED = 1,
+    WASM_COMPONENT_WASI_INPUT_STREAM_FAILED = 2,
+} wasm_component_wasi_input_stream_status_t;
+
+/**
+ * Fill WAMR-owned buffer synchronously on the component owner thread.
+ * buffer is valid only for this call and must not be retained. For a positive
+ * capacity, OK requires 1..capacity bytes; CLOSED and FAILED require zero.
+ */
+typedef wasm_component_wasi_input_stream_status_t (
+    *wasm_component_wasi_input_stream_read_callback_t)(
+    void *attachment, uint8_t *buffer, uint32_t capacity,
+    uint32_t *out_bytes_read);
+
+/**
+ * Skip synchronously on the component owner thread. For a positive max_bytes,
+ * OK requires 1..max_bytes skipped; CLOSED and FAILED require zero.
+ */
+typedef wasm_component_wasi_input_stream_status_t (
+    *wasm_component_wasi_input_stream_skip_callback_t)(
+    void *attachment, uint64_t max_bytes, uint64_t *out_bytes_skipped);
+
+/**
+ * Release attachment exactly once: synchronously on constructor failure, or
+ * on the component owner thread after successful construction.
+ */
+typedef void (*wasm_component_wasi_input_stream_drop_callback_t)(
+    void *attachment);
+
+typedef struct wasm_component_wasi_input_stream_callbacks_t {
+    uint32_t struct_size;
+    wasm_component_wasi_input_stream_read_callback_t read;
+    wasm_component_wasi_input_stream_skip_callback_t skip;
+    wasm_component_wasi_input_stream_drop_callback_t drop;
+} wasm_component_wasi_input_stream_callbacks_t;
+
+struct wasm_component_wasi_pollable_signal;
+typedef struct wasm_component_wasi_pollable_signal
+    *wasm_component_wasi_pollable_signal_t;
+
+/**
+ * Non-blocking level query made on the component owner thread, outside WAMR
+ * wait locks. It must not enter WAMR or retain/access guest memory.
+ */
+typedef bool (*wasm_component_wasi_pollable_ready_callback_t)(void *attachment);
+/**
+ * Release attachment exactly once: synchronously on constructor failure, or
+ * on the component owner thread after successful construction.
+ */
+typedef void (*wasm_component_wasi_pollable_drop_callback_t)(void *attachment);
+
+typedef struct wasm_component_wasi_pollable_callbacks_t {
+    uint32_t struct_size;
+    wasm_component_wasi_pollable_ready_callback_t ready;
+    wasm_component_wasi_pollable_drop_callback_t drop;
+} wasm_component_wasi_pollable_callbacks_t;
+#endif
 #endif
 
 /* Function instance */
@@ -271,29 +342,6 @@ typedef struct RuntimeInitArgs {
     bool enable_linux_perf;
 } RuntimeInitArgs;
 
-#ifndef LOAD_ARGS_OPTION_DEFINED
-#define LOAD_ARGS_OPTION_DEFINED
-typedef struct LoadArgs {
-    char *name;
-    /* This option is only used by the Wasm C API (see wasm_c_api.h) */
-    bool clone_wasm_binary;
-    /* False by default, used by AOT/wasm loader only.
-    If true, the AOT/wasm loader creates a copy of some module fields (e.g.
-    const strings), making it possible to free the wasm binary buffer after
-    loading. */
-    bool wasm_binary_freeable;
-
-    /* false by default, if true, don't resolve the symbols yet. The
-       wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
-       call */
-    bool no_resolve;
-#if WASM_ENABLE_COMPONENT_MODEL != 0
-    bool is_component;
-#endif
-    /* TODO: more fields? */
-} LoadArgs;
-#endif /* LOAD_ARGS_OPTION_DEFINED */
-
 #ifndef INSTANTIATION_ARGS_OPTION_DEFINED
 #define INSTANTIATION_ARGS_OPTION_DEFINED
 /* WASM module instantiation arguments */
@@ -305,6 +353,32 @@ typedef struct InstantiationArgs {
 #endif /* INSTANTIATION_ARGS_OPTION_DEFINED */
 
 struct InstantiationArgs2;
+
+/**
+ * Optional aggregate linear-memory page quota callbacks.
+ *
+ * The reserve callback is invoked before committing newly owned WebAssembly
+ * memory pages, including initial pages and memory.grow.  The release callback
+ * is invoked when a failed reservation is rolled back or when committed pages
+ * are retired.  Callbacks may be shared by several module/component instances
+ * and therefore must be thread-safe.
+ */
+typedef bool (*wasm_memory_page_quota_reserve_callback_t)(void *attachment,
+                                                          uint32_t pages);
+typedef void (*wasm_memory_page_quota_release_callback_t)(void *attachment,
+                                                          uint32_t pages);
+
+/**
+ * Optional aggregate native file-descriptor quota callbacks.
+ *
+ * The reserve callback runs before quota-aware WASI Preview 2 operations
+ * create descriptors owned by the component. The release callback runs after
+ * close or reservation rollback. Shared callbacks must be thread-safe.
+ */
+typedef bool (*wasm_native_fd_quota_reserve_callback_t)(void *attachment,
+                                                        uint32_t fd_count);
+typedef void (*wasm_native_fd_quota_release_callback_t)(void *attachment,
+                                                        uint32_t fd_count);
 
 #ifndef WASM_VALKIND_T_DEFINED
 #define WASM_VALKIND_T_DEFINED
@@ -445,6 +519,7 @@ wasm_runtime_destroy(void);
 
 /**
  * Allocate memory from runtime memory environment.
+ * The returned pointer is aligned for any fundamental C object type.
  *
  * @param size bytes need to allocate
  *
@@ -471,6 +546,9 @@ wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment);
 
 /**
  * Reallocate memory from runtime memory environment
+ * A null pointer is handled as wasm_runtime_malloc(). A zero size frees a
+ * non-aligned allocation and returns NULL. Explicitly aligned allocations
+ * cannot be reallocated and remain owned by the caller when NULL is returned.
  *
  * @param ptr the original memory
  * @param size bytes need to reallocate
@@ -491,9 +569,7 @@ wasm_runtime_realloc(void *ptr, unsigned int size);
 WASM_RUNTIME_API_EXTERN void *
 wasm_runtime_calloc(uint64_t count, unsigned int size);
 
-/*
- * Free memory to runtime memory environment.
- */
+/* Free memory to runtime memory environment. A null pointer is a no-op. */
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_free(void *ptr);
 
@@ -600,7 +676,7 @@ WASM_RUNTIME_API_EXTERN void
 wasm_runtime_set_module_reader(const module_reader reader,
                                const module_destroyer destroyer);
 /**
- * Give the "module" a name "module_name".
+ * Give the "module" a copied name "module_name".
  * Can not assign a new name to a module if it already has a name
  *
  * @param module_name indicate a name
@@ -613,6 +689,29 @@ wasm_runtime_set_module_reader(const module_reader reader,
 WASM_RUNTIME_API_EXTERN bool
 wasm_runtime_register_module(const char *module_name, wasm_module_t module,
                              char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Try to remove a module from the multi-module registry without unloading it.
+ *
+ * A registered module is owned by the runtime, so wasm_runtime_unload() does
+ * not release it.  After this call removes the module from the registry, the
+ * caller owns the module again and should release it with
+ * wasm_runtime_unload().  Unload parent modules before dependencies that they
+ * reference.
+ *
+ * A dependency loaded by the configured module_reader remains runtime-owned
+ * and registered so its backing buffer can be released by the configured
+ * module_destroyer after the module is unloaded during wasm_runtime_destroy().
+ * Calling this function for NULL or an unregistered module succeeds without
+ * taking any action.
+ *
+ * @param module the module to remove from the registry
+ *
+ * @return true if the module is no longer registered, false if it remains
+ *         registered because it owns a module_reader buffer
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_runtime_unregister_module(wasm_module_t module);
 
 /**
  * Check if there is already a loaded module named module_name in the
@@ -658,6 +757,36 @@ wasm_runtime_load_ex(uint8_t *buf, uint32_t size, const LoadArgs *args,
                      char *error_buf, uint32_t error_buf_size);
 
 /**
+ * Initialize versioned loader settings.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_load_args2_init(LoadArgs2 *args);
+
+/**
+ * Attach a native-allocation quota to versioned loader settings.
+ *
+ * Passing five NULL attachment/callback values disables accounting. Any
+ * partially specified callback set is rejected before loading begins.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_load_args2_set_allocation_quota(
+    LoadArgs2 *args, void *attachment,
+    wasm_allocation_quota_reserve_callback_t reserve_callback,
+    wasm_allocation_quota_release_callback_t release_callback,
+    wasm_allocation_quota_attachment_retain_callback_t retain_callback,
+    wasm_allocation_quota_attachment_release_callback_t
+        attachment_release_callback);
+
+/**
+ * Load a WASM module using sized, versioned settings. A configured allocation
+ * quota is installed before the first loader allocation and fails closed if
+ * its owner cannot be established.
+ */
+WASM_RUNTIME_API_EXTERN wasm_module_t
+wasm_runtime_load_ex2(uint8_t *buf, uint32_t size, const LoadArgs2 *args,
+                      char *error_buf, uint32_t error_buf_size);
+
+/**
  * Resolve symbols for a previously loaded WASM module. Only useful when the
  * module was loaded with LoadArgs::no_resolve set to true
  */
@@ -679,6 +808,11 @@ wasm_runtime_load_from_sections(wasm_section_list_t section_list, bool is_aot,
 
 /**
  * Unload a WASM module.
+ *
+ * When the multi-module feature is enabled, this function leaves registered
+ * modules intact because the runtime owns them.  Call
+ * wasm_runtime_unregister_module() first to transfer ownership back to the
+ * caller, and unload the module immediately only when it returns true.
  *
  * @param module the module to be unloaded
  */
@@ -716,7 +850,7 @@ wasm_runtime_get_module_hash(wasm_module_t module);
  * @param env_count     The number of elements in env.
  * @param argv          The list of command line arguments.
  * @param argc          The number of elements in argv.
- * @param stdin_handle  The raw host handle to back WASI STDIN_FILENO.
+ * @param stdinfd       The raw host handle to back WASI STDIN_FILENO.
  *                      If an invalid handle is specified (e.g. -1 on POSIX,
  *                      INVALID_HANDLE_VALUE on Windows), the platform default
  *                      for STDIN is used.
@@ -821,6 +955,33 @@ wasm_runtime_instantiation_args_set_host_managed_heap_size(
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_max_memory_pages(
     struct InstantiationArgs2 *p, uint32_t v);
+
+/**
+ * Set an aggregate committed-page quota shared by this instantiation and any
+ * nested core instances which inherit its InstantiationArgs2.
+ *
+ * Passing NULL callbacks disables aggregate quota accounting.  Otherwise both
+ * callbacks must be non-NULL and attachment remains owned by the caller for
+ * the lifetime of every resulting module/component instance.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_instantiation_args_set_memory_page_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_memory_page_quota_reserve_callback_t reserve_callback,
+    wasm_memory_page_quota_release_callback_t release_callback);
+
+/**
+ * Set an aggregate native-descriptor quota for WASI Preview 2 resources.
+ *
+ * Passing NULL callbacks disables accounting. Otherwise both callbacks must
+ * be non-NULL. The attachment must remain live until every reservation is
+ * released; asynchronous work may release after component deinstantiation.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_instantiation_args_set_native_fd_quota(
+    struct InstantiationArgs2 *p, void *attachment,
+    wasm_native_fd_quota_reserve_callback_t reserve_callback,
+    wasm_native_fd_quota_release_callback_t release_callback);
 
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_instantiation_args_set_custom_data(struct InstantiationArgs2 *p,
@@ -1376,8 +1537,446 @@ WASM_RUNTIME_API_EXTERN const char *
 wasm_runtime_get_exception(wasm_module_inst_t module_inst);
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
+/**
+ * Load and validate a WebAssembly component from a byte buffer.
+ *
+ * The buffer must be writable and remain alive and unchanged until
+ * wasm_component_unload() returns.  A component and all of its instances are
+ * confined to the thread which owns them unless an API explicitly documents
+ * cross-thread use.
+ *
+ * @param buf writable component binary data
+ * @param size size of buf in bytes
+ * @param load_args optional loader settings; is_component is forced to true
+ * @param error_buf optional buffer which receives a load error
+ * @param error_buf_size size of error_buf in bytes
+ *
+ * @return a validated component on success, NULL on failure
+ */
+WASM_RUNTIME_API_EXTERN WASMComponent *
+wasm_component_load(uint8_t *buf, uint32_t size, const LoadArgs *load_args,
+                    char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Load and validate a component using sized, versioned loader settings.
+ */
+WASM_RUNTIME_API_EXTERN WASMComponent *
+wasm_component_load_ex2(uint8_t *buf, uint32_t size, const LoadArgs2 *load_args,
+                        char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Unload a component.
+ *
+ * All prepared calls must be destroyed and all component instances must be
+ * deinstantiated before this function is called.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_unload(WASMComponent *component);
+
+/**
+ * Register the owner-drop callback for an imported resource before component
+ * instantiation.
+ *
+ * Names are exact WIT interface/resource names; interface_name includes its
+ * version. The registration belongs to component and remains valid until
+ * wasm_component_unload(). During instantiation it is copied into each
+ * matching imported resource type before any core start/constructor can run.
+ * The callback's context argument is the per-instance custom_data supplied in
+ * InstantiationArgs2.
+ *
+ * Call this on the component's owner thread after load and before creating any
+ * instances.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_register_host_resource_drop_callback(
+    WASMComponent *component, const char *interface_name,
+    const char *resource_name,
+    wasm_component_host_resource_drop_callback_t callback);
+
 WASM_RUNTIME_API_EXTERN const char *
 wasm_component_runtime_get_exception(WASMComponentInstance *comp_inst);
+
+/**
+ * Prepare a synchronous component export for allocation-free flat calls.
+ *
+ * This resolves the export and creates its core execution environment.  The
+ * returned handle uses the canonical ABI's flattened core signature: only
+ * WASM_I32, WASM_I64, WASM_F32, and WASM_F64 values are accepted.  It does
+ * not parse WAVE text or perform WIT lifting/lowering.
+ *
+ * This compatibility entrypoint resolves a leaf function name using WAMR's
+ * legacy first-match lookup.  Generated bindings should use
+ * wasm_component_prepare_export_call_qualified() so duplicate function names
+ * in different interfaces cannot be confused.
+ *
+ * The handle is thread-affine and non-reentrant.  Prepare it on the thread
+ * which will call it, and keep both the component instance and that thread
+ * alive until wasm_component_destroy_prepared_call() returns.
+ *
+ * @param comp_inst the component instance containing the export
+ * @param export_name the exported component function name
+ * @param error_buf optional buffer which receives a preparation error
+ * @param error_buf_size size of error_buf in bytes
+ *
+ * @return a prepared call on success, NULL on failure
+ */
+WASM_RUNTIME_API_EXTERN WASMComponentPreparedCall *
+wasm_component_prepare_export_call(WASMComponentInstance *comp_inst,
+                                   const char *export_name, char *error_buf,
+                                   uint32_t error_buf_size);
+
+/**
+ * Prepare a synchronous component export by its interface and function name.
+ *
+ * interface_name is matched exactly against the component's exported
+ * interface instance name.  For a versioned interface it must contain the
+ * full version suffix, for example "test:project/my-interface@0.1.0".  The
+ * lookup never falls back to an unqualified or first-matching function.
+ *
+ * The returned handle has the same lifetime, thread-affinity, signature, and
+ * allocation behavior as wasm_component_prepare_export_call().
+ *
+ * @param comp_inst the component instance containing the interface export
+ * @param interface_name the complete exported interface instance name
+ * @param export_name the function name within that interface
+ * @param error_buf optional buffer which receives a preparation error
+ * @param error_buf_size size of error_buf in bytes
+ *
+ * @return a prepared call on success, NULL on failure
+ */
+WASM_RUNTIME_API_EXTERN WASMComponentPreparedCall *
+wasm_component_prepare_export_call_qualified(WASMComponentInstance *comp_inst,
+                                             const char *interface_name,
+                                             const char *export_name,
+                                             char *error_buf,
+                                             uint32_t error_buf_size);
+
+/**
+ * Report whether this export declares a canonical post-return function.
+ *
+ * This property is available immediately after preparation, before calling
+ * the export. A successful call requires
+ * wasm_component_prepared_call_post_return() exactly when this returns true.
+ * Embedders which cannot safely lift guest-backed results may use this query
+ * to reject the prepared call before executing it.
+ *
+ * @return true when successful calls require post-return, false otherwise
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_prepared_call_requires_post_return(
+    const WASMComponentPreparedCall *prepared_call);
+
+/**
+ * Call a prepared component export with canonical flattened values.
+ *
+ * The argument/result counts and kinds must exactly match the prepared core
+ * signature.  After preparation the adapter performs no heap allocation; it
+ * uses scratch storage owned by the prepared handle.  Allocations explicitly
+ * performed by guest code or host imports are outside this guarantee.
+ *
+ * If the export has a canonical post-return function, a successful call
+ * retains guest-backed result storage.  The caller must finish lifting or
+ * copying those results and then call
+ * wasm_component_prepared_call_post_return() before another call or destroy.
+ *
+ * @return true on success, false on failure; component exception is set
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_call_prepared(WASMComponentPreparedCall *prepared_call,
+                             uint32_t num_results, wasm_val_t results[],
+                             uint32_t num_args, const wasm_val_t args[]);
+
+/**
+ * Complete the last prepared call's canonical post-return step.
+ *
+ * This is a no-op when the export has no post-return function.  It performs
+ * no adapter heap allocation.  Call it only from the prepared handle's owning
+ * thread.  Guest post-return code may itself allocate.
+ *
+ * @return true on success, false on failure; component exception is set
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_prepared_call_post_return(
+    WASMComponentPreparedCall *prepared_call);
+
+/**
+ * Destroy a prepared component call.
+ *
+ * This does not implicitly execute a pending post-return.  The caller must
+ * complete post-return before destroying the handle.  Destroy must run on the
+ * handle's owning thread and before its component instance is deinstantiated.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_destroy_prepared_call(WASMComponentPreparedCall *prepared_call);
+
+WASM_RUNTIME_API_EXTERN WASMComponentInstance *
+wasm_component_instantiate_ex2(WASMComponent *component,
+                               const struct InstantiationArgs2 *args,
+                               char *error_buf, uint32_t error_buf_size);
+
+/**
+ * Deinstantiate a component on its owning thread.
+ *
+ * Destroy all prepared calls and join any thread executing this instance
+ * before deinstantiating it.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_deinstantiate(WASMComponentInstance *comp_inst);
+
+/**
+ * Request asynchronous termination of a component instance.
+ *
+ * This is the component API which may be called by a control thread while the
+ * instance's owning thread is executing Wasm.  It recursively terminates the
+ * instance's defined core and nested component instances. Interruptible
+ * wasi:io poll waits return as termination, never as a ready event, even when
+ * no host notifier or other event occurs. The owner must return from execution
+ * and be joined before prepared calls, the instance, or its component buffer
+ * are destroyed.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_terminate(WASMComponentInstance *comp_inst);
+
+/**
+ * Replace the component instance's custom data on its owning thread.
+ *
+ * The update is propagated to nested/core instances and to host-resource drop
+ * callbacks which inherited their attachment from InstantiationArgs2.
+ * Attachments explicitly installed with
+ * wasm_component_set_host_resource_drop_callback() remain unchanged.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_set_custom_data(WASMComponentInstance *comp_inst,
+                               void *custom_data);
+
+WASM_RUNTIME_API_EXTERN void *
+wasm_component_get_custom_data(WASMComponentInstance *comp_inst);
+
+WASM_RUNTIME_API_EXTERN void *
+wasm_component_get_custom_data_from_exec_env(wasm_exec_env_t exec_env);
+
+/**
+ * Report whether exec_env is currently handling a raw component host import.
+ *
+ * The result is true only for the dynamic extent of the callback on its
+ * calling thread. It does not require canonical memory or non-NULL custom
+ * data, and becomes false as soon as the callback returns.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_exec_env_is_callback(wasm_exec_env_t exec_env);
+
+/**
+ * Create a canonical own-resource handle from a host representation.
+ *
+ * Call this only from an exact raw native component import callback. The
+ * interface name must include its complete version. The resource is resolved
+ * nominally from the current callback's component signature, so an unrelated
+ * resource with the same leaf name cannot be selected accidentally.
+ *
+ * Generated static bindings should call this once for each host-owned
+ * resource returned through the canonical flat ABI, then write out_handle to
+ * the corresponding result cell. The nonzero representation remains owned by
+ * the component until it is transferred out or its registered owner-drop
+ * callback runs.
+ *
+ * @return true on success; false for invalid context, names, representation,
+ *         ambiguous nominal types, or allocation failure
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_host_resource_new(wasm_exec_env_t exec_env,
+                                 const char *interface_name,
+                                 const char *resource_name,
+                                 uint32_t representation, uint32_t *out_handle);
+
+/**
+ * Resolve a borrowed canonical resource handle to its host representation.
+ *
+ * Call this from an exact raw native component import callback for a borrow
+ * parameter. The function signature and fully versioned names are checked
+ * nominally. This does not transfer or destroy the handle.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_host_resource_rep(wasm_exec_env_t exec_env,
+                                 const char *interface_name,
+                                 const char *resource_name, uint32_t handle,
+                                 uint32_t *out_representation);
+
+/**
+ * Consume an owned canonical resource parameter and return its representation.
+ *
+ * This is the ownership-transferring counterpart to
+ * wasm_component_host_resource_rep(). It fails while the handle has active
+ * borrows and never invokes the registered owner-drop callback.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_host_resource_take(wasm_exec_env_t exec_env,
+                                  const char *interface_name,
+                                  const char *resource_name, uint32_t handle,
+                                  uint32_t *out_representation);
+
+/**
+ * Install the owner-drop callback for an imported component resource type.
+ *
+ * interface_name and resource_name are exact WIT names, including the
+ * interface version. This per-instance API overrides or installs a callback
+ * after instantiation; use
+ * wasm_component_register_host_resource_drop_callback() when core
+ * starts/constructors may create or drop the resource during instantiation.
+ * The callback is invoked on the owner thread for each owned representation,
+ * including during component teardown. A false result traps the drop, but the
+ * handle is still consumed exactly once.
+ *
+ * Resources whose complete interface was resolved through WAMR's built-in
+ * WASI Preview 2 implementation retain their existing resource-table fallback
+ * when no callback is installed. An exact statically registered wasi: import,
+ * like every other imported owned resource, requires a callback; omitting one
+ * is reported as a drop failure instead of deleting an unrelated built-in
+ * table entry with the same representation.
+ *
+ * @return true when at least one exact resource type was configured
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_set_host_resource_drop_callback(
+    WASMComponentInstance *comp_inst, const char *interface_name,
+    const char *resource_name,
+    wasm_component_host_resource_drop_callback_t callback, void *attachment);
+
+/**
+ * Validate a range in the canonical memory active for a component host
+ * callback.
+ *
+ * This API is only valid while synchronously handling a component host import
+ * on the callback thread. The exec_env must be the one supplied to that
+ * callback.
+ *
+ * Bounds are always checked as a wasm32 range, including when configurable
+ * bounds checks are disabled. Empty ranges are valid at the end of memory.
+ *
+ * @param exec_env the execution environment supplied to the host callback
+ * @param app_offset the wasm32 offset of the first byte
+ * @param size the number of bytes in the range
+ * @return true on success, false for an invalid callback context or range. An
+ *         out-of-bounds range raises a WebAssembly exception.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_validate_memory_range(wasm_exec_env_t exec_env,
+                                     uint32_t app_offset, uint32_t size);
+
+/**
+ * Validate and translate a mutable range in the canonical memory active for a
+ * component host callback.
+ *
+ * This performs the same complete range validation, and follows the same
+ * callback rules, as wasm_component_validate_memory_range(). The returned
+ * pointer is borrowed: it must not be retained after the callback returns or
+ * across a call that can re-enter WebAssembly or grow the canonical memory.
+ *
+ * @param p_native_addr output for the translated mutable address
+ *
+ * @return true on success, false for an invalid callback context, output
+ *         pointer, or range. On failure, p_native_addr is set to NULL when it
+ *         is non-NULL. An out-of-bounds range raises a WebAssembly exception.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_get_memory_range(wasm_exec_env_t exec_env, uint32_t app_offset,
+                                uint32_t size, uint8_t **p_native_addr);
+
+/**
+ * Const-qualified variant of wasm_component_get_memory_range().
+ *
+ * The callback, lifetime, and bounds rules are identical to the mutable API.
+ * Const qualification limits host access only; guest memory remains mutable.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_get_memory_range_const(wasm_exec_env_t exec_env,
+                                      uint32_t app_offset, uint32_t size,
+                                      const uint8_t **p_native_addr);
+
+/**
+ * Invoke the canonical realloc selected for the active component callback.
+ *
+ * This is valid only during an exact raw component host-import callback. The
+ * alignment must be a power of two no greater than eight, the old allocation
+ * must be absent (both offset and size zero) or a valid aligned memory range,
+ * and the returned allocation is checked for alignment and wasm32 bounds.
+ * new_size zero frees the old allocation and returns offset zero.
+ *
+ * Calling guest realloc may re-enter WebAssembly and grow canonical memory.
+ * Hosts must not retain a pointer obtained from wasm_component_get_memory_range
+ * across this call; translate offsets again after it returns.
+ *
+ * @param out_offset receives zero on every failure
+ * @return true on success, false for invalid arguments/context, a guest trap,
+ *         or an invalid realloc result
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_cabi_realloc(wasm_exec_env_t exec_env, uint32_t old_offset,
+                            uint32_t old_size, uint32_t alignment,
+                            uint32_t new_size, uint32_t *out_offset);
+
+#if WASM_ENABLE_LIBC_WASI_P2 != 0
+/**
+ * Create an owned callback-backed wasi:io/streams input-stream@0.2.6.
+ *
+ * The constructor is callback-only and resolves the nominal input-stream from
+ * the current function's result type. It returns the canonical owned handle;
+ * the caller remains responsible for writing that handle to its flat result
+ * cell. Read and skip callbacks are synchronous and receive at most
+ * WASM_COMPONENT_WASI_INPUT_STREAM_MAX_CALLBACK_BYTES per invocation. A
+ * positive request reported as OK must make progress without blocking.
+ * Callback-backed streams therefore subscribe as always-ready pollables.
+ *
+ * The callback table is copied. Once a structurally valid table is accepted,
+ * WAMR consumes attachment even if later construction fails and invokes drop
+ * exactly once. Invalid tables are rejected without invoking their callbacks.
+ * On success attachment remains owned until explicit resource drop or
+ * component teardown. No callback is made after drop returns.
+ *
+ * @param out_handle receives zero on every failure
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_wasi_input_stream_new(
+    wasm_exec_env_t exec_env,
+    const wasm_component_wasi_input_stream_callbacks_t *callbacks,
+    void *attachment, uint32_t *out_handle);
+
+/**
+ * Create an owned, externally wakeable wasi:io/poll pollable@0.2.6.
+ *
+ * ready is a level query made only on the component owner thread and never
+ * while an internal wait lock is held. The returned signal owns a separate
+ * reference for the caller; notify may be called from any thread and never
+ * invokes host callbacks. Each successful constructor call creates a distinct
+ * canonical own handle and signal.
+ *
+ * The callback table and attachment follow the same consume-on-valid-table,
+ * exact-once-drop rules as wasm_component_wasi_input_stream_new(). On failure
+ * out_signal is NULL and out_handle is zero. On success the caller must release
+ * out_signal after synchronously unregistering every external notifier and
+ * before destroying the WAMR runtime.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_wasi_pollable_new(
+    wasm_exec_env_t exec_env,
+    const wasm_component_wasi_pollable_callbacks_t *callbacks, void *attachment,
+    wasm_component_wasi_pollable_signal_t *out_signal, uint32_t *out_handle);
+
+/**
+ * Wake waits involving a callback-backed pollable.
+ *
+ * The operation is thread-safe and level-neutral: ready remains authoritative.
+ * It returns false once the guest resource has been dropped. The caller must
+ * retain its signal reference for the complete duration of this call.
+ */
+WASM_RUNTIME_API_EXTERN bool
+wasm_component_wasi_pollable_notify(
+    wasm_component_wasi_pollable_signal_t signal);
+
+/** Release the caller-owned reference returned by pollable_new. */
+WASM_RUNTIME_API_EXTERN void
+wasm_component_wasi_pollable_signal_release(
+    wasm_component_wasi_pollable_signal_t signal);
+#endif
 #endif
 
 /**
@@ -2069,7 +2668,7 @@ wasm_runtime_sum_wasm_exec_time(wasm_module_inst_t module_inst);
  * Return execution time in ms of a given wasm function with
  * func_name. If the function is not found, return 0.
  *
- * @param module_inst the WASM module instance to profile
+ * @param inst the WASM module instance to profile
  * @param func_name could be an export name or a name in the
  *                  name section
  */
@@ -2094,7 +2693,7 @@ wasm_runtime_set_max_thread_num(uint32_t num);
  * Spawn a new exec_env, the spawned exec_env
  *   can be used in other threads
  *
- * @param num the original exec_env
+ * @param exec_env the original exec_env
  *
  * @return the spawned exec_env if success, NULL otherwise
  */

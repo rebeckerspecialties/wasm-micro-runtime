@@ -469,6 +469,8 @@ flatten_functype(LiftLowerContext *cx, WASMComponentFuncTypeInstance *ft,
             // Clean up params on failure
             if (out->params.val_types) {
                 wasm_runtime_free(out->params.val_types);
+                out->params.val_types = NULL;
+                out->params.count = 0;
             }
             set_component_exception(cx, "failed to build core results");
             return false;
@@ -515,6 +517,8 @@ flatten_functype(LiftLowerContext *cx, WASMComponentFuncTypeInstance *ft,
             // Clean up params on failure
             if (out->params.val_types) {
                 wasm_runtime_free(out->params.val_types);
+                out->params.val_types = NULL;
+                out->params.count = 0;
             }
             set_component_exception(cx, "failed to build core results");
             return false;
@@ -762,6 +766,15 @@ lift_flat_signed(CoreValueIter *vi, uint32_t core_width, uint32_t t_width)
 }
 
 static bool
+lift_flat_value_or_oom(LiftLowerContext *cx, wit_value_t *out)
+{
+    if (out && *out)
+        return true;
+    set_component_exception(cx, "out of memory for flattened WIT value");
+    return false;
+}
+
+static bool
 lift_flat_primitive(LiftLowerContext *cx, CoreValueIter *vi,
                     WASMComponentPrimValType primval, wit_value_t *out)
 {
@@ -869,22 +882,36 @@ lift_flat_list(LiftLowerContext *cx, CoreValueIter *vi,
                bool is_fixed_size, wit_value_t *out)
 {
     if (is_fixed_size) {
-        wit_value_t *elements = (wit_value_t *)wasm_runtime_malloc(
-            maybe_length * sizeof(wit_value_t));
-        if (!elements) {
+        wit_value_t *elements = NULL;
+        uint32_t i;
+
+        if (maybe_length > UINT32_MAX / sizeof(wit_value_t)) {
+            set_component_exception(cx, "fixed list is too large");
+            return false;
+        }
+        if (maybe_length > 0
+            && !(elements = (wit_value_t *)wasm_runtime_calloc(
+                     maybe_length, sizeof(wit_value_t)))) {
             set_component_exception(cx, "allocation failed");
             return false;
         }
 
-        for (uint32_t i = 0; i < maybe_length; i++) {
+        for (i = 0; i < maybe_length; i++) {
             if (!lift_flat(cx, vi, type, &elements[i])) {
+                while (i > 0)
+                    free_wit_value(elements[--i]);
+                wasm_runtime_free(elements);
                 return false;
             }
         }
 
         *out = wit_list_ctor(elements, maybe_length);
-
-        return true;
+        if (!*out) {
+            for (i = 0; i < maybe_length; i++)
+                free_wit_value(elements[i]);
+            wasm_runtime_free(elements);
+        }
+        return lift_flat_value_or_oom(cx, out);
     }
 
     uint32_t ptr = vi_next_i32(vi);
@@ -897,10 +924,15 @@ static bool
 lift_flat_record(LiftLowerContext *cx, CoreValueIter *vi,
                  WASMComponentRecordInstance *type, wit_value_t *out)
 {
-    ComponentWITRecordField *elements =
-        (ComponentWITRecordField *)wasm_runtime_malloc(
-            type->count * sizeof(ComponentWITRecordField));
-    if (!elements) {
+    ComponentWITRecordField *elements = NULL;
+
+    if (type->count > UINT32_MAX / sizeof(ComponentWITRecordField)) {
+        set_component_exception(cx, "record is too large");
+        return false;
+    }
+    if (type->count > 0
+        && !(elements = (ComponentWITRecordField *)wasm_runtime_calloc(
+                 type->count, sizeof(ComponentWITRecordField)))) {
         set_component_exception(cx, "out of memory for record elements");
         return false;
     }
@@ -922,11 +954,27 @@ lift_flat_record(LiftLowerContext *cx, CoreValueIter *vi,
 
         init_record_field(&elements[field], type->fields[field].label->name,
                           type->fields[field].label->name_len, temp);
+        if (!elements[field].key) {
+            free_wit_value(temp);
+            for (uint32_t index = 0; index < field; index++) {
+                free_wit_value(elements[index].value);
+                wasm_runtime_free(elements[index].key);
+            }
+            wasm_runtime_free(elements);
+            set_component_exception(cx, "out of memory for record field name");
+            return false;
+        }
     }
 
     *out = wit_record_ctor(elements, type->count);
-
-    return true;
+    if (!*out) {
+        for (uint32_t index = 0; index < type->count; index++) {
+            free_wit_value(elements[index].value);
+            wasm_runtime_free(elements[index].key);
+        }
+        wasm_runtime_free(elements);
+    }
+    return lift_flat_value_or_oom(cx, out);
 }
 
 static bool
@@ -970,8 +1018,9 @@ lift_flat_variant(LiftLowerContext *cx, CoreValueIter *vi,
 
     // Build variant: { c.label: v }
     *out = wit_variant_ctor(c.label->name, c.label->name_len, v);
-
-    return true;
+    if (!*out)
+        free_wit_value(v);
+    return lift_flat_value_or_oom(cx, out);
 }
 
 static bool
@@ -1008,7 +1057,12 @@ lift_flat_tuple(LiftLowerContext *cx, CoreValueIter *vi,
     }
 
     *out = wit_tuple_ctor(elems, type->count);
-    return true;
+    if (!*out) {
+        for (uint32_t index = 0; index < type->count; index++)
+            free_wit_value(elems[index]);
+        wasm_runtime_free(elems);
+    }
+    return lift_flat_value_or_oom(cx, out);
 }
 
 static bool
@@ -1020,7 +1074,7 @@ lift_flat_enum(LiftLowerContext *cx, CoreValueIter *vi,
     trap_if(case_index >= type->count);
 
     *out = wit_enum_ctor(case_index);
-    return true;
+    return lift_flat_value_or_oom(cx, out);
 }
 
 static bool
@@ -1065,8 +1119,9 @@ lift_flat_option(LiftLowerContext *cx, CoreValueIter *vi,
     else {
         *out = wit_option_ctor(v);
     }
-
-    return true;
+    if (!*out)
+        free_wit_value(v);
+    return lift_flat_value_or_oom(cx, out);
 }
 
 static bool
@@ -1113,13 +1168,14 @@ lift_flat_result(LiftLowerContext *cx, CoreValueIter *vi,
     else {
         *out = wit_result_ctor(true, v);
     }
-
-    return true;
+    if (!*out)
+        free_wit_value(v);
+    return lift_flat_value_or_oom(cx, out);
 }
 
-bool
-lift_flat(LiftLowerContext *cx, CoreValueIter *vi,
-          WASMComponentTypeInstance *type, wit_value_t *out)
+static bool
+lift_flat_impl(LiftLowerContext *cx, CoreValueIter *vi,
+               WASMComponentTypeInstance *type, wit_value_t *out)
 {
     switch (type->type) {
         case COMPONENT_VAL_TYPE_PRIMVAL:
@@ -1196,6 +1252,33 @@ lift_flat(LiftLowerContext *cx, CoreValueIter *vi,
 
     set_component_exception(cx, "invalid type to lift_flat");
     return false;
+}
+
+bool
+lift_flat(LiftLowerContext *cx, CoreValueIter *vi,
+          WASMComponentTypeInstance *type, wit_value_t *out)
+{
+    CanonicalResourceTransferScope scope;
+    bool success;
+
+    if (!out)
+        return false;
+    *out = NULL;
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LIFT)) {
+        set_component_exception(cx, "failed to begin flattened value lift");
+        return false;
+    }
+
+    success = lift_flat_impl(cx, vi, type, out);
+    if (success && !*out)
+        success = lift_flat_value_or_oom(cx, out);
+    success = canonical_resource_transfer_scope_leave(&scope, success);
+    if (!success && *out) {
+        free_wit_value(*out);
+        *out = NULL;
+    }
+    return success;
 }
 
 // Lower Flat
@@ -1331,7 +1414,8 @@ lower_flat_list(LiftLowerContext *cx, WASMComponentTypeInstance *type,
                 return false;
             }
 
-            cvl_extend(out, &flat);
+            if (!cvl_extend(out, &flat))
+                return false;
         }
 
         return true;
@@ -1356,7 +1440,8 @@ lower_flat_record(LiftLowerContext *cx, WASMComponentRecordInstance *type,
             return false;
         }
 
-        cvl_extend(out, &flat);
+        if (!cvl_extend(out, &flat))
+            return false;
     }
 
     return true;
@@ -1435,10 +1520,12 @@ lower_flat_variant(LiftLowerContext *cx, WASMComponentVariantInstance *type,
     while (variant_flat_index < variant_flat.count) {
         CoreValType want = variant_flat.types[variant_flat_index++];
         if (want == CORE_TYPE_I32 || want == CORE_TYPE_F32) {
-            cvl_push_i32(&payload, 0);
+            if (!cvl_push_i32(&payload, 0))
+                return false;
         }
         else {
-            cvl_push_i64(&payload, 0);
+            if (!cvl_push_i64(&payload, 0))
+                return false;
         }
     }
 
@@ -1480,7 +1567,8 @@ lower_flat_tuple(LiftLowerContext *cx, WASMComponentTupleInstance *type,
                         value->value.tuple_value.elems[i])) {
             return false;
         }
-        cvl_extend(out, &flat);
+        if (!cvl_extend(out, &flat))
+            return false;
     }
     return true;
 }
@@ -1562,10 +1650,12 @@ lower_flat_option(LiftLowerContext *cx, WASMComponentOptionInstance *type,
     while (option_flat_index < option_flat.count) {
         CoreValType want = option_flat.types[option_flat_index++];
         if (want == CORE_TYPE_I32 || want == CORE_TYPE_F32) {
-            cvl_push_i32(&payload, 0);
+            if (!cvl_push_i32(&payload, 0))
+                return false;
         }
         else {
-            cvl_push_i64(&payload, 0);
+            if (!cvl_push_i64(&payload, 0))
+                return false;
         }
     }
 
@@ -1646,10 +1736,12 @@ lower_flat_result(LiftLowerContext *cx, WASMComponentResultInstance *type,
     while (result_flat_index < result_flat.count) {
         CoreValType want = result_flat.types[result_flat_index++];
         if (want == CORE_TYPE_I32 || want == CORE_TYPE_F32) {
-            cvl_push_i32(&payload, 0);
+            if (!cvl_push_i32(&payload, 0))
+                return false;
         }
         else {
-            cvl_push_i64(&payload, 0);
+            if (!cvl_push_i64(&payload, 0))
+                return false;
         }
     }
 
@@ -1661,9 +1753,9 @@ lower_flat_result(LiftLowerContext *cx, WASMComponentResultInstance *type,
     return cvl_extend(out, &payload);
 }
 
-bool
-lower_flat(LiftLowerContext *cx, WASMComponentTypeInstance *type,
-           CoreValueList *out, wit_value_t value)
+static bool
+lower_flat_impl(LiftLowerContext *cx, WASMComponentTypeInstance *type,
+                CoreValueList *out, wit_value_t value)
 {
     switch (type->type) {
         case COMPONENT_VAL_TYPE_PRIMVAL:
@@ -1753,6 +1845,29 @@ lower_flat(LiftLowerContext *cx, WASMComponentTypeInstance *type,
 
     set_component_exception(cx, "invalid type for lower_flat");
     return false;
+}
+
+bool
+lower_flat(LiftLowerContext *cx, WASMComponentTypeInstance *type,
+           CoreValueList *out, wit_value_t value)
+{
+    CanonicalResourceTransferScope scope;
+    uint32_t original_count;
+    bool success;
+
+    if (!out)
+        return false;
+    original_count = out->count;
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+        set_component_exception(cx, "failed to begin flattened value lower");
+        return false;
+    }
+    success = lower_flat_impl(cx, type, out, value);
+    success = canonical_resource_transfer_scope_leave(&scope, success);
+    if (!success)
+        out->count = original_count;
+    return success;
 }
 
 // Lifting and Lowering Values
@@ -1995,10 +2110,11 @@ lift_flat_values_results(LiftLowerContext *cx, uint32_t max_flat,
     return true;
 }
 
-bool
-lift_flat_values(LiftLowerContext *cx, uint32_t max_flat, CoreValueIter *vi,
-                 WASMComponentParamListInstance *params,
-                 WASMComponentResultListInstance *results, wit_value_t *out)
+static bool
+lift_flat_values_impl(LiftLowerContext *cx, uint32_t max_flat,
+                      CoreValueIter *vi, WASMComponentParamListInstance *params,
+                      WASMComponentResultListInstance *results,
+                      wit_value_t *out)
 {
     if (params && !results) {
         return lift_flat_values_params(cx, max_flat, vi, params, out);
@@ -2009,6 +2125,32 @@ lift_flat_values(LiftLowerContext *cx, uint32_t max_flat, CoreValueIter *vi,
     }
 
     return false;
+}
+
+bool
+lift_flat_values(LiftLowerContext *cx, uint32_t max_flat, CoreValueIter *vi,
+                 WASMComponentParamListInstance *params,
+                 WASMComponentResultListInstance *results, wit_value_t *out)
+{
+    CanonicalResourceTransferScope scope;
+    bool success;
+
+    if (!out)
+        return false;
+    *out = NULL;
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LIFT)) {
+        set_component_exception(cx, "failed to begin flattened values lift");
+        return false;
+    }
+
+    success = lift_flat_values_impl(cx, max_flat, vi, params, results, out);
+    success = canonical_resource_transfer_scope_leave(&scope, success);
+    if (!success && *out) {
+        free_wit_value(*out);
+        *out = NULL;
+    }
+    return success;
 }
 
 bool
@@ -2062,7 +2204,8 @@ lower_flat_values_params(LiftLowerContext *cx, uint32_t max_flat,
                 goto done_lower_params;
             }
 
-            cvl_push_i32(out, ptr);
+            if (!cvl_push_i32(out, ptr))
+                goto done_lower_params;
         }
         else {
             ptr = vi_next_i32(out_param);
@@ -2095,7 +2238,8 @@ lower_flat_values_params(LiftLowerContext *cx, uint32_t max_flat,
                             values->value.list_value.elems[i])) {
                 return false;
             }
-            cvl_extend(out, &flat);
+            if (!cvl_extend(out, &flat))
+                return false;
         }
         return true;
     }
@@ -2154,7 +2298,8 @@ lower_flat_values_results(LiftLowerContext *cx, uint32_t max_flat,
             if (ptr == 0) {
                 goto done_lower_results;
             }
-            cvl_push_i32(out, ptr);
+            if (!cvl_push_i32(out, ptr))
+                goto done_lower_results;
         }
         else {
             ptr = vi_next_i32(out_param);
@@ -2187,19 +2332,20 @@ lower_flat_values_results(LiftLowerContext *cx, uint32_t max_flat,
                             values->value.list_value.elems[i])) {
                 return false;
             }
-            cvl_extend(out, &flat);
+            if (!cvl_extend(out, &flat))
+                return false;
         }
         return true;
     }
 }
 
-bool
-lower_flat_values(LiftLowerContext *cx, uint32_t max_flat, wit_value_t values,
-                  WASMComponentParamListInstance *params,
-                  WASMComponentResultListInstance *results,
-                  CoreValueIter *out_param, CoreValueList *out)
+static bool
+lower_flat_values_impl(LiftLowerContext *cx, uint32_t max_flat,
+                       wit_value_t values,
+                       WASMComponentParamListInstance *params,
+                       WASMComponentResultListInstance *results,
+                       CoreValueIter *out_param, CoreValueList *out)
 {
-    cx->inst->may_leave = false;
     bool ok = false;
     if (params && !results) {
         ok = lower_flat_values_params(cx, max_flat, values, params, out_param,
@@ -2211,7 +2357,35 @@ lower_flat_values(LiftLowerContext *cx, uint32_t max_flat, wit_value_t values,
                                        out);
     }
 
-    cx->inst->may_leave = true;
-
     return ok;
+}
+
+bool
+lower_flat_values(LiftLowerContext *cx, uint32_t max_flat, wit_value_t values,
+                  WASMComponentParamListInstance *params,
+                  WASMComponentResultListInstance *results,
+                  CoreValueIter *out_param, CoreValueList *out)
+{
+    CanonicalResourceTransferScope scope;
+    uint32_t original_count;
+    bool saved_may_leave;
+    bool success;
+
+    if (!out || !cx || !cx->inst)
+        return false;
+    original_count = out->count;
+    if (!canonical_resource_transfer_scope_enter(
+            &scope, cx, WASM_COMPONENT_TABLE_TRANSACTION_LOWER)) {
+        set_component_exception(cx, "failed to begin flattened values lower");
+        return false;
+    }
+    saved_may_leave = cx->inst->may_leave;
+    cx->inst->may_leave = false;
+    success = lower_flat_values_impl(cx, max_flat, values, params, results,
+                                     out_param, out);
+    cx->inst->may_leave = saved_may_leave;
+    success = canonical_resource_transfer_scope_leave(&scope, success);
+    if (!success)
+        out->count = original_count;
+    return success;
 }

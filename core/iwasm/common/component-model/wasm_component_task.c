@@ -5,6 +5,8 @@
 
 #include "wasm_component_task.h"
 #include "wasm_component_resource.h"
+#include "wasm_component_resource_table.h"
+#include "bh_log.h"
 
 Task *
 task_create(CanonicalOptions *opts, WASMComponentInstance *inst,
@@ -49,6 +51,14 @@ task_destroy(Task *task)
 {
     if (!task)
         return;
+
+    if (task->num_borrows > 0
+        && (!task->inst || !task->inst->table
+            || !wasm_component_table_remove_task_borrows(task->inst->table,
+                                                         task))) {
+        LOG_ERROR("component task: failed to clean up borrowed handles");
+        return;
+    }
 
     // For sync, just free
     // For async, would need to check threads are done or something else
@@ -110,7 +120,10 @@ subtask_deliver_resolve(Subtask *subtask)
 
     // Decrement all lend counts
     for (uint32_t i = 0; i < subtask->lenders_count; i++) {
-        subtask->lenders[i]->num_lends--;
+        if (subtask->lenders[i] && subtask->lenders[i]->num_lends > 0)
+            subtask->lenders[i]->num_lends--;
+        else
+            LOG_ERROR("component subtask: lender count underflow");
     }
 
     // Clear the list (marks as delivered)
@@ -120,6 +133,7 @@ subtask_deliver_resolve(Subtask *subtask)
     }
 
     subtask->lenders_count = 0;
+    subtask->lenders_capacity = 0;
 }
 
 void
@@ -128,8 +142,6 @@ subtask_destroy(Subtask *subtask)
     if (!subtask)
         return;
 
-    if (subtask->lenders) {
-        wasm_runtime_free((void *)subtask->lenders);
-    }
+    subtask_deliver_resolve(subtask);
     wasm_runtime_free(subtask);
 }

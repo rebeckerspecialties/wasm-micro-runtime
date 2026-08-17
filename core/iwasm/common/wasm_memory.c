@@ -7,6 +7,7 @@
 #include "../interpreter/wasm_runtime.h"
 #include "../aot/aot_runtime.h"
 #include "mem_alloc.h"
+#include "wasm_allocation_quota.h"
 #include "wasm_memory.h"
 
 #if WASM_ENABLE_SHARED_MEMORY != 0
@@ -28,6 +29,41 @@ static Memory_Mode memory_mode = MEMORY_MODE_UNKNOWN;
 
 static mem_allocator_t pool_allocator = NULL;
 
+struct WASMAllocationQuotaToken {
+    korp_mutex lock;
+    uint32 ref_count;
+    void *attachment;
+    wasm_allocation_quota_reserve_callback_t reserve;
+    wasm_allocation_quota_release_callback_t release;
+    wasm_allocation_quota_attachment_retain_callback_t attachment_retain;
+    wasm_allocation_quota_attachment_release_callback_t attachment_release;
+};
+
+#if defined(os_thread_local_attribute)
+static os_thread_local_attribute WASMAllocationQuotaToken
+    *current_allocation_quota;
+static os_thread_local_attribute WASMAllocationQuotaThreadLease
+    *current_allocation_quota_thread_lease;
+static os_thread_local_attribute WASMAllocationQuotaScope
+    *current_allocation_quota_scope;
+#elif defined(_MSC_VER)
+static __declspec(thread) WASMAllocationQuotaToken *current_allocation_quota;
+static __declspec(thread)
+    WASMAllocationQuotaThreadLease *current_allocation_quota_thread_lease;
+static __declspec(thread)
+    WASMAllocationQuotaScope *current_allocation_quota_scope;
+#elif defined(__GNUC__) || defined(__clang__)
+static __thread WASMAllocationQuotaToken *current_allocation_quota;
+static __thread WASMAllocationQuotaThreadLease
+    *current_allocation_quota_thread_lease;
+static __thread WASMAllocationQuotaScope *current_allocation_quota_scope;
+#else
+static _Thread_local WASMAllocationQuotaToken *current_allocation_quota;
+static _Thread_local WASMAllocationQuotaThreadLease
+    *current_allocation_quota_thread_lease;
+static _Thread_local WASMAllocationQuotaScope *current_allocation_quota_scope;
+#endif
+
 #if WASM_ENABLE_SHARED_HEAP != 0
 static WASMSharedHeap *shared_heap_list = NULL;
 static korp_mutex shared_heap_list_lock;
@@ -35,6 +71,54 @@ static korp_mutex shared_heap_list_lock;
 
 static enlarge_memory_error_callback_t enlarge_memory_error_cb;
 static void *enlarge_memory_error_user_data;
+
+void
+wasm_memory_set_page_quota(WASMMemoryInstance *memory_inst,
+                           const struct InstantiationArgs2 *args)
+{
+    bh_assert(memory_inst);
+
+    memory_inst->page_quota_attachment =
+        args ? args->memory_page_quota_attachment : NULL;
+    memory_inst->page_quota_reserve =
+        args ? args->memory_page_quota_reserve : NULL;
+    memory_inst->page_quota_release =
+        args ? args->memory_page_quota_release : NULL;
+    memory_inst->page_quota_reserved_pages = 0;
+}
+
+bool
+wasm_memory_reserve_page_quota(WASMMemoryInstance *memory_inst, uint32 pages)
+{
+    bh_assert(memory_inst);
+
+    if (pages == 0)
+        return true;
+    if (!memory_inst->page_quota_reserve)
+        return true;
+    if (UINT32_MAX - memory_inst->page_quota_reserved_pages < pages)
+        return false;
+    if (!memory_inst->page_quota_reserve(memory_inst->page_quota_attachment,
+                                         pages))
+        return false;
+
+    memory_inst->page_quota_reserved_pages += pages;
+    return true;
+}
+
+void
+wasm_memory_release_page_quota(WASMMemoryInstance *memory_inst, uint32 pages)
+{
+    bh_assert(memory_inst);
+
+    if (pages == 0 || !memory_inst->page_quota_release)
+        return;
+    bh_assert(pages <= memory_inst->page_quota_reserved_pages);
+    if (pages > memory_inst->page_quota_reserved_pages)
+        pages = memory_inst->page_quota_reserved_pages;
+    memory_inst->page_quota_reserved_pages -= pages;
+    memory_inst->page_quota_release(memory_inst->page_quota_attachment, pages);
+}
 
 #if WASM_MEM_ALLOC_WITH_USER_DATA != 0
 static void *allocator_user_data = NULL;
@@ -943,7 +1027,7 @@ wasm_runtime_memory_pool_size(void)
 }
 
 static inline void *
-wasm_runtime_malloc_internal(unsigned int size)
+wasm_runtime_malloc_direct(unsigned int size)
 {
     if (memory_mode == MEMORY_MODE_UNKNOWN) {
         LOG_WARNING(
@@ -969,7 +1053,7 @@ wasm_runtime_malloc_internal(unsigned int size)
 }
 
 static inline void *
-wasm_runtime_realloc_internal(void *ptr, unsigned int size)
+wasm_runtime_realloc_direct(void *ptr, unsigned int size)
 {
     if (memory_mode == MEMORY_MODE_UNKNOWN) {
         LOG_WARNING(
@@ -998,15 +1082,10 @@ wasm_runtime_realloc_internal(void *ptr, unsigned int size)
 }
 
 static inline void
-wasm_runtime_free_internal(void *ptr)
+wasm_runtime_free_direct(void *ptr)
 {
-    if (!ptr) {
-        LOG_WARNING("warning: wasm_runtime_free with NULL pointer\n");
-#if BH_ENABLE_GC_VERIFY != 0
-        exit(-1);
-#endif
+    if (!ptr)
         return;
-    }
 
     if (memory_mode == MEMORY_MODE_UNKNOWN) {
         LOG_WARNING("warning: wasm_runtime_free failed: "
@@ -1030,22 +1109,586 @@ wasm_runtime_free_internal(void *ptr)
     }
 }
 
-static inline void *
-wasm_runtime_aligned_alloc_internal(unsigned int size, unsigned int alignment)
+static uint32
+wasm_allocation_quota_token_storage_size(void)
 {
-    if (memory_mode == MEMORY_MODE_UNKNOWN) {
-        LOG_ERROR("wasm_runtime_aligned_alloc failed: memory hasn't been "
-                  "initialized.\n");
+    const uint32 alignment = WASM_ALLOCATION_MAX_ALIGNMENT;
+
+    return (uint32)(((uint64)sizeof(WASMAllocationQuotaToken) + alignment - 1)
+                    & ~((uint64)alignment - 1));
+}
+
+static bool
+wasm_allocation_quota_args_are_complete(const LoadArgs2 *args)
+{
+    return args && args->allocation_quota_attachment
+           && args->allocation_quota_reserve && args->allocation_quota_release
+           && args->allocation_quota_attachment_retain
+           && args->allocation_quota_attachment_release;
+}
+
+static bool
+wasm_allocation_quota_token_matches(const WASMAllocationQuotaToken *token,
+                                    const LoadArgs2 *args)
+{
+    return token && wasm_allocation_quota_args_are_complete(args)
+           && token->attachment == args->allocation_quota_attachment
+           && token->reserve == args->allocation_quota_reserve
+           && token->release == args->allocation_quota_release
+           && token->attachment_retain
+                  == args->allocation_quota_attachment_retain
+           && token->attachment_release
+                  == args->allocation_quota_attachment_release;
+}
+
+WASMAllocationQuotaToken *
+wasm_allocation_quota_token_create(const LoadArgs2 *args)
+{
+    WASMAllocationQuotaToken *token;
+    uint32 storage_size;
+
+    if (!wasm_allocation_quota_args_are_complete(args))
+        return NULL;
+
+    if (!args->allocation_quota_attachment_retain(
+            args->allocation_quota_attachment)) {
         return NULL;
     }
 
-    if (memory_mode != MEMORY_MODE_POOL) {
-        LOG_ERROR("wasm_runtime_aligned_alloc failed: only supported in POOL "
-                  "memory mode.\n");
+    storage_size = wasm_allocation_quota_token_storage_size();
+    if (!args->allocation_quota_reserve(args->allocation_quota_attachment,
+                                        storage_size, 1)) {
+        args->allocation_quota_attachment_release(
+            args->allocation_quota_attachment);
         return NULL;
     }
 
-    return mem_allocator_malloc_aligned(pool_allocator, size, alignment);
+    token = wasm_runtime_malloc_direct(storage_size);
+    if (!token) {
+        args->allocation_quota_release(args->allocation_quota_attachment,
+                                       storage_size, 1);
+        args->allocation_quota_attachment_release(
+            args->allocation_quota_attachment);
+        return NULL;
+    }
+
+    memset(token, 0, storage_size);
+    if (os_mutex_init(&token->lock) != BHT_OK) {
+        wasm_runtime_free_direct(token);
+        args->allocation_quota_release(args->allocation_quota_attachment,
+                                       storage_size, 1);
+        args->allocation_quota_attachment_release(
+            args->allocation_quota_attachment);
+        return NULL;
+    }
+
+    token->ref_count = 1;
+    token->attachment = args->allocation_quota_attachment;
+    token->reserve = args->allocation_quota_reserve;
+    token->release = args->allocation_quota_release;
+    token->attachment_retain = args->allocation_quota_attachment_retain;
+    token->attachment_release = args->allocation_quota_attachment_release;
+    return token;
+}
+
+bool
+wasm_allocation_quota_token_retain(WASMAllocationQuotaToken *token)
+{
+    bool retained = false;
+
+    if (!token)
+        return false;
+
+    os_mutex_lock(&token->lock);
+    if (token->ref_count > 0 && token->ref_count < UINT32_MAX) {
+        token->ref_count++;
+        retained = true;
+    }
+    os_mutex_unlock(&token->lock);
+    return retained;
+}
+
+void
+wasm_allocation_quota_token_release(WASMAllocationQuotaToken *token)
+{
+    bool destroy = false;
+
+    if (!token)
+        return;
+
+    os_mutex_lock(&token->lock);
+    bh_assert(token->ref_count > 0);
+    if (token->ref_count > 0) {
+        token->ref_count--;
+        destroy = token->ref_count == 0;
+    }
+    os_mutex_unlock(&token->lock);
+
+    if (destroy) {
+        void *attachment = token->attachment;
+        uint32 storage_size = wasm_allocation_quota_token_storage_size();
+        wasm_allocation_quota_release_callback_t quota_release = token->release;
+        wasm_allocation_quota_attachment_release_callback_t attachment_release =
+            token->attachment_release;
+
+        os_mutex_destroy(&token->lock);
+        wasm_runtime_free_direct(token);
+        quota_release(attachment, storage_size, 1);
+        attachment_release(attachment);
+    }
+}
+
+bool
+wasm_allocation_quota_token_reserve(WASMAllocationQuotaToken *token,
+                                    uint64_t bytes, uint32_t allocations)
+{
+    if (!token || (bytes == 0 && allocations == 0))
+        return true;
+    return token->reserve(token->attachment, bytes, allocations);
+}
+
+void
+wasm_allocation_quota_token_refund(WASMAllocationQuotaToken *token,
+                                   uint64_t bytes, uint32_t allocations)
+{
+    if (token && (bytes != 0 || allocations != 0))
+        token->release(token->attachment, bytes, allocations);
+}
+
+WASMAllocationQuotaToken *
+wasm_allocation_quota_get_current(void)
+{
+    return current_allocation_quota;
+}
+
+WASMAllocationQuotaToken *
+wasm_allocation_quota_set_current(WASMAllocationQuotaToken *token)
+{
+    WASMAllocationQuotaToken *previous = current_allocation_quota;
+
+    current_allocation_quota = token;
+    return previous;
+}
+
+static bool
+wasm_allocation_quota_scope_enter_token(WASMAllocationQuotaScope *scope,
+                                        WASMAllocationQuotaToken *token)
+{
+    WASMAllocationQuotaToken *previous;
+
+    if (!scope || !token)
+        return false;
+
+    memset(scope, 0, sizeof(*scope));
+    previous = wasm_allocation_quota_get_current();
+    if (previous && previous != token)
+        return false;
+    if (!wasm_allocation_quota_token_retain(token))
+        return false;
+
+    scope->token = token;
+    scope->previous_scope = current_allocation_quota_scope;
+    current_allocation_quota_scope = scope;
+    scope->previous = wasm_allocation_quota_set_current(token);
+    scope->active = true;
+    return true;
+}
+
+bool
+wasm_allocation_quota_scope_enter_for_load(WASMAllocationQuotaScope *scope,
+                                           const LoadArgs2 *args)
+{
+    WASMAllocationQuotaToken *token;
+    bool entered;
+
+    if (!scope || !args)
+        return false;
+    memset(scope, 0, sizeof(*scope));
+
+    if (!args->allocation_quota_attachment && !args->allocation_quota_reserve
+        && !args->allocation_quota_release
+        && !args->allocation_quota_attachment_retain
+        && !args->allocation_quota_attachment_release) {
+        return true;
+    }
+    if (!wasm_allocation_quota_args_are_complete(args))
+        return false;
+
+    token = wasm_allocation_quota_get_current();
+    if (token) {
+        if (!wasm_allocation_quota_token_matches(token, args))
+            return false;
+        return wasm_allocation_quota_scope_enter_token(scope, token);
+    }
+
+    token = wasm_allocation_quota_token_create(args);
+    if (!token)
+        return false;
+    entered = wasm_allocation_quota_scope_enter_token(scope, token);
+    wasm_allocation_quota_token_release(token);
+    return entered;
+}
+
+bool
+wasm_allocation_quota_scope_enter_for_allocation(
+    WASMAllocationQuotaScope *scope, const void *allocation)
+{
+    WASMAllocationHeader *header;
+    WASMAllocationQuotaToken *current;
+
+    if (!scope || !allocation)
+        return false;
+    memset(scope, 0, sizeof(*scope));
+
+    header = wasm_allocation_header_from_user((void *)allocation);
+    if (!header)
+        return false;
+
+    current = wasm_allocation_quota_get_current();
+    if (!header->data.owner)
+        return current == NULL;
+    if (current && current != header->data.owner)
+        return false;
+    return wasm_allocation_quota_scope_enter_token(scope, header->data.owner);
+}
+
+bool
+wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+    WASMAllocationQuotaBorrowedScope *scope, const void *allocation)
+{
+    WASMAllocationHeader *header;
+    WASMAllocationQuotaToken *current;
+
+    if (!scope || !allocation)
+        return false;
+    memset(scope, 0, sizeof(*scope));
+
+    header = wasm_allocation_header_from_user((void *)allocation);
+    if (!header)
+        return false;
+
+    current = wasm_allocation_quota_get_current();
+    if (!header->data.owner)
+        return current == NULL;
+    if (current && current != header->data.owner)
+        return false;
+
+    scope->token = header->data.owner;
+    scope->previous = wasm_allocation_quota_set_current(header->data.owner);
+    scope->active = true;
+    return true;
+}
+
+void
+wasm_allocation_quota_borrowed_scope_leave(
+    WASMAllocationQuotaBorrowedScope *scope)
+{
+    if (!scope || !scope->active)
+        return;
+
+    bh_assert(wasm_allocation_quota_get_current() == scope->token);
+    wasm_allocation_quota_set_current(scope->previous);
+    memset(scope, 0, sizeof(*scope));
+}
+
+bool
+wasm_allocation_quota_reservation_acquire_for_allocation(
+    WASMAllocationQuotaReservation *reservation, const void *allocation,
+    uint64 bytes, uint32 allocations)
+{
+    WASMAllocationHeader *header;
+    WASMAllocationQuotaToken *current;
+
+    if (!reservation || !allocation || (bytes == 0 && allocations == 0))
+        return false;
+    memset(reservation, 0, sizeof(*reservation));
+
+    header = wasm_allocation_header_from_user((void *)allocation);
+    if (!header)
+        return false;
+
+    current = wasm_allocation_quota_get_current();
+    if (!header->data.owner)
+        return current == NULL;
+    if (current && current != header->data.owner)
+        return false;
+    if (!wasm_allocation_quota_token_retain(header->data.owner))
+        return false;
+    if (!wasm_allocation_quota_token_reserve(header->data.owner, bytes,
+                                             allocations)) {
+        wasm_allocation_quota_token_release(header->data.owner);
+        return false;
+    }
+
+    reservation->token = header->data.owner;
+    reservation->bytes = bytes;
+    reservation->allocations = allocations;
+    reservation->active = true;
+    return true;
+}
+
+void
+wasm_allocation_quota_reservation_release(
+    WASMAllocationQuotaReservation *reservation)
+{
+    WASMAllocationQuotaToken *token;
+    uint64 bytes;
+    uint32 allocations;
+
+    if (!reservation || !reservation->active)
+        return;
+
+    token = reservation->token;
+    bytes = reservation->bytes;
+    allocations = reservation->allocations;
+    memset(reservation, 0, sizeof(*reservation));
+    wasm_allocation_quota_token_refund(token, bytes, allocations);
+    wasm_allocation_quota_token_release(token);
+}
+
+void
+wasm_allocation_quota_reservation_move(
+    WASMAllocationQuotaReservation *destination,
+    WASMAllocationQuotaReservation *source)
+{
+    if (!destination || !source || destination == source
+        || destination->active) {
+        return;
+    }
+
+    *destination = *source;
+    memset(source, 0, sizeof(*source));
+}
+
+bool
+wasm_allocation_quota_thread_lease_enter_for_allocation(
+    WASMAllocationQuotaThreadLease *lease, const void *allocation)
+{
+    WASMAllocationHeader *header;
+    WASMAllocationQuotaToken *current;
+
+    if (!lease || !allocation || current_allocation_quota_thread_lease)
+        return false;
+    memset(lease, 0, sizeof(*lease));
+
+    header = wasm_allocation_header_from_user((void *)allocation);
+    if (!header)
+        return false;
+    current = wasm_allocation_quota_get_current();
+    if (!header->data.owner)
+        return current == NULL;
+    if (current && current != header->data.owner)
+        return false;
+    if (!wasm_allocation_quota_token_retain(header->data.owner))
+        return false;
+
+    lease->token = header->data.owner;
+    lease->previous = wasm_allocation_quota_set_current(header->data.owner);
+    lease->active = true;
+    current_allocation_quota_thread_lease = lease;
+    return true;
+}
+
+void
+wasm_allocation_quota_thread_lease_leave(WASMAllocationQuotaThreadLease *lease)
+{
+    WASMAllocationQuotaToken *token;
+
+    if (!lease || !lease->active)
+        return;
+
+    token = lease->token;
+    bh_assert(current_allocation_quota_thread_lease == lease);
+    current_allocation_quota_thread_lease = NULL;
+    wasm_allocation_quota_set_current(lease->previous);
+    memset(lease, 0, sizeof(*lease));
+    wasm_allocation_quota_token_release(token);
+}
+
+void
+wasm_allocation_quota_thread_scope_unwind_current(void)
+{
+    WASMAllocationQuotaScope *scope;
+
+    /* A guest pthread_exit can bypass every active C frame. Release retained
+       scopes in LIFO order while their abandoned stack records are valid. */
+    while ((scope = current_allocation_quota_scope) != NULL) {
+        WASMAllocationQuotaToken *token = scope->token;
+
+        current_allocation_quota_scope = scope->previous_scope;
+        wasm_allocation_quota_set_current(scope->previous);
+        memset(scope, 0, sizeof(*scope));
+        wasm_allocation_quota_token_release(token);
+    }
+}
+
+void
+wasm_allocation_quota_thread_lease_leave_current(void)
+{
+    WASMAllocationQuotaThreadLease *lease =
+        current_allocation_quota_thread_lease;
+
+    wasm_allocation_quota_thread_scope_unwind_current();
+
+    if (lease)
+        wasm_allocation_quota_thread_lease_leave(lease);
+}
+
+bool
+wasm_allocation_quota_allocations_share_owner(const void *first,
+                                              const void *second)
+{
+    WASMAllocationHeader *first_header;
+    WASMAllocationHeader *second_header;
+
+    if (!first || !second)
+        return false;
+    first_header = wasm_allocation_header_from_user((void *)first);
+    second_header = wasm_allocation_header_from_user((void *)second);
+    return first_header && second_header
+           && first_header->data.owner == second_header->data.owner;
+}
+
+bool
+wasm_allocation_quota_allocation_matches_current(const void *allocation)
+{
+    WASMAllocationHeader *header;
+
+    if (!allocation)
+        return false;
+    header = wasm_allocation_header_from_user((void *)allocation);
+    return header && header->data.owner == wasm_allocation_quota_get_current();
+}
+
+void
+wasm_allocation_quota_scope_leave(WASMAllocationQuotaScope *scope)
+{
+    WASMAllocationQuotaToken *token;
+
+    if (!scope || !scope->active)
+        return;
+
+    token = scope->token;
+    bh_assert(wasm_allocation_quota_get_current() == token);
+    bh_assert(current_allocation_quota_scope == scope);
+    current_allocation_quota_scope = scope->previous_scope;
+    wasm_allocation_quota_set_current(scope->previous);
+    memset(scope, 0, sizeof(*scope));
+    wasm_allocation_quota_token_release(token);
+}
+
+bool
+wasm_allocation_header_calculate_size(uint32_t user_size, uint32_t alignment,
+                                      uint32_t *raw_size)
+{
+    uint64_t size;
+
+    if (!raw_size || alignment < WASM_ALLOCATION_MAX_ALIGNMENT
+        || (alignment & (alignment - 1)) != 0)
+        return false;
+
+    size = (uint64_t)sizeof(WASMAllocationHeader) + user_size + alignment - 1;
+    size = (size + alignment - 1) & ~((uint64_t)alignment - 1);
+    if (size > UINT32_MAX)
+        return false;
+
+    *raw_size = (uint32_t)size;
+    return true;
+}
+
+static uint32
+wasm_allocation_user_offset(void *raw_ptr, uint32 alignment)
+{
+    uintptr_t mask = (uintptr_t)alignment - 1;
+    uintptr_t header_end_mod =
+        (((uintptr_t)raw_ptr & mask) + (sizeof(WASMAllocationHeader) & mask))
+        & mask;
+    uint32 padding = (uint32)((alignment - header_end_mod) & mask);
+
+    return (uint32)sizeof(WASMAllocationHeader) + padding;
+}
+
+void *
+wasm_allocation_header_initialize(void *raw_ptr, uint32_t raw_size,
+                                  uint32_t user_size, uint32_t alignment,
+                                  bool explicitly_aligned,
+                                  WASMAllocationQuotaToken *owner)
+{
+    uint32 user_offset;
+    uint8 *user_ptr;
+    WASMAllocationHeader *header;
+
+    if (!raw_ptr || alignment < WASM_ALLOCATION_MAX_ALIGNMENT
+        || (alignment & (alignment - 1)) != 0)
+        return NULL;
+
+    user_offset = wasm_allocation_user_offset(raw_ptr, alignment);
+    if (user_offset > raw_size || user_size > raw_size - user_offset)
+        return NULL;
+
+    user_ptr = (uint8 *)raw_ptr + user_offset;
+    header = (WASMAllocationHeader *)(user_ptr - sizeof(*header));
+    memset(header, 0, sizeof(*header));
+    header->data.magic = WASM_ALLOCATION_HEADER_MAGIC;
+    header->data.raw_ptr = raw_ptr;
+    header->data.owner = owner;
+    header->data.user_size = user_size;
+    header->data.raw_size = raw_size;
+    header->data.alignment = alignment;
+    header->data.explicitly_aligned = explicitly_aligned;
+    return user_ptr;
+}
+
+WASMAllocationHeader *
+wasm_allocation_header_from_user(void *user_ptr)
+{
+    WASMAllocationHeader *header;
+
+    if (!user_ptr)
+        return NULL;
+
+    header = (WASMAllocationHeader *)((uint8 *)user_ptr - sizeof(*header));
+    if (header->data.magic != WASM_ALLOCATION_HEADER_MAGIC)
+        return NULL;
+    return header;
+}
+
+static void *
+wasm_runtime_allocate_owned(unsigned int size, unsigned int alignment,
+                            bool explicitly_aligned)
+{
+    WASMAllocationQuotaToken *owner = wasm_allocation_quota_get_current();
+    uint32 raw_size;
+    void *raw_ptr;
+    void *user_ptr;
+
+    if (!wasm_allocation_header_calculate_size(size, alignment, &raw_size))
+        return NULL;
+
+    if (owner) {
+        if (!wasm_allocation_quota_token_retain(owner))
+            return NULL;
+        if (!wasm_allocation_quota_token_reserve(owner, raw_size, 1)) {
+            wasm_allocation_quota_token_release(owner);
+            return NULL;
+        }
+    }
+
+    raw_ptr = wasm_runtime_malloc_direct(raw_size);
+    if (!raw_ptr) {
+        wasm_allocation_quota_token_refund(owner, raw_size, 1);
+        wasm_allocation_quota_token_release(owner);
+        return NULL;
+    }
+
+    user_ptr = wasm_allocation_header_initialize(
+        raw_ptr, raw_size, size, alignment, explicitly_aligned, owner);
+    if (!user_ptr) {
+        wasm_runtime_free_direct(raw_ptr);
+        wasm_allocation_quota_token_refund(owner, raw_size, 1);
+        wasm_allocation_quota_token_release(owner);
+    }
+    return user_ptr;
 }
 
 void *
@@ -1067,17 +1710,24 @@ wasm_runtime_malloc(unsigned int size)
     }
 #endif
 
-    return wasm_runtime_malloc_internal(size);
+    return wasm_runtime_allocate_owned(size, WASM_ALLOCATION_MAX_ALIGNMENT,
+                                       false);
 }
 
 void *
 wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment)
 {
+    unsigned int allocator_alignment;
+    unsigned int effective_alignment;
+
     if (alignment == 0) {
         LOG_WARNING(
             "warning: wasm_runtime_aligned_alloc with zero alignment\n");
         return NULL;
     }
+
+    if ((alignment & (alignment - 1)) != 0)
+        return NULL;
 
     if (size == 0) {
         LOG_WARNING("warning: wasm_runtime_aligned_alloc with size zero\n");
@@ -1088,6 +1738,26 @@ wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment)
 #endif
     }
 
+    allocator_alignment = alignment < 8 ? 8 : alignment;
+    if (allocator_alignment > (unsigned int)os_getpagesize()
+        || size % allocator_alignment != 0)
+        return NULL;
+    effective_alignment = allocator_alignment < WASM_ALLOCATION_MAX_ALIGNMENT
+                              ? WASM_ALLOCATION_MAX_ALIGNMENT
+                              : allocator_alignment;
+
+    if (memory_mode == MEMORY_MODE_UNKNOWN) {
+        LOG_ERROR("wasm_runtime_aligned_alloc failed: memory hasn't been "
+                  "initialized.\n");
+        return NULL;
+    }
+
+    if (memory_mode != MEMORY_MODE_POOL) {
+        LOG_ERROR("wasm_runtime_aligned_alloc failed: only supported in POOL "
+                  "memory mode.\n");
+        return NULL;
+    }
+
 #if WASM_ENABLE_FUZZ_TEST != 0
     if (size >= WASM_MEM_ALLOC_MAX_SIZE) {
         LOG_WARNING(
@@ -1096,29 +1766,137 @@ wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment)
     }
 #endif
 
-    return wasm_runtime_aligned_alloc_internal(size, alignment);
+    return wasm_runtime_allocate_owned(size, effective_alignment, true);
 }
 
 void *
 wasm_runtime_realloc(void *ptr, unsigned int size)
 {
-    return wasm_runtime_realloc_internal(ptr, size);
+    WASMAllocationHeader old_header;
+    WASMAllocationHeader *header;
+    WASMAllocationQuotaToken *owner;
+    void *new_raw_ptr;
+    void *new_user_ptr;
+    uint32 new_raw_size;
+    uint32 old_user_offset;
+    uint32 new_user_offset;
+    uint32 copy_size;
+    uint64 reserved_growth = 0;
+
+    if (!ptr)
+        return wasm_runtime_malloc(size);
+
+    header = wasm_allocation_header_from_user(ptr);
+    if (!header) {
+        LOG_ERROR("wasm_runtime_realloc failed: invalid allocation header\n");
+        return NULL;
+    }
+    if (wasm_allocation_quota_get_current()
+        && header->data.owner != wasm_allocation_quota_get_current()) {
+        LOG_ERROR("wasm_runtime_realloc failed: allocation owner mismatch\n");
+        return NULL;
+    }
+
+    old_header = *header;
+    if (old_header.data.explicitly_aligned)
+        return NULL;
+
+    if (size == 0) {
+        wasm_runtime_free(ptr);
+        return NULL;
+    }
+
+    if (!wasm_allocation_header_calculate_size(size, old_header.data.alignment,
+                                               &new_raw_size))
+        return NULL;
+
+    owner = old_header.data.owner;
+    if (new_raw_size > old_header.data.raw_size) {
+        reserved_growth = new_raw_size - old_header.data.raw_size;
+        if (!wasm_allocation_quota_token_reserve(owner, reserved_growth, 0))
+            return NULL;
+    }
+
+    old_user_offset = (uint32)((uint8 *)ptr - (uint8 *)old_header.data.raw_ptr);
+    if (new_raw_size == old_header.data.raw_size) {
+        header->data.user_size = size;
+        return ptr;
+    }
+
+    new_raw_ptr =
+        wasm_runtime_realloc_direct(old_header.data.raw_ptr, new_raw_size);
+    if (!new_raw_ptr) {
+        wasm_allocation_quota_token_refund(owner, reserved_growth, 0);
+        return NULL;
+    }
+
+    new_user_offset =
+        wasm_allocation_user_offset(new_raw_ptr, old_header.data.alignment);
+    new_user_ptr = (uint8 *)new_raw_ptr + new_user_offset;
+    copy_size =
+        old_header.data.user_size < size ? old_header.data.user_size : size;
+    if (new_user_offset != old_user_offset)
+        memmove(new_user_ptr, (uint8 *)new_raw_ptr + old_user_offset,
+                copy_size);
+
+    new_user_ptr = wasm_allocation_header_initialize(
+        new_raw_ptr, new_raw_size, size, old_header.data.alignment, false,
+        owner);
+    bh_assert(new_user_ptr);
+
+    if (new_raw_size < old_header.data.raw_size) {
+        wasm_allocation_quota_token_refund(
+            owner, old_header.data.raw_size - new_raw_size, 0);
+    }
+    return new_user_ptr;
 }
 
 void *
 wasm_runtime_calloc(uint64_t count, unsigned int size)
 {
-    void *ptr = wasm_runtime_malloc(count * size);
+    uint64 total_size;
+    void *ptr;
+
+    if (size != 0 && count > UINT32_MAX / size)
+        return NULL;
+
+    total_size = count * size;
+    if (total_size > UINT32_MAX)
+        return NULL;
+
+    ptr = wasm_runtime_malloc((uint32)total_size);
     if (!ptr)
         return NULL;
-    memset(ptr, 0, count * size);
+    memset(ptr, 0, (uint32)total_size);
     return ptr;
 }
 
 void
 wasm_runtime_free(void *ptr)
 {
-    wasm_runtime_free_internal(ptr);
+    WASMAllocationHeader header_copy;
+    WASMAllocationHeader *header;
+
+    if (!ptr)
+        return;
+
+    header = wasm_allocation_header_from_user(ptr);
+    if (!header) {
+        LOG_ERROR("wasm_runtime_free failed: invalid allocation header\n");
+        return;
+    }
+    if (wasm_allocation_quota_get_current()
+        && header->data.owner != wasm_allocation_quota_get_current()) {
+        LOG_ERROR("wasm_runtime_free failed: allocation owner mismatch\n");
+        return;
+    }
+
+    header_copy = *header;
+    header->data.magic = 0;
+    wasm_runtime_free_direct(header_copy.data.raw_ptr);
+    wasm_allocation_quota_token_refund(header_copy.data.owner,
+                                       header_copy.data.raw_size, 1);
+    wasm_allocation_quota_token_release(header_copy.data.owner);
 }
 
 bool
@@ -1675,6 +2453,7 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
     uint32 cur_page_count, max_page_count, total_page_count;
     uint64 total_size_old = 0, total_size_new;
     bool ret = true, full_size_mmaped;
+    bool page_quota_reserved = false, page_quota_committed = false;
     enlarge_memory_error_reason_t failure_reason = INTERNAL_ERROR;
 
     if (!memory) {
@@ -1716,6 +2495,13 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
         ret = false;
         goto return_func;
     }
+
+    if (!wasm_memory_reserve_page_quota(memory, inc_page_count)) {
+        failure_reason = MAX_SIZE_REACHED;
+        ret = false;
+        goto return_func;
+    }
+    page_quota_reserved = true;
 
 #if WASM_ENABLE_SHARED_HEAP != 0
     shared_heap = get_shared_heap(module);
@@ -1833,9 +2619,14 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
     SET_LINEAR_MEMORY_SIZE(memory, total_size_new);
     memory->memory_data_end = memory->memory_data + total_size_new;
 
+    page_quota_committed = true;
+
     wasm_runtime_set_mem_bound_check_bytes(memory, total_size_new);
 
 return_func:
+    if (page_quota_reserved && !page_quota_committed)
+        wasm_memory_release_page_quota(memory, inc_page_count);
+
     if (!ret && module && enlarge_memory_error_cb) {
         WASMExecEnv *exec_env = NULL;
 
@@ -2064,6 +2855,8 @@ wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
 #endif
 
     memory_inst->memory_data = NULL;
+    wasm_memory_release_page_quota(memory_inst,
+                                   memory_inst->page_quota_reserved_pages);
 }
 
 int

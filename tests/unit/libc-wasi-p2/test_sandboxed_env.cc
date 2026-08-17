@@ -36,7 +36,7 @@ class CanonSandboxedEnv : public testing::Test
 
     bool runtime_init = false;
     WASMComponentInstance *comp_instance;
-    libc_wasi_parse_context_t parse_ctx;
+    libc_wasi_parse_context_t parse_ctx = {};
 
     // WASIContext *wasi_ctx;
     char test_dir[128];

@@ -84,6 +84,10 @@ extern "C" {
             sizeof(name##_symbols) / sizeof(NativeSymbol)      \
     }
 
+/* The built-in host surface implements the stable WASI Preview 2 package set
+ * published as 0.2.6. Keep the symbol tables synchronized with its WIT. */
+#define WASI_P2_IMPLEMENTED_VERSION "0.2.6"
+
 static NativeSymbol cli_environment_symbols[] = {
     REG_WASI_P2_FUNCTION("get-environment", wasi_cli_get_environment, "(i)"),
     REG_WASI_P2_FUNCTION("get-arguments", wasi_cli_get_arguments, "(i)"),
@@ -196,7 +200,7 @@ static NativeSymbol filesystem_types_symbols[] = {
     REG_WASI_P2_FUNCTION("[method]descriptor.metadata-hash-at",
                          wasi_filesystem_metadata_hash_at, "(iii~i)"),
     REG_WASI_P2_FUNCTION("[method]directory-entry-stream.read-directory-entry",
-                         wasi_filesystem_read_directory_entry, "(Ii)"),
+                         wasi_filesystem_read_directory_entry, "(ii)"),
     REG_WASI_P2_FUNCTION("filesystem-error-code",
                          wasi_filesystem_filesystem_error_code, "(ii)"),
 };
@@ -282,7 +286,7 @@ static NativeSymbol sockets_ip_name_lookup_symbols[] = {
         "(ii)"),
     REG_WASI_P2_FUNCTION(
         "[method]resolve-address-stream.subscribe",
-        wasi_sockets_ip_name_lookup_resolve_address_stream_subscribe, "(i)"),
+        wasi_sockets_ip_name_lookup_resolve_address_stream_subscribe, "(i)i"),
 };
 
 static NativeSymbol sockets_tcp_create_socket_symbols[] = {
@@ -420,33 +424,66 @@ static NativeSymbol sockets_udp_symbols[] = {
 };
 
 static wasi_p2_module_t wasi_p2_modules[] = {
-    WASI_P2_MODULE(cli_environment, "cli/environment", "0.2.0"),
-    WASI_P2_MODULE(cli_exit, "cli/exit", "0.2.0"),
-    WASI_P2_MODULE(cli_stdin, "cli/stdin", "0.2.0"),
-    WASI_P2_MODULE(cli_stdout, "cli/stdout", "0.2.0"),
-    WASI_P2_MODULE(cli_stderr, "cli/stderr", "0.2.0"),
-    WASI_P2_MODULE(cli_terminal_stdin, "cli/terminal-stdin", "0.2.0"),
-    WASI_P2_MODULE(cli_terminal_stdout, "cli/terminal-stdout", "0.2.0"),
-    WASI_P2_MODULE(cli_terminal_stderr, "cli/terminal-stderr", "0.2.0"),
-    WASI_P2_MODULE(clocks_monotonic_clock, "clocks/monotonic-clock", "0.2.0"),
-    WASI_P2_MODULE(clocks_wall_clock, "clocks/wall-clock", "0.2.0"),
-    WASI_P2_MODULE(filesystem_preopens, "filesystem/preopens", "0.2.0"),
-    WASI_P2_MODULE(filesystem_types, "filesystem/types", "0.2.0"),
-    WASI_P2_MODULE(random_random, "random/random", "0.2.0"),
-    WASI_P2_MODULE(random_insecure, "random/insecure", "0.2.0"),
-    WASI_P2_MODULE(random_insecure_seed, "random/insecure-seed", "0.2.0"),
-    WASI_P2_MODULE(io_error, "io/error", "0.2.0"),
-    WASI_P2_MODULE(io_poll, "io/poll", "0.2.0"),
-    WASI_P2_MODULE(io_streams, "io/streams", "0.2.0"),
+    WASI_P2_MODULE(cli_environment, "cli/environment",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_exit, "cli/exit", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_stdin, "cli/stdin", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_stdout, "cli/stdout", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_stderr, "cli/stderr", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_terminal_stdin, "cli/terminal-stdin",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_terminal_stdout, "cli/terminal-stdout",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(cli_terminal_stderr, "cli/terminal-stderr",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(clocks_monotonic_clock, "clocks/monotonic-clock",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(clocks_wall_clock, "clocks/wall-clock",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(filesystem_preopens, "filesystem/preopens",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(filesystem_types, "filesystem/types",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(random_random, "random/random", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(random_insecure, "random/insecure",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(random_insecure_seed, "random/insecure-seed",
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(io_error, "io/error", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(io_poll, "io/poll", WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(io_streams, "io/streams", WASI_P2_IMPLEMENTED_VERSION),
     WASI_P2_MODULE(sockets_instance_network, "sockets/instance-network",
-                   "0.2.0"),
-    WASI_P2_MODULE(sockets_ip_name_lookup, "sockets/ip-name-lookup", "0.2.0"),
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(sockets_ip_name_lookup, "sockets/ip-name-lookup",
+                   WASI_P2_IMPLEMENTED_VERSION),
     WASI_P2_MODULE(sockets_tcp_create_socket, "sockets/tcp-create-socket",
-                   "0.2.0"),
-    WASI_P2_MODULE(sockets_tcp, "sockets/tcp", "0.2.0"),
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(sockets_tcp, "sockets/tcp", WASI_P2_IMPLEMENTED_VERSION),
     WASI_P2_MODULE(sockets_udp_create_socket, "sockets/udp-create-socket",
-                   "0.2.0"),
-    WASI_P2_MODULE(sockets_udp, "sockets/udp", "0.2.0"),
+                   WASI_P2_IMPLEMENTED_VERSION),
+    WASI_P2_MODULE(sockets_udp, "sockets/udp", WASI_P2_IMPLEMENTED_VERSION),
+};
+
+typedef struct wasi_p2_resource {
+    const char *interface_name;
+    const char *resource_name;
+} wasi_p2_resource_t;
+
+static const wasi_p2_resource_t wasi_p2_resources[] = {
+    { "wasi:io/error", "error" },
+    { "wasi:io/streams", "input-stream" },
+    { "wasi:io/streams", "output-stream" },
+    { "wasi:io/poll", "pollable" },
+    { "wasi:filesystem/types", "directory-entry-stream" },
+    { "wasi:filesystem/types", "descriptor" },
+    { "wasi:cli/terminal-input", "terminal-input" },
+    { "wasi:cli/terminal-output", "terminal-output" },
+    { "wasi:sockets/tcp", "tcp-socket" },
+    { "wasi:sockets/udp", "udp-socket" },
+    { "wasi:sockets/network", "network" },
+    { "wasi:sockets/udp", "incoming-datagram-stream" },
+    { "wasi:sockets/udp", "outgoing-datagram-stream" },
+    { "wasi:sockets/ip-name-lookup", "resolve-address-stream" },
 };
 
 static bool
@@ -461,54 +498,101 @@ convert_version(int *value, const char version_string[])
     return true;
 }
 
-bool
-wasm_check_wasi_p2_version(const char *required_interface)
+static bool
+wasi_p2_version_is_compatible(const char *required_interface,
+                              const char *runtime_version)
 {
     const char *at = strchr(required_interface, '@');
     if (!at)
         return true; // no version requirement, always ok
 
     const char *required_ver = at + 1;
+    int req_maj = 0, req_min = 0, req_pat = 0, run_maj = 0, run_min = 0,
+        run_pat = 0;
+    char req_maj_str[20] = { 0 }, req_min_str[20] = { 0 },
+         req_pat_str[20] = { 0 }, run_maj_str[20] = { 0 },
+         run_min_str[20] = { 0 }, run_pat_str[20] = { 0 };
+
+    if (sscanf(required_ver, "%19[^.].%19[^.].%19[^.]", req_maj_str,
+               req_min_str, req_pat_str)
+            != 3
+        || sscanf(runtime_version, "%19[^.].%19[^.].%19[^.]", run_maj_str,
+                  run_min_str, run_pat_str)
+               != 3) {
+        return false;
+    }
+
+    if (!convert_version(&req_maj, req_maj_str)
+        || !convert_version(&req_min, req_min_str)
+        || !convert_version(&req_pat, req_pat_str)
+        || !convert_version(&run_maj, run_maj_str)
+        || !convert_version(&run_min, run_min_str)
+        || !convert_version(&run_pat, run_pat_str)) {
+        return false;
+    }
+
+    // Hard fail if the runtime does not implement the requested major/minor
+    // line or a sufficiently recent patch release.
+    if (req_maj != run_maj || req_min != run_min || run_pat < req_pat) {
+        LOG_ERROR("Incompatible WASI version for %s: "
+                  "required %d.%d.%d, runtime implements %d.%d.%d",
+                  required_interface, req_maj, req_min, req_pat, run_maj,
+                  run_min, run_pat);
+        return false;
+    }
+    return true;
+}
+
+bool
+wasm_check_wasi_p2_version(const char *required_interface)
+{
     wasi_p2_module_t *modules = NULL;
     uint32_t count = get_libc_wasi_p2_export_apis(&modules);
     for (uint32_t i = 0; i < count; i++) {
         if (is_module_equal(modules[i].module_name, required_interface)) {
-            int req_maj = 0, req_min = 0, req_pat = 0, run_maj = 0, run_min = 0,
-                run_pat = 0;
-            char req_maj_str[20] = { 0 }, req_min_str[20] = { 0 },
-                 req_pat_str[20] = { 0 }, run_maj_str[20] = { 0 },
-                 run_min_str[20] = { 0 }, run_pat_str[20] = { 0 };
-
-            if (sscanf(required_ver, "%19[^.].%19[^.].%19[^.]", req_maj_str,
-                       req_min_str, req_pat_str)
-                    != 3
-                || sscanf(modules[i].version, "%19[^.].%19[^.].%19[^.]",
-                          run_maj_str, run_min_str, run_pat_str)
-                       != 3) {
-                return false;
-            }
-
-            if (!convert_version(&req_maj, req_maj_str)
-                || !convert_version(&req_min, req_min_str)
-                || !convert_version(&req_pat, req_pat_str)
-                || !convert_version(&run_maj, run_maj_str)
-                || !convert_version(&run_min, run_min_str)
-                || !convert_version(&run_pat, run_pat_str)) {
-                return false;
-            }
-
-            // Hard fail: major or minor mismatch = incompatible API
-            if (req_maj != run_maj || req_min != run_min || req_pat < run_pat) {
-                LOG_ERROR("Incompatible WASI version for %s: "
-                          "required %d.%d.%d, runtime implements %d.%d.%d",
-                          required_interface, req_maj, req_min, req_pat,
-                          run_maj, run_min, run_pat);
-                return false;
-            }
-            return true;
+            return wasi_p2_version_is_compatible(required_interface,
+                                                 modules[i].version);
         }
     }
     return true;
+}
+
+bool
+wasm_native_has_builtin_wasi_p2_module(const char *module_name)
+{
+    wasi_p2_module_t *modules = NULL;
+    uint32_t count;
+
+    if (!module_name) {
+        return false;
+    }
+
+    count = get_libc_wasi_p2_export_apis(&modules);
+    for (uint32_t i = 0; i < count; i++) {
+        if (is_module_equal(modules[i].module_name, module_name)) {
+            return wasm_check_wasi_p2_version(module_name);
+        }
+    }
+    return false;
+}
+
+bool
+wasm_native_has_builtin_wasi_p2_resource(const char *interface_name,
+                                         const char *resource_name)
+{
+    if (!interface_name || !resource_name || !strchr(interface_name, '@')) {
+        return false;
+    }
+
+    for (uint32_t i = 0;
+         i < sizeof(wasi_p2_resources) / sizeof(wasi_p2_resources[0]); i++) {
+        if (is_module_equal(interface_name, wasi_p2_resources[i].interface_name)
+            && strcmp(resource_name, wasi_p2_resources[i].resource_name) == 0) {
+            return wasi_p2_version_is_compatible(interface_name,
+                                                 WASI_P2_IMPLEMENTED_VERSION);
+        }
+    }
+    return false;
 }
 
 /**
@@ -621,8 +705,9 @@ wasm_native_unregister_wasi_p2_module(const char *module_name)
  * @param func_name The name of the function to find.
  * @return A pointer to the native symbol if found, otherwise NULL.
  */
-static const NativeSymbol *
-find_wasi_p2_module_func(const char *module_name, const char *func_name)
+const NativeSymbol *
+wasm_native_get_wasi_p2_module_func(const char *module_name,
+                                    const char *func_name)
 {
     wasi_p2_module_t *modules = NULL;
     uint32_t wasi_p2_module_count = get_libc_wasi_p2_export_apis(&modules);
@@ -650,7 +735,7 @@ wasm_native_register_wasi_p2_module_func(const char *module_name,
                                          const char *func_name)
 {
     const NativeSymbol *symbol =
-        find_wasi_p2_module_func(module_name, func_name);
+        wasm_native_get_wasi_p2_module_func(module_name, func_name);
     if (symbol) {
         return wasm_native_register_natives(module_name, (NativeSymbol *)symbol,
                                             1);
@@ -668,7 +753,7 @@ wasm_native_unregister_wasi_p2_module_func(const char *module_name,
                                            const char *func_name)
 {
     const NativeSymbol *symbol =
-        find_wasi_p2_module_func(module_name, func_name);
+        wasm_native_get_wasi_p2_module_func(module_name, func_name);
     if (symbol) {
         wasm_native_unregister_natives(module_name, (NativeSymbol *)symbol);
     }

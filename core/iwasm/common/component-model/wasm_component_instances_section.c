@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include "wasm_loader_common.h"
 #include "wasm_runtime_common.h"
+#include "wasm_allocation_quota.h"
 #include "wasm_export.h"
 #include <stdio.h>
 
@@ -32,8 +33,9 @@ wasm_component_parse_instances_section(const uint8_t **payload,
         return false;
     }
 
-    const uint8_t *p = *payload;
-    const uint8_t *end = *payload + payload_len;
+    const uint8_t *start = *payload;
+    const uint8_t *p = start;
+    const uint8_t *end = start + payload_len;
 
     uint64_t instance_count = 0;
     if (!read_leb((uint8_t **)&p, end, 32, false, &instance_count, error_buf,
@@ -45,18 +47,14 @@ wasm_component_parse_instances_section(const uint8_t **payload,
     out->count = (uint32_t)instance_count;
 
     if (instance_count > 0) {
-        out->instances =
-            wasm_runtime_malloc(sizeof(WASMComponentInst) * instance_count);
+        out->instances = wasm_component_checked_calloc(
+            (uint32_t)instance_count, sizeof(WASMComponentInst), p, end, 1,
+            "component instance", error_buf, error_buf_size);
         if (!out->instances) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for instances");
             if (consumed_len)
                 *consumed_len = (uint32_t)(p - *payload);
             return false;
         }
-
-        // Initialize all instances to zero to avoid garbage data
-        memset(out->instances, 0, sizeof(WASMComponentInst) * instance_count);
 
         for (uint32_t i = 0; i < instance_count; ++i) {
             // Check bounds before reading tag
@@ -96,20 +94,15 @@ wasm_component_parse_instances_section(const uint8_t **payload,
 
                     if (arg_len > 0) {
                         out->instances[i].expression.with_args.args =
-                            wasm_runtime_malloc(sizeof(WASMComponentInstArg)
-                                                * arg_len);
+                            wasm_component_checked_calloc(
+                                (uint32_t)arg_len, sizeof(WASMComponentInstArg),
+                                p, end, 1, "component instantiate argument",
+                                error_buf, error_buf_size);
                         if (!out->instances[i].expression.with_args.args) {
-                            set_error_buf_ex(error_buf, error_buf_size,
-                                             "Failed to allocate memory for "
-                                             "component instantiate args");
                             if (consumed_len)
                                 *consumed_len = (uint32_t)(p - *payload);
                             return false;
                         }
-
-                        // Initialize args to zero
-                        memset(out->instances[i].expression.with_args.args, 0,
-                               sizeof(WASMComponentInstArg) * arg_len);
 
                         for (uint32_t j = 0; j < arg_len; ++j) {
                             // Parse core:name (LEB128 length + UTF-8 bytes)
@@ -138,8 +131,6 @@ wasm_component_parse_instances_section(const uint8_t **payload,
                                 set_error_buf_ex(error_buf, error_buf_size,
                                                  "Failed to allocate memory "
                                                  "for component arg sort idx");
-                                free_core_name(core_name);
-                                wasm_runtime_free(core_name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
@@ -161,8 +152,6 @@ wasm_component_parse_instances_section(const uint8_t **payload,
                                 set_error_buf_ex(
                                     error_buf, error_buf_size,
                                     "Failed to parse component arg sort idx");
-                                free_core_name(core_name);
-                                wasm_runtime_free(core_name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
@@ -191,45 +180,35 @@ wasm_component_parse_instances_section(const uint8_t **payload,
 
                     if (inline_expr_len > 0) {
                         out->instances[i].expression.without_args.inline_expr =
-                            wasm_runtime_malloc(
-                                sizeof(WASMComponentInlineExport)
-                                * inline_expr_len);
+                            wasm_component_checked_calloc(
+                                (uint32_t)inline_expr_len,
+                                sizeof(WASMComponentInlineExport), p, end, 1,
+                                "component inline export", error_buf,
+                                error_buf_size);
                         if (!out->instances[i]
                                  .expression.without_args.inline_expr) {
-                            set_error_buf_ex(error_buf, error_buf_size,
-                                             "Failed to allocate memory for "
-                                             "component inline exports");
                             if (consumed_len)
                                 *consumed_len = (uint32_t)(p - *payload);
                             return false;
                         }
 
-                        // Initialize inline exports to zero
-                        memset(out->instances[i]
-                                   .expression.without_args.inline_expr,
-                               0,
-                               sizeof(WASMComponentInlineExport)
-                                   * inline_expr_len);
-
                         for (uint32_t j = 0; j < inline_expr_len; j++) {
                             // inlineexport ::= n:<exportname> si:<sortidx>
-                            WASMComponentCoreName *name = wasm_runtime_malloc(
-                                sizeof(WASMComponentCoreName));
-                            if (!name) {
-                                set_error_buf_ex(error_buf, error_buf_size,
-                                                 "Failed to allocate memory "
-                                                 "for component export name");
-                                if (consumed_len)
-                                    *consumed_len = (uint32_t)(p - *payload);
-                                return false;
-                            }
+                            /* parse_core_name() allocates the result itself and
+                             * only writes *out on success. Pre-allocating here
+                             * leaked that struct on success and, worse, left
+                             * `name` pointing at uninitialized memory whose
+                             * ->name field free_core_name() then dereferenced
+                             * on the failure path (heap-use-after-free found by
+                             * the component-parser fuzz target). Pass NULL and
+                             * let parse_core_name own the allocation + its own
+                             * cleanup on failure. */
+                            WASMComponentCoreName *name = NULL;
 
                             // Parse export name (component-level name)
                             bool name_parse_success = parse_core_name(
                                 &p, end, &name, error_buf, error_buf_size);
                             if (!name_parse_success) {
-                                free_core_name(name);
-                                wasm_runtime_free(name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
@@ -253,6 +232,9 @@ wasm_component_parse_instances_section(const uint8_t **payload,
                             }
                             // Zero-initialize sort_idx
                             memset(sort_idx, 0, sizeof(WASMComponentSortIdx));
+                            out->instances[i]
+                                .expression.without_args.inline_expr[j]
+                                .sort_idx = sort_idx;
 
                             bool status =
                                 parse_sort_idx(&p, end, sort_idx, error_buf,
@@ -261,17 +243,10 @@ wasm_component_parse_instances_section(const uint8_t **payload,
                                 set_error_buf_ex(
                                     error_buf, error_buf_size,
                                     "Failed to parse component sort idx");
-                                wasm_runtime_free(sort_idx);
-                                free_core_name(name);
-                                wasm_runtime_free(name);
                                 if (consumed_len)
                                     *consumed_len = (uint32_t)(p - *payload);
                                 return false;
                             }
-
-                            out->instances[i]
-                                .expression.without_args.inline_expr[j]
-                                .sort_idx = sort_idx;
                         }
                     }
                     else {
@@ -293,7 +268,8 @@ wasm_component_parse_instances_section(const uint8_t **payload,
         }
     }
     if (consumed_len)
-        *consumed_len = payload_len;
+        *consumed_len = (uint32_t)(p - start);
+    *payload = p;
     return true;
 }
 
@@ -412,14 +388,13 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
             bool inst_ok = true;
 
             if (instance_expression.arg_len) {
-                instance_expression.args =
-                    (WASMComponentInstArgInstance *)wasm_runtime_malloc(
-                        instance_expression.arg_len
-                        * sizeof(WASMComponentInstArgInstance));
+                instance_expression.args = (WASMComponentInstArgInstance *)
+                    wasm_component_checked_calloc(
+                        instance_expression.arg_len,
+                        sizeof(WASMComponentInstArgInstance), NULL, NULL, 0,
+                        "resolved component instantiate argument", error_buf,
+                        error_buf_size);
                 if (!instance_expression.args) {
-                    set_error_buf_ex(
-                        error_buf, error_buf_size,
-                        "ERROR: Failed to allocate instance expression args");
                     goto fail_inst;
                 }
             }
@@ -528,6 +503,15 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
                     instance->expression.with_args.idx);
                 goto fail_inst;
             }
+            if (!wasm_allocation_quota_allocations_share_owner(comp_instance,
+                                                               new_inst)) {
+                set_error_buf_ex(
+                    error_buf, error_buf_size,
+                    "ERROR: Nested component instance has a different "
+                    "allocation quota owner\n");
+                wasm_component_deinstantiate(new_inst);
+                goto fail_inst;
+            }
             comp_instance->component_instances
                 [comp_instance->component_instances_count] = new_inst;
             comp_instance->component_instances_count++;
@@ -539,7 +523,8 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
         fail_inst:
             inst_ok = false;
         done_inst:
-            if (instance_expression.args) wasm_runtime_free(instance_expression.args);
+            if (instance_expression.args)
+                wasm_runtime_free(instance_expression.args);
             instance_expression.args = NULL;
             if (!inst_ok)
                 return false;
@@ -548,11 +533,22 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
                  == WASM_COMP_INSTANCE_EXPRESSION_WITHOUT_ARGS) {
             WASMComponentIndexCount index_count = { 0 };
             WASMComponentInlineExport *inst_expression = NULL;
+            WASMComponentInstance *new_inst;
+
+            index_count.exports =
+                instance->expression.without_args.inline_expr_len;
             for (idx = 0;
                  idx < instance->expression.without_args.inline_expr_len;
                  idx++) {
                 inst_expression =
                     &instance->expression.without_args.inline_expr[idx];
+                if (!inst_expression->sort_idx
+                    || !inst_expression->sort_idx->sort) {
+                    set_error_buf_ex(error_buf, error_buf_size,
+                                     "ERROR: Inline component export has an "
+                                     "invalid sort index");
+                    return false;
+                }
                 switch (inst_expression->sort_idx->sort->sort) {
                     case WASM_COMP_SORT_CORE_SORT:
                         if (inst_expression->sort_idx->sort->core_sort
@@ -564,29 +560,112 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
                                 inst_expression->sort_idx->sort->core_sort);
                             return false;
                         }
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->core_modules_count) {
+                            set_error_buf_ex(
+                                error_buf, error_buf_size,
+                                "ERROR: Inline core module %u not yet "
+                                "defined",
+                                inst_expression->sort_idx->idx);
+                            return false;
+                        }
+                        index_count.core_modules++;
                         break;
                     case WASM_COMP_SORT_FUNC:
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->functions_count) {
+                            set_error_buf_ex(error_buf, error_buf_size,
+                                             "ERROR: Inline function %u not "
+                                             "yet defined",
+                                             inst_expression->sort_idx->idx);
+                            return false;
+                        }
                         index_count.functions++;
                         break;
                     case WASM_COMP_SORT_VALUE:
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->values_count) {
+                            set_error_buf_ex(error_buf, error_buf_size,
+                                             "ERROR: Inline value %u not yet "
+                                             "defined",
+                                             inst_expression->sort_idx->idx);
+                            return false;
+                        }
                         index_count.values++;
                         break;
                     case WASM_COMP_SORT_TYPE:
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->types_count) {
+                            set_error_buf_ex(error_buf, error_buf_size,
+                                             "ERROR: Inline type %u not yet "
+                                             "defined",
+                                             inst_expression->sort_idx->idx);
+                            return false;
+                        }
                         index_count.types++;
                         break;
                     case WASM_COMP_SORT_COMPONENT:
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->components_count) {
+                            set_error_buf_ex(
+                                error_buf, error_buf_size,
+                                "ERROR: Inline component %u not yet defined",
+                                inst_expression->sort_idx->idx);
+                            return false;
+                        }
                         index_count.components++;
                         break;
                     case WASM_COMP_SORT_INSTANCE:
+                        if (inst_expression->sort_idx->idx
+                            >= comp_instance->component_instances_count) {
+                            set_error_buf_ex(
+                                error_buf, error_buf_size,
+                                "ERROR: Inline instance %u not yet defined",
+                                inst_expression->sort_idx->idx);
+                            return false;
+                        }
                         index_count.instances++;
                         break;
                     default:
-                        break;
+                        set_error_buf_ex(
+                            error_buf, error_buf_size,
+                            "ERROR: Unsupported inline component export sort "
+                            "%u",
+                            inst_expression->sort_idx->sort->sort);
+                        return false;
                 }
             }
-            WASMComponentInstance *new_inst = wasm_component_instance_allocate(
-                &index_count, error_buf, error_buf_size);
+            new_inst = wasm_component_instance_allocate(&index_count, error_buf,
+                                                        error_buf_size);
+            if (!new_inst) {
+                set_error_buf_ex(error_buf, error_buf_size,
+                                 "ERROR: Inline component instance allocation "
+                                 "failed\n");
+                return false;
+            }
             new_inst->parent = comp_instance;
+            if (!wasm_allocation_quota_allocations_share_owner(comp_instance,
+                                                               new_inst)
+                || !wasm_allocation_quota_allocations_share_owner(
+                    new_inst, new_inst->table)) {
+                set_error_buf_ex(
+                    error_buf, error_buf_size,
+                    "ERROR: Inline component instance has a different "
+                    "allocation quota owner\n");
+                wasm_component_deinstantiate(new_inst);
+                return false;
+            }
+            if (index_count.exports > 0) {
+                new_inst->owned_export_names = wasm_component_checked_calloc(
+                    index_count.exports, sizeof(WASMComponentExportName), NULL,
+                    NULL, 0, "inline component export name", error_buf,
+                    error_buf_size);
+                if (!new_inst->owned_export_names) {
+                    wasm_component_deinstantiate(new_inst);
+                    return false;
+                }
+                new_inst->owned_export_names_count = index_count.exports;
+            }
 
             for (idx = 0;
                  idx < instance->expression.without_args.inline_expr_len;
@@ -596,6 +675,8 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
 
                 WASMComponentExportInstance *inline_export =
                     &new_inst->exports[new_inst->exports_count];
+                inline_export->export_name =
+                    &new_inst->owned_export_names[new_inst->exports_count];
                 inline_export->export_name->exported.simple.name =
                     inst_expression->name;
                 inline_export->export_name->tag =
@@ -616,7 +697,7 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
                                 "ERROR: Export definition only suport module "
                                 "core sort, sort %d not supported",
                                 inst_expression->sort_idx->sort->core_sort);
-                            free(new_inst);
+                            wasm_component_deinstantiate(new_inst);
                             return false;
                         }
                         new_inst->core_modules[new_inst->core_modules_count] =
@@ -680,6 +761,7 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
             }
             comp_instance->component_instances
                 [comp_instance->component_instances_count] = new_inst;
+            comp_instance->component_instances_count++;
             comp_instance
                 ->defined_instances[comp_instance->defined_instances_count] =
                 new_inst;

@@ -208,6 +208,7 @@ endif()
 set (WAMR_PUBLIC_HEADERS
   ${WAMR_ROOT_DIR}/core/iwasm/include/wasm_c_api.h
   ${WAMR_ROOT_DIR}/core/iwasm/include/wasm_export.h
+  ${WAMR_ROOT_DIR}/core/iwasm/include/wasm_load_args.h
   ${WAMR_ROOT_DIR}/core/iwasm/include/lib_export.h
 )
 set_target_properties (vmlib PROPERTIES PUBLIC_HEADER "${WAMR_PUBLIC_HEADERS}")

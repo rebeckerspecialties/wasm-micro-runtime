@@ -89,6 +89,7 @@ TEST_F(WasiP2RandomTest, wasi_random_get_random_bytes_different_sizes) {
     // Test with size 0
     wasi_random_get_random_bytes(0, &ret);
     ASSERT_EQ(ret.buf_len, 0);
+    ASSERT_EQ(ret.buf, nullptr);
 
     // Test with size 1
     wasi_random_get_random_bytes(1, &ret);
@@ -144,6 +145,7 @@ TEST_F(WasiP2RandomTest, wasi_random_get_insecure_random_bytes_different_sizes) 
     // Test with size 0
     wasi_random_get_insecure_random_bytes(0, &ret);
     ASSERT_EQ(ret.buf_len, 0);
+    ASSERT_EQ(ret.buf, nullptr);
 
     // Test with size 1
     wasi_random_get_insecure_random_bytes(1, &ret);

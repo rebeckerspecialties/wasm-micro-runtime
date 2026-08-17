@@ -8,6 +8,7 @@
 
 #include "bh_assert.h"
 #include "wasm_suspend_flags.h"
+#include "wasm_allocation_quota.h"
 #if WASM_ENABLE_INTERP != 0
 #include "../interpreter/wasm.h"
 #endif
@@ -19,11 +20,16 @@ extern "C" {
 struct WASMModuleInstanceCommon;
 struct WASMInterpFrame;
 
+typedef bool (*WASMCallPreEntryCallback)(void *attachment);
+
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 typedef struct WASMComponentInstance WASMComponentInstance;
 typedef struct WASMFunctionInstance WASMFunctionInstance;
 typedef struct WASMMemoryInstance WASMMemoryInstance;
 typedef struct LiftLowerContext LiftLowerContext;
+#if WASM_ENABLE_LIBC_WASI_P2 != 0 && WASM_ENABLE_THREAD_MGR != 0
+typedef struct WasiP2WaitInterrupt WasiP2WaitInterrupt;
+#endif
 #endif
 
 #if WASM_ENABLE_THREAD_MGR != 0
@@ -132,6 +138,12 @@ typedef struct WASMExecEnv {
 
     /* whether the aux stack is allocated */
     bool is_aux_stack_allocated;
+
+    /* child startup could not install its allocation-owner lease */
+    bool thread_owner_lease_failed;
+
+    /* generic runtime thread wrapper allocation, if this env owns one */
+    void *runtime_thread_arg;
 #endif
 
 #if WASM_ENABLE_GC != 0
@@ -193,7 +205,21 @@ typedef struct WASMExecEnv {
     WASMFunctionInstance *core_func;
     WASMMemoryInstance *memory;
     LiftLowerContext *cx;
+    bool component_callback_active;
+#if WASM_ENABLE_INTERP != 0 && WASM_ENABLE_FAST_INTERP != 0
+    /* One-shot callback consumed after all fallible call setup and before
+       interpreter dispatch. */
+    WASMCallPreEntryCallback call_pre_entry_callback;
+    void *call_pre_entry_attachment;
 #endif
+#if WASM_ENABLE_LIBC_WASI_P2 != 0 && WASM_ENABLE_THREAD_MGR != 0
+    WasiP2WaitInterrupt *wasi_p2_wait_interrupt;
+#endif
+#endif
+
+    /* Host allocations which are admitted separately from the root block. */
+    WASMAllocationQuotaReservation guard_page_reservation;
+    WASMAllocationQuotaReservation native_thread_stack_reservation;
 
     /* The WASM stack of current thread */
     union {
@@ -202,6 +228,53 @@ typedef struct WASMExecEnv {
         uint8 bottom[1];
     } wasm_stack_u;
 } WASMExecEnv;
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0 \
+    && WASM_ENABLE_FAST_INTERP != 0
+static inline bool
+wasm_exec_env_call_pre_entry_is_terminated(WASMExecEnv *exec_env)
+{
+#if WASM_ENABLE_THREAD_MGR != 0
+    return exec_env
+           && (WASM_SUSPEND_FLAGS_GET(exec_env->suspend_flags)
+               & WASM_SUSPEND_FLAG_TERMINATE)
+                  != 0;
+#else
+    (void)exec_env;
+    return false;
+#endif
+}
+
+static inline bool
+wasm_exec_env_consume_call_pre_entry(WASMExecEnv *exec_env)
+{
+    WASMCallPreEntryCallback callback;
+    void *attachment;
+
+    if (!exec_env || !exec_env->call_pre_entry_callback)
+        return true;
+#if WASM_ENABLE_THREAD_MGR != 0
+    /* Serialize the terminate check with thread cancellation.  Once the
+       callback is detached below, the callee owns the transferred values and
+       cancellation is ordinary post-entry cancellation. */
+    os_mutex_lock(&exec_env->wait_lock);
+    if (wasm_exec_env_call_pre_entry_is_terminated(exec_env)) {
+        os_mutex_unlock(&exec_env->wait_lock);
+        return false;
+    }
+#endif
+    callback = exec_env->call_pre_entry_callback;
+    attachment = exec_env->call_pre_entry_attachment;
+    /* Clear first so callback reentrancy cannot consume this outer call's
+       stack attachment a second time. */
+    exec_env->call_pre_entry_callback = NULL;
+    exec_env->call_pre_entry_attachment = NULL;
+#if WASM_ENABLE_THREAD_MGR != 0
+    os_mutex_unlock(&exec_env->wait_lock);
+#endif
+    return callback(attachment);
+}
+#endif
 
 #if WASM_ENABLE_MEMORY_PROFILING != 0
 #define RECORD_STACK_USAGE(e, p)               \
@@ -227,6 +300,23 @@ wasm_exec_env_create(struct WASMModuleInstanceCommon *module_inst,
 
 void
 wasm_exec_env_destroy(WASMExecEnv *exec_env);
+
+bool
+wasm_exec_env_reserve_native_thread_stack(WASMExecEnv *exec_env,
+                                          uint32 stack_size);
+
+uint64
+wasm_exec_env_native_thread_stack_reservation_size(uint32 stack_size);
+
+uint32
+wasm_exec_env_native_thread_stack_reservation_count(void);
+
+void
+wasm_exec_env_release_native_thread_stack(WASMExecEnv *exec_env);
+
+void
+wasm_exec_env_take_native_thread_stack(
+    WASMExecEnv *exec_env, WASMAllocationQuotaReservation *reservation);
 
 static inline bool
 wasm_exec_env_is_aux_stack_managed_by_runtime(WASMExecEnv *exec_env)

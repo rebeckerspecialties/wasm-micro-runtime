@@ -31,14 +31,36 @@ wasm_component_parse_core_module_section(const uint8_t **payload,
 
     LOG_DEBUG("    Module section: embedded Core WebAssembly module\n");
 
-    // Use the core wasm loader to parse the module
-    wasm_module_t mod = wasm_runtime_load_ex((uint8 *)*payload, payload_len,
-                                             args, error_buf, error_buf_size);
+    /*
+     * Component core-module imports are linked by the enclosing component
+     * instance.  Never consult or mutate the process-global native registry
+     * while parsing the embedded module.
+     */
+    LoadArgs core_args = { 0 };
+    if (args) {
+        core_args = *args;
+    }
+    core_args.no_resolve = true;
+    core_args.is_component = false;
+    wasm_module_t mod = wasm_runtime_load_ex(
+        (uint8 *)*payload, payload_len, &core_args, error_buf, error_buf_size);
     if (!mod) {
         LOG_DEBUG("      Failed to load embedded core wasm module: %s\n",
                   error_buf);
         return false;
     }
+
+#if WASM_ENABLE_MULTI_MODULE != 0
+    /* Embedded component modules are owned by the component tree, not by the
+     * process-wide core-module registry. wasm_runtime_load_ex() registers all
+     * core modules for legacy multi-module resolution, so transfer ownership
+     * back immediately and let component teardown unload this module. */
+    if (!wasm_runtime_unregister_module(mod)) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "failed to take ownership of embedded core module");
+        return false;
+    }
+#endif
 
     // Print some basic info about the embedded module
     LOG_DEBUG("      Types: %u function types\n",

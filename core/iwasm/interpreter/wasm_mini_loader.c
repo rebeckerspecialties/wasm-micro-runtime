@@ -3037,7 +3037,9 @@ load_from_sections(WASMModule *module, WASMSection *sections,
                         module->aux_stack_size =
                             aux_stack_top > aux_data_end
                                 ? (uint32)(aux_stack_top - aux_data_end)
-                                : (uint32)aux_stack_top;
+                            : aux_stack_top < aux_data_end
+                                ? (uint32)aux_stack_top
+                                : 0;
                         LOG_VERBOSE(
                             "Found aux stack top global, value: %" PRIu64 ", "
                             "global index: %d, stack size: %d",
@@ -3328,9 +3330,9 @@ create_module(char *name, char *error_buf, uint32 error_buf_size)
     }
 #endif
 
-#if WASM_ENABLE_LIBC_WASI != 0
+#if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     wasi_args_set_defaults(&module->wasi_args);
-#endif /* WASM_ENABLE_LIBC_WASI != 0 */
+#endif /* WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0 */
 
     (void)ret;
     return module;

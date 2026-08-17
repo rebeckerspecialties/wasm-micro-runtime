@@ -101,9 +101,7 @@ jobs:
             llvm_cache_key: ${{ needs.build_llvm_libraries_on_arm_macos.outputs.cache_key }}
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       - name: Get LLVM libraries
         id: retrieve_llvm_libs
@@ -205,9 +203,7 @@ jobs:
             extra_options: "-DWAMR_BUILD_SIMD=0"
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       # only download llvm cache when needed
       - name: Get LLVM libraries
@@ -269,9 +265,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       - name: Get LLVM libraries
         id: retrieve_llvm_libs
@@ -303,6 +297,14 @@ jobs:
           cmake --build . --config Release --parallel 4
         working-directory: wamr-compiler
 
+      # The macOS runner ships Apple/Xcode GNU bison 2.3, which cannot parse the
+      # component-model wave-parser grammar (it uses Bison 2.4+ %code blocks).
+      # Put Homebrew bison (3.x) ahead of /usr/bin/bison on PATH.
+      - name: Setup modern bison
+        run: |
+          brew install bison
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+
       - name: Build Sample [wasm-c-api]
         run: |
           VERBOSE=1
@@ -329,9 +331,7 @@ jobs:
             llvm_cache_key: ${{ needs.build_llvm_libraries_on_arm_macos.outputs.cache_key }}
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       - name: install-wasi-sdk-wabt
         uses: ./.github/actions/install-wasi-sdk-wabt

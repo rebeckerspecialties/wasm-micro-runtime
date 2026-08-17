@@ -96,13 +96,6 @@ wasi_cli_get_environment(uint32_t *ret_len)
     }
     env = environ;
 
-    const wasi_tuple_string_string_t *ret =
-        wasm_runtime_calloc(count, sizeof(wasi_tuple_string_string_t));
-    if (!ret) {
-        *ret_len = 0;
-        return NULL;
-    }
-
     *ret_len = count;
     return wasi_cli_environment_split_str(env, count);
 }

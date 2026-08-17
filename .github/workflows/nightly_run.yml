@@ -127,9 +127,7 @@ jobs:
             llvm_cache_key: ${{ needs.build_llvm_libraries_on_ubuntu.outputs.cache_key }}
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       # since jobs.id can't contain the dot character
       # it is hard to use `format` to assemble the cache key
@@ -282,9 +280,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       # only download llvm cache when needed
       - name: Get LLVM libraries
@@ -325,7 +321,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7.0.0
         with:
           ref: ${{ env.PR_REF }}
           submodules: recursive
@@ -512,9 +508,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       - name: Get LLVM libraries
         id: retrieve_llvm_libs
@@ -568,9 +562,7 @@ jobs:
             sanitizer: ""
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       - name: install-wasi-sdk-wabt
         uses: ./.github/actions/install-wasi-sdk-wabt
@@ -813,9 +805,7 @@ jobs:
             sanitizer: ubsan
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ env.PR_REF }}
+        uses: actions/checkout@v7.0.0
 
       - name: install-wasi-sdk-wabt
         if: matrix.test_option == '$WASI_TEST_OPTIONS'

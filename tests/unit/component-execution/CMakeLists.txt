@@ -15,8 +15,10 @@ set (WAMR_BUILD_COMPONENT_MODEL 1)
 set (WAMR_BUILD_APP_FRAMEWORK 1)
 set (WAMR_BUILD_AOT 0)
 set (WAMR_BUILD_INTERP 1)
+set (WAMR_BUILD_FAST_INTERP 1)
 set (WAMR_BUILD_REF_TYPES 1)
-set (WAMR_BUILD_MULTI_MODULE 0)
+set (WAMR_BUILD_MULTI_MODULE 1)
+set (WAMR_BUILD_THREAD_MGR 1)
 set (WAMR_BUILD_LOAD_CUSTOM_SECTION 1)
 set (WAMR_BUILD_SIMD 0)
 
@@ -45,6 +47,7 @@ set (unit_test_sources
      ${IWASM_COMMON_SOURCE}
      ${IWASM_COMPONENT_SOURCE}
      ${IWASM_INTERP_SOURCE}
+     ${THREAD_MGR_SOURCE}
      ${UNCOMMON_SHARED_SOURCE}
     )
 
@@ -62,6 +65,9 @@ add_custom_command(TARGET component-execution POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps/*.wasm
     ${CMAKE_CURRENT_BINARY_DIR}/
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/../component/wasm-apps/complex_with_host.wasm
+    ${CMAKE_CURRENT_BINARY_DIR}/complex_with_host.wasm
 )
 
 gtest_discover_tests(component-execution)

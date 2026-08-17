@@ -21,10 +21,8 @@
  * build the component model and must not reference wasm.h. */
 #include "wasm.h"
 #include "wasm_component.h"
+#include "wasm_component_host_resource.h"
 #include "wasm_component_runtime.h"
-#include "component-model/wasm_component_host_resource.h"
-#include "wasm_component_export.h"
-#include "component-model/wasm_component_validate.h"
 #endif
 #if WASM_ENABLE_LIBC_WASI != 0
 #include "../common/libc_wasi.c"
@@ -836,7 +834,7 @@ execute_wasm_component(uint8 *wasm_file_buf, uint32 wasm_file_size,
                        uint32 stack_size, uint32 heap_size, bool is_repl_mode,
                        bool is_component_func_invoke, char *error_buf,
                        uint32 error_buf_size, int32 *ret_value,
-                       WASMComponent *component_out,
+                       WASMComponent **component_out,
                        WASMComponentInstance **component_inst_out
 #if WASM_ENABLE_LIBC_WASI != 0
                        ,
@@ -844,6 +842,7 @@ execute_wasm_component(uint8 *wasm_file_buf, uint32 wasm_file_size,
 #endif
 )
 {
+    WASMComponent *component = NULL;
     LOG_DEBUG("Loading WASM Component (Preview 2)...\n");
 
     LoadArgs load_args = { 0 };
@@ -852,52 +851,40 @@ execute_wasm_component(uint8 *wasm_file_buf, uint32 wasm_file_size,
     load_args.clone_wasm_binary = false;
     load_args.no_resolve = false;
     load_args.is_component = true;
-    struct InstantiationArgs2 *inst_args;
+    struct InstantiationArgs2 *inst_args = NULL;
     const char *exception = NULL;
 
-    memset(component_out, 0, sizeof(WASMComponent));
-
-    if (!wasm_decode_header(wasm_file_buf, wasm_file_size,
-                            &component_out->header)) {
-        snprintf(error_buf, error_buf_size, "Failed to decode WASM header");
-        *ret_value = -1;
-        return false;
-    }
-
-    if (!wasm_component_parse_sections(wasm_file_buf, wasm_file_size,
-                                       component_out, &load_args, 0)) {
-        snprintf(error_buf, error_buf_size,
-                 "Failed to parse WASM component sections");
-        *ret_value = -1;
-        return false;
-    }
-
-    if (!wasm_component_validate(component_out, NULL, error_buf,
-                                 error_buf_size)) {
+    *component_out = NULL;
+    *component_inst_out = NULL;
+    component = wasm_component_load(wasm_file_buf, wasm_file_size, &load_args,
+                                    error_buf, error_buf_size);
+    if (!component) {
         LOG_DEBUG("Validation failed: %s\n", error_buf);
         *ret_value = -1;
         return false;
     }
 
 #if WASM_ENABLE_LIBC_WASI != 0
-    libc_component_wasi_init(component_out, app_argc, app_argv, wasi_parse_ctx);
+    libc_component_wasi_init(component, app_argc, app_argv, wasi_parse_ctx);
 #endif
 
     if (!wasm_runtime_instantiation_args_create(&inst_args)) {
-        LOG_ERROR("failed to create instantiate args\n");
-        return false;
+        snprintf(error_buf, error_buf_size,
+                 "Failed to create component instantiation arguments");
+        goto fail;
     }
     wasm_runtime_instantiation_args_set_default_stack_size(inst_args,
                                                            stack_size);
     wasm_runtime_instantiation_args_set_host_managed_heap_size(inst_args,
                                                                heap_size);
 
-    WASMComponentInstance *component_inst =
-        wasm_component_instantiate(component_out, error_buf, error_buf_size);
+    WASMComponentInstance *component_inst = wasm_component_instantiate_ex2(
+        component, inst_args, error_buf, error_buf_size);
     wasm_runtime_instantiation_args_destroy(inst_args);
+    inst_args = NULL;
     if (!component_inst) {
         LOG_ERROR("Error in instantiation: %s\n", error_buf);
-        return false;
+        goto fail;
     }
 
     *ret_value = 0;
@@ -922,8 +909,16 @@ execute_wasm_component(uint8 *wasm_file_buf, uint32 wasm_file_size,
     if (exception)
         LOG_ERROR("Exception occured: %s\n", exception);
 
+    *component_out = component;
     *component_inst_out = component_inst;
     return true;
+
+fail:
+    if (inst_args)
+        wasm_runtime_instantiation_args_destroy(inst_args);
+    wasm_component_unload(component);
+    *ret_value = -1;
+    return false;
 }
 #endif
 
@@ -963,10 +958,11 @@ main(int argc, char *argv[])
     wasm_module_t wasm_module = NULL;
     wasm_module_inst_t wasm_module_inst = NULL;
 #if WASM_ENABLE_COMPONENT_MODEL != 0
-    WASMComponent component;
+    WASMComponent *component = NULL;
     WASMComponentInstance *component_inst = NULL;
     bool component_loaded = false;
-    bool component_func_invoke = false; // 'true' if component function is invoked
+    bool component_func_invoke =
+        false; // 'true' if component function is invoked
 #endif
 #if WASM_ENABLE_COMPONENT_MODEL != 0
     bool module_func_invoke = false; // 'true' if module function is invoked
@@ -1368,7 +1364,6 @@ main(int argc, char *argv[])
         }
         LOG_DEBUG("Detected WASM Component (Preview 2)\n");
         LOG_DEBUG("Executing WASM Component...\n");
-        set_component_runtime(true);
         if (!execute_wasm_component(
                 wasm_file_buf, wasm_file_size, stack_size, heap_size,
                 is_repl_mode, component_func_invoke, error_buf,
@@ -1459,10 +1454,9 @@ main(int argc, char *argv[])
     /* cleanup module/component resources */
 #if WASM_ENABLE_COMPONENT_MODEL != 0
     if (component_loaded) {
-        if (component_inst) {
+        if (component_inst)
             wasm_component_deinstantiate(component_inst);
-            wasm_component_free(&component);
-        }
+        wasm_component_unload(component);
     }
 #endif
     if (wasm_module_inst) {

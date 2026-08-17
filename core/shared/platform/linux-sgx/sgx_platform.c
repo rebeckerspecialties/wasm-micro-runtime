@@ -119,7 +119,7 @@ strcpy(char *dest, const char *src)
     return dest;
 }
 
-#if WASM_ENABLE_LIBC_WASI == 0
+#if WASM_ENABLE_LIBC_WASI == 0 && WASM_ENABLE_LIBC_WASI_P2 == 0
 bool
 os_is_handle_valid(os_file_handle *handle)
 {

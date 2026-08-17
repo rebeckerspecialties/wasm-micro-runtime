@@ -174,55 +174,79 @@ class ComponentInstantiationTest : public testing::Test
       }
     }
 
-    virtual void test_instance_type(WASMComponentTypeInstance *type_instance, WASMComponentInstType *instance_type_definition, WASMComponentTypeInstance **types) {
-      WASMComponentInstanceDeclTypeSize instance_decl_size;
-      memset(&instance_decl_size, 0, sizeof(WASMComponentInstanceDeclTypeSize));
-      uint32 size = 0, decl_idx, type_idx = 0, func_idx = 0, export_idx = 0;;
-      WASMComponentInstTypeInstance *instance_type_instance = type_instance->type_specific.instance;
-      WASMComponentInstDecl instance_decl;
-      size += wasm_get_inst_decl_size(instance_type_definition, &instance_decl_size);
-      ASSERT_TRUE(type_instance);
-      ASSERT_EQ(type_instance->type, COMPONENT_VAL_TYPE_INSTANCE);
-      ASSERT_TRUE(type_instance->type_specific.instance->types);
-      ASSERT_TRUE(type_instance->type_specific.instance->funcs);
-      ASSERT_TRUE(type_instance->type_specific.instance->exports);
-      ASSERT_EQ(type_instance->type_specific.instance->types_count, instance_decl_size.types_count);
-      ASSERT_EQ(type_instance->type_specific.instance->func_count, instance_decl_size.func_count);
-      ASSERT_EQ(type_instance->type_specific.instance->exports_count, instance_decl_size.exports_count);
+    virtual void test_instance_type(
+        WASMComponentTypeInstance *type_instance,
+        WASMComponentInstType *instance_type_definition,
+        WASMComponentTypeInstance **types)
+    {
+        WASMComponentInstanceDeclTypeSize instance_decl_size;
+        memset(&instance_decl_size, 0,
+               sizeof(WASMComponentInstanceDeclTypeSize));
+        uint64 size = 0;
+        uint32 decl_idx, type_idx = 0, func_idx = 0, export_idx = 0;
+        WASMComponentInstTypeInstance *instance_type_instance =
+            type_instance->type_specific.instance;
+        WASMComponentInstDecl instance_decl;
+        ASSERT_TRUE(wasm_get_inst_decl_size(instance_type_definition,
+                                            &instance_decl_size, &size));
+        ASSERT_TRUE(type_instance);
+        ASSERT_EQ(type_instance->type, COMPONENT_VAL_TYPE_INSTANCE);
+        ASSERT_TRUE(type_instance->type_specific.instance->types);
+        ASSERT_TRUE(type_instance->type_specific.instance->funcs);
+        ASSERT_TRUE(type_instance->type_specific.instance->exports);
+        ASSERT_EQ(type_instance->type_specific.instance->types_count,
+                  instance_decl_size.types_count);
+        ASSERT_EQ(type_instance->type_specific.instance->func_count,
+                  instance_decl_size.func_count);
+        ASSERT_EQ(type_instance->type_specific.instance->exports_count,
+                  instance_decl_size.exports_count);
 
-      for (decl_idx = 0; decl_idx < instance_type_definition->count; decl_idx++) {
-        instance_decl = instance_type_definition->instance_decls[decl_idx];
-        switch (instance_decl.tag)
-        {
-          case WASM_COMP_COMPONENT_DECL_INSTANCE_TYPE:
-            type_idx++;
-            break;
-          case WASM_COMP_COMPONENT_DECL_INSTANCE_ALIAS:
-            type_idx++;
-            break;
-          case WASM_COMP_COMPONENT_DECL_INSTANCE_EXPORTDECL:
-            switch(instance_decl.decl.export_decl->extern_desc->type) {
-              case WASM_COMP_EXTERN_TYPE:
-                type_idx++;
-                ASSERT_EQ(instance_type_instance->exports[export_idx].export_name, instance_decl.decl.export_decl->export_name);
-                ASSERT_EQ(instance_type_instance->exports[export_idx].type, instance_decl.decl.export_decl->extern_desc->type);
-                export_idx++;
-                break;
-              case WASM_COMP_EXTERN_FUNC:
-                func_idx++;
-                ASSERT_EQ(instance_type_instance->exports[export_idx].export_name, instance_decl.decl.export_decl->export_name);
-                ASSERT_EQ(instance_type_instance->exports[export_idx].type, instance_decl.decl.export_decl->extern_desc->type);
-                export_idx++;
-                break;
-              default:
-                break;
+        for (decl_idx = 0; decl_idx < instance_type_definition->count;
+             decl_idx++) {
+            instance_decl = instance_type_definition->instance_decls[decl_idx];
+            switch (instance_decl.tag) {
+                case WASM_COMP_COMPONENT_DECL_INSTANCE_TYPE:
+                    type_idx++;
+                    break;
+                case WASM_COMP_COMPONENT_DECL_INSTANCE_ALIAS:
+                    type_idx++;
+                    break;
+                case WASM_COMP_COMPONENT_DECL_INSTANCE_EXPORTDECL:
+                    switch (instance_decl.decl.export_decl->extern_desc->type) {
+                        case WASM_COMP_EXTERN_TYPE:
+                            type_idx++;
+                            ASSERT_EQ(
+                                instance_type_instance->exports[export_idx]
+                                    .export_name,
+                                instance_decl.decl.export_decl->export_name);
+                            ASSERT_EQ(
+                                instance_type_instance->exports[export_idx]
+                                    .type,
+                                instance_decl.decl.export_decl->extern_desc
+                                    ->type);
+                            export_idx++;
+                            break;
+                        case WASM_COMP_EXTERN_FUNC:
+                            func_idx++;
+                            ASSERT_EQ(
+                                instance_type_instance->exports[export_idx]
+                                    .export_name,
+                                instance_decl.decl.export_decl->export_name);
+                            ASSERT_EQ(
+                                instance_type_instance->exports[export_idx]
+                                    .type,
+                                instance_decl.decl.export_decl->extern_desc
+                                    ->type);
+                            export_idx++;
+                            break;
+                        default:
+                            break;
+                    }
+                default:
+                    break;
             }
-          default:
-            break;
         }
-      }
     }
-
 };
 
 TEST_F(ComponentInstantiationTest, TestGetIndexCount)
@@ -536,6 +560,98 @@ TEST_F(ComponentInstantiationTest, TestResolveAlias)
   wasm_component_deinstantiate(comp_instance);
 }
 
+TEST_F(ComponentInstantiationTest,
+       InlineComponentInstanceIncrementsIndexSpaceCount)
+{
+    WASMComponentIndexCount index_count = {};
+    WASMComponentInstSection section = {};
+    WASMComponentInst inline_instance = {};
+    char local_error[128] = {};
+
+    index_count.instances = 1;
+    index_count.defined_instances = 1;
+    WASMComponentInstance *parent = wasm_component_instance_allocate(
+        &index_count, local_error, sizeof(local_error));
+    ASSERT_NE(parent, nullptr) << local_error;
+
+    inline_instance.instance_expression_tag =
+        WASM_COMP_INSTANCE_EXPRESSION_WITHOUT_ARGS;
+    inline_instance.expression.without_args.inline_expr_len = 0;
+    inline_instance.expression.without_args.inline_expr = nullptr;
+    section.count = 1;
+    section.instances = &inline_instance;
+
+    ASSERT_TRUE(wasm_resolve_instance(&section, parent, local_error,
+                                      sizeof(local_error)))
+        << local_error;
+    ASSERT_EQ(parent->component_instances_count, 1u);
+    ASSERT_EQ(parent->defined_instances_count, 1u);
+    EXPECT_EQ(parent->component_instances[0], parent->defined_instances[0]);
+
+    wasm_component_deinstantiate(parent);
+}
+
+TEST_F(ComponentInstantiationTest,
+       InlineComponentInstanceReservesAndValidatesCoreModuleExports)
+{
+    WASMComponentIndexCount index_count = {};
+    WASMComponentInstSection section = {};
+    WASMComponentInst inline_instance = {};
+    WASMComponentInlineExport inline_export = {};
+    WASMComponentCoreName export_name = {};
+    WASMComponentSort sort = {};
+    WASMComponentSortIdx sort_idx = {};
+    char export_name_chars[] = "m";
+    char local_error[128] = {};
+
+    index_count.core_modules = 1;
+    index_count.instances = 1;
+    index_count.defined_instances = 1;
+    WASMComponentInstance *parent = wasm_component_instance_allocate(
+        &index_count, local_error, sizeof(local_error));
+    ASSERT_NE(parent, nullptr) << local_error;
+    parent->core_modules[0] = &test_core_module;
+    parent->core_modules_count = 1;
+
+    export_name.name_len = 1;
+    export_name.name = export_name_chars;
+    sort.sort = WASM_COMP_SORT_CORE_SORT;
+    sort.core_sort = WASM_COMP_CORE_SORT_MODULE;
+    sort_idx.sort = &sort;
+    sort_idx.idx = 0;
+    inline_export.name = &export_name;
+    inline_export.sort_idx = &sort_idx;
+    inline_instance.instance_expression_tag =
+        WASM_COMP_INSTANCE_EXPRESSION_WITHOUT_ARGS;
+    inline_instance.expression.without_args.inline_expr_len = 1;
+    inline_instance.expression.without_args.inline_expr = &inline_export;
+    section.count = 1;
+    section.instances = &inline_instance;
+
+    ASSERT_TRUE(wasm_resolve_instance(&section, parent, local_error,
+                                      sizeof(local_error)))
+        << local_error;
+    ASSERT_EQ(parent->component_instances_count, 1u);
+    ASSERT_EQ(parent->defined_instances_count, 1u);
+    ASSERT_NE(parent->component_instances[0], nullptr);
+    EXPECT_EQ(parent->component_instances[0]->core_modules_count, 1u);
+    EXPECT_EQ(parent->component_instances[0]->core_modules[0],
+              &test_core_module);
+    ASSERT_EQ(parent->component_instances[0]->exports_count, 1u);
+    EXPECT_EQ(parent->component_instances[0]->exports[0].exp.core_module,
+              &test_core_module);
+
+    sort_idx.idx = 1;
+    memset(local_error, 0, sizeof(local_error));
+    EXPECT_FALSE(wasm_resolve_instance(&section, parent, local_error,
+                                       sizeof(local_error)));
+    EXPECT_NE(strstr(local_error, "not yet defined"), nullptr) << local_error;
+    EXPECT_EQ(parent->component_instances_count, 1u);
+    EXPECT_EQ(parent->defined_instances_count, 1u);
+
+    wasm_component_deinstantiate(parent);
+}
+
 TEST_F(ComponentInstantiationTest, TestResolveCoreInstance) 
 {
   uint32 idx;
@@ -544,6 +660,7 @@ TEST_F(ComponentInstantiationTest, TestResolveCoreInstance)
   WASMComponentIndexCount index_count;
   memset(&index_count, 0, sizeof(WASMComponentIndexCount));
   index_count.core_instances = 3;
+  index_count.defined_core_instances = 2;
   index_count.core_modules = 1;
   index_count.core_functions = 1;
   index_count.core_tables = 1;
@@ -614,6 +731,8 @@ TEST_F(ComponentInstantiationTest, TestResolveCoreInstance)
   WASMComponent *comp_1 = component->sections[3].parsed.component;
   ASSERT_EQ(comp_1->sections[2].id, 1);
   WASMModule *core_module_0 = (WASMModule *)component->sections[3].parsed.component->sections[2].parsed.core_module->module_handle;
+  dummy_core_func_2.u.func->func_type =
+      core_module_0->import_functions[0].u.function.func_type;
 
   ASSERT_EQ(comp_1->sections[5].id, 2);
   instance_section = comp_1->sections[5].parsed.core_instance_section;
@@ -673,8 +792,22 @@ TEST_F(ComponentInstantiationTest, TestResolveCoreInstance)
   ASSERT_EQ(comp_instance_2->core_module_instances[0]->export_func_count , 1);
   ASSERT_EQ(comp_instance_2->core_module_instances[0]->export_functions[0].function , &dummy_core_func_2);
   ASSERT_TRUE(comp_instance_2->core_module_instances[1]->e->functions[0].is_import_func);
-  ASSERT_EQ(*(comp_instance_2->core_module_instances[1]->e->functions[0].local_types), 8);
-  ASSERT_EQ(*(comp_instance_2->core_module_instances[1]->e->functions[0].local_offsets), 16);
+  ASSERT_EQ(comp_instance_2->core_module_instances[1]
+                ->e->functions[0]
+                .import_func_inst,
+            &dummy_core_func_2);
+  ASSERT_EQ(comp_instance_2->core_module_instances[1]
+                ->e->functions[0]
+                .u.func_import->func_type,
+            core_module_0->import_functions[0].u.function.func_type);
+  ASSERT_EQ(*(comp_instance_2->core_module_instances[1]
+                  ->e->functions[0]
+                  .import_func_inst->local_types),
+            8);
+  ASSERT_EQ(*(comp_instance_2->core_module_instances[1]
+                  ->e->functions[0]
+                  .import_func_inst->local_offsets),
+            16);
 
   wasm_component_deinstantiate(comp_instance);
 
@@ -738,7 +871,9 @@ TEST_F(ComponentInstantiationTest, TestResolveCanons)
   memset(&index_count, 0, sizeof(index_count));
   index_count.types = 1;
   index_count.functions = 2;
+  index_count.defined_functions = 1;
   index_count.core_functions = 2;
+  index_count.defined_core_functions = 1;
 
   WASMComponentInstance *comp_instance = wasm_component_instance_allocate(&index_count, NULL, 0);
   comp_instance->functions[0]      = &dummy_comp_func;
@@ -813,7 +948,14 @@ TEST_F(ComponentInstantiationTest, TestInstantiateInternal)
   ASSERT_EQ(comp_instance->component_instances[2]->core_module_instances[0]->export_table_count, 1);
 
   // Test core module instantiation (test imports are resolved properly)
-  ASSERT_EQ(comp_instance->component_instances[2]->core_module_instances[2]->e->functions[0].u.func, comp_instance->component_instances[2]->core_functions[0]->u.func );
+  ASSERT_EQ(comp_instance->component_instances[2]
+                ->core_module_instances[2]
+                ->e->functions[0]
+                .u.func_import->func_type,
+            comp_instance->component_instances[2]
+                ->core_module_instances[2]
+                ->module->import_functions[0]
+                .u.function.func_type);
   ASSERT_EQ(comp_instance->component_instances[2]->core_module_instances[2]->e->functions[0].import_func_inst, comp_instance->component_instances[2]->core_functions[0]);
   ASSERT_EQ(comp_instance->component_instances[2]->core_module_instances[2]->e->functions[0].import_module_inst, comp_instance->component_instances[2]->core_functions[0]->module_instance);
 
@@ -1011,44 +1153,70 @@ TEST_F(ComponentInstantiationTest, TestTypesInstantiation)
   // Test resource type instantiation
   ASSERT_EQ(comp_instance->types[2]->type_specific.instance->types[2]->type, COMPONENT_VAL_TYPE_RESOURCE_SYNC);
   ASSERT_FALSE(strcmp(comp_instance->types[2]->type_specific.instance->types[2]->type_specific.resource->name , "output-stream"));
-  ASSERT_FALSE(strcmp(comp_instance->types[2]->type_specific.instance->types[2]->type_specific.resource->interface_name, "wasi:io/streams@0.2.3"));
+  ASSERT_EQ(comp_instance->types[2]
+                ->type_specific.instance->types[2]
+                ->type_specific.resource->interface_name,
+            nullptr);
+  ASSERT_FALSE(comp_instance->types[2]
+                   ->type_specific.instance->types[2]
+                   ->type_specific.resource->is_host);
   ASSERT_TRUE(comp_instance->types[2]->type_specific.instance->types[2]->type_specific.resource->drop_method);
-
-
+  ASSERT_FALSE(strcmp(comp_instance->component_instances[3]
+                          ->types[0]
+                          ->type_specific.resource->interface_name,
+                      "wasi:io/streams@0.2.3"));
+  ASSERT_TRUE(comp_instance->component_instances[3]
+                  ->types[0]
+                  ->type_specific.resource->is_host);
 }
 
 TEST_F(ComponentInstantiationTest, TestInstantiateSmokeTest)
 {
-  std::vector<std::string> component_files = {
-    "complex.wasm",
-    "hello_wasi.wasm",
-    "hello_wasip1_hacked.component.wasm",
-    "logging_service.component.wasm",
-    "processor_and_logging_merged_wac_plug.wasm",
-    "surface_and_geometry_0_2_0.wasm",
-    "surface_and_geometry.wasm",
-    "wasi_server.wasm",
-    "wasip2_tcp_server.wasm",
-    "add.wasm",
-    "sampletypes.wasm"
-  };
+    std::vector<std::string> component_files = {
+        "complex.wasm",
+        "hello_wasi.wasm",
+        "logging_service.component.wasm",
+        "processor_and_logging_merged_wac_plug.wasm",
+        "surface_and_geometry_0_2_0.wasm",
+        "surface_and_geometry.wasm",
+        "wasi_server.wasm",
+        "wasip2_tcp_server.wasm",
+        "add.wasm",
+        "sampletypes.wasm"
+    };
 
-  WASMComponent *component;
-  WASMComponentInstance *comp_instance;
+    WASMComponent *component;
+    WASMComponentInstance *comp_instance;
 
-  for (uint32 i = 0; i < component_files.size(); i++)
-  {
-    const char *file_name = component_files[i].c_str();
-    component = load_component_from_candidates(file_name);
-    ASSERT_NE(component, nullptr) << "Failed to load/parse component from candidates: "<< file_name;
+    for (uint32 i = 0; i < component_files.size(); i++) {
+        const char *file_name = component_files[i].c_str();
+        component = load_component_from_candidates(file_name);
+        ASSERT_NE(component, nullptr)
+            << "Failed to load/parse component from candidates: " << file_name;
 
-    // Test component is instantiated
-    printf("Instantiate %s\n", file_name);
-    comp_instance = wasm_component_instantiate_internal(component, NULL, error_buf, sizeof(error_buf));
-    ASSERT_NE(comp_instance, nullptr) << "Failed to instantiate " << file_name;
-    wasm_component_deinstantiate(comp_instance);
+        // Test component is instantiated
+        printf("Instantiate %s\n", file_name);
+        comp_instance = wasm_component_instantiate_internal(
+            component, NULL, error_buf, sizeof(error_buf));
+        ASSERT_NE(comp_instance, nullptr)
+            << "Failed to instantiate " << file_name;
+        wasm_component_deinstantiate(comp_instance);
+    }
+}
 
-  }
+TEST_F(ComponentInstantiationTest, TestRejectMissingCoreImportArguments)
+{
+    char file_name[] = "hello_wasip1_hacked.component.wasm";
+    WASMComponent *component = load_component_from_candidates(file_name);
+    ASSERT_NE(component, nullptr)
+        << "Failed to load/parse component from candidates.";
+
+    error_buf[0] = '\0';
+    WASMComponentInstance *comp_instance = wasm_component_instantiate_internal(
+        component, NULL, error_buf, sizeof(error_buf));
+    ASSERT_EQ(comp_instance, nullptr);
+    ASSERT_STREQ(error_buf,
+                 "Import 0 of core instance not found in arguments\n");
 }
 
 TEST_F(ComponentInstantiationTest, TestInstantiateCanonFunctions)
@@ -1104,5 +1272,4 @@ TEST_F(ComponentInstantiationTest, TestInstantiateCanonFunctions)
   ASSERT_TRUE(comp_instance->component_instances[7]->core_module_instances[7]->e->functions[8].is_canon_func);
   ASSERT_EQ(comp_instance->component_instances[7]->core_module_instances[7]->e->functions[8].canon_type, WASM_COMP_CANON_RESOURCE_DROP);
   ASSERT_EQ(comp_instance->component_instances[7]->core_module_instances[7]->e->functions[8].resource, comp_instance->component_instances[7]->types[11]->type_specific.resource);
-
 }

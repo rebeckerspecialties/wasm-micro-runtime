@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include "../component-instantiation/helpers.h"
+#include "wasi_p2_unavailable_context_test.h"
 extern "C" {
 #include "wasm_component_runtime.h"
 #include "wasm_component_host_resource.h"
@@ -25,7 +26,7 @@ class WasiP2FilesystemWrapperTest : public testing::Test
     ~WasiP2FilesystemWrapperTest() {}
     RuntimeInitArgs init_args;
     unsigned char *component_raw = NULL;
-    libc_wasi_parse_context_t parse_ctx;
+    libc_wasi_parse_context_t parse_ctx = {};
 
     char error_buf[128];
     char global_heap_buf[HEAP_SIZE]; // 100 MB
@@ -34,7 +35,7 @@ class WasiP2FilesystemWrapperTest : public testing::Test
     WASMComponentInstance *comp_instance;
 
     WASIContext *wasi_ctx;
-    char test_dir[128];
+    char test_dir[PATH_MAX] = WAMR_UNIT_TEST_SOURCE_DIR "/test_dir";
 
     int32_t dir_fd;
 
@@ -88,8 +89,6 @@ class WasiP2FilesystemWrapperTest : public testing::Test
         strcat(created_link, "/test_file_2.txt");
         unlink(created_link);
 
-        close(dir_fd);
-
         printf("Ending teardown\n");
     }
 
@@ -97,47 +96,16 @@ class WasiP2FilesystemWrapperTest : public testing::Test
       return load_component_from_candidates_internal(file_name, "libc-wasi-p2");
     }
 
-    void get_test_dir() {
-      char cwd[PATH_MAX];
-      getcwd(cwd, sizeof(cwd));
-      const char *substr = "wasm-micro-runtime";
-      /* Last occurrence: hosted CI nests the checkout as
-         .../wasm-micro-runtime/wasm-micro-runtime, and the first match
-         truncates the path prefix one directory short. */
-      char *pos = NULL;
-      for (char *p = strstr(cwd, substr); p; p = strstr(p + 1, substr))
-          pos = p;
-      if (!pos) {
-          printf("Could not find 'wasm-micro-runtime' in cwd\n");
-          return;
-      }
-      size_t prefix_len = (pos - cwd) + strlen(substr);
-      test_dir[0] = '\0';
-      strncat(test_dir, cwd, prefix_len);
-      strcat(test_dir, "/tests/unit/libc-wasi-p2/test_dir");
-    }
-
-    void init_prestats() {
-
-      get_test_dir();
-
-      WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx((WASMModuleInstanceCommon *)comp_instance->core_module_instances[0]);
-      wasi_ctx->prestats = (struct fd_prestats *)wasm_runtime_malloc(
-          sizeof(struct fd_prestats));
-      ASSERT_NE(wasi_ctx->prestats, nullptr);
-      memset(wasi_ctx->prestats, 0, sizeof(struct fd_prestats));
-      // one preopen
-      wasi_ctx->prestats->size = 10;
-      wasi_ctx->prestats->prestats = (struct fd_prestat *)wasm_runtime_malloc(
-          10 * sizeof(struct fd_prestat));
-      ASSERT_NE(wasi_ctx->prestats->prestats, nullptr);
-      memset(wasi_ctx->prestats->prestats, 0, 10 * sizeof(struct fd_prestat));
-      dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
-
-      ASSERT_TRUE(dir_fd < (int32_t)wasi_ctx->prestats->size );
-      wasi_ctx->prestats->prestats[dir_fd].dir = test_dir;
-      ASSERT_NE(wasi_ctx->prestats->prestats[dir_fd].dir[0], '\0');
-      fd_table_insert_existing(wasi_ctx->curfds, dir_fd, dir_fd, false);
+    void init_prestats()
+    {
+        WASIContext *wasi_ctx = wasm_runtime_get_wasi_ctx(
+            (WASMModuleInstanceCommon *)
+                comp_instance->core_module_instances[0]);
+        dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY);
+        ASSERT_NE(dir_fd, -1) << strerror(errno);
+        ASSERT_TRUE(fd_prestats_insert(wasi_ctx->prestats, test_dir, dir_fd));
+        ASSERT_TRUE(
+            fd_table_insert_existing(wasi_ctx->curfds, dir_fd, dir_fd, false));
     }
 
     void test_function_execution(const char *binary_name, const char *func_name) {
@@ -173,21 +141,103 @@ TEST_F(WasiP2FilesystemWrapperTest, test_call_fs_get_directories)
   ASSERT_TRUE(loaded_value->value.list_value.size);
 }
 
+TEST_F(WasiP2FilesystemWrapperTest,
+       preopen_paths_honor_non_utf8_canonical_encodings)
+{
+    const StringEncoding encodings[] = {
+        ENCODING_UTF_16,
+        ENCODING_LATIN_1_UTF_16,
+    };
+    for (StringEncoding encoding : encodings) {
+        wasi_p2_test::SideEffectSnapshot snapshot;
+        wasi_p2_test::ScopedStringEncoding scoped_encoding(
+            comp_instance->core_functions[34]->canon_options, encoding);
+        ASSERT_TRUE(scoped_encoding.valid());
+        ASSERT_TRUE(wasm_component_application_execute_func(
+            comp_instance, const_cast<char *>("call-fs-get-directories()")));
+
+        WASMComponentTypeInstance *ret_type =
+            comp_instance->functions[4]->func_type->results->result;
+        LiftLowerContext cx = {};
+        cx.canonical_opts = comp_instance->core_functions[34]->canon_options;
+        cx.inst = comp_instance;
+        wit_value_t loaded_value = nullptr;
+        ASSERT_TRUE(load(&cx, 0, ret_type, &loaded_value));
+        ASSERT_NE(loaded_value, nullptr);
+        ASSERT_EQ(loaded_value->type, COMPONENT_VAL_TYPE_LIST);
+        ASSERT_GT(loaded_value->value.list_value.size, 0u);
+        wit_value_t tuple = loaded_value->value.list_value.elems[0];
+        ASSERT_NE(tuple, nullptr);
+        ASSERT_EQ(tuple->type, COMPONENT_VAL_TYPE_TUPLE);
+        ASSERT_EQ(tuple->value.tuple_value.size, 2u);
+        wit_value_t descriptor = tuple->value.tuple_value.elems[0];
+        wit_value_t path = tuple->value.tuple_value.elems[1];
+        ASSERT_NE(descriptor, nullptr);
+        ASSERT_NE(path, nullptr);
+        EXPECT_STREQ(path->value.string_value.chars, test_dir);
+        EXPECT_EQ(path->value.string_value.hint_encoding, encoding);
+        const uint32_t rep = descriptor->value.resource_value.value;
+        free_wit_value(loaded_value);
+        ASSERT_EQ(
+            host_resource_table_delete(get_global_host_resource_table(), rep),
+            1u);
+        snapshot.expect_unchanged();
+    }
+}
+
+void
+exercise_unavailable_filesystem(WASMComponentInstance *comp_instance,
+                                bool remove_context)
+{
+    wasi_p2_test::SideEffectSnapshot snapshot;
+    wasi_p2_test::ScopedUnavailableWasi unavailable(comp_instance,
+                                                    remove_context);
+    ASSERT_TRUE(unavailable.valid());
+
+    ASSERT_TRUE(wasm_component_application_execute_func(
+        comp_instance, const_cast<char *>("call-fs-get-directories()")));
+    WASMComponentTypeInstance *ret_type =
+        comp_instance->functions[4]->func_type->results->result;
+    LiftLowerContext cx = {};
+    cx.canonical_opts = comp_instance->core_functions[34]->canon_options;
+    cx.inst = comp_instance;
+    wit_value_t loaded_value = nullptr;
+    ASSERT_TRUE(load(&cx, 0, ret_type, &loaded_value));
+    ASSERT_NE(loaded_value, nullptr);
+    ASSERT_EQ(loaded_value->type, COMPONENT_VAL_TYPE_LIST);
+    EXPECT_EQ(loaded_value->value.list_value.size, 0u);
+    free_wit_value(loaded_value);
+
+    snapshot.expect_unchanged();
+}
+
+TEST_F(WasiP2FilesystemWrapperTest, missing_wasi_context_fails_closed)
+{
+    exercise_unavailable_filesystem(comp_instance, true);
+}
+
+TEST_F(WasiP2FilesystemWrapperTest, null_wasi_options_fail_closed)
+{
+    exercise_unavailable_filesystem(comp_instance, false);
+}
+
 TEST_F(WasiP2FilesystemWrapperTest, test_call_fs_open_at)
 {
-  ASSERT_TRUE(wasm_component_application_execute_func(comp_instance, (char *)"call-fs-open-at()"));
-    
-  WASMComponentTypeInstance *ret_type = comp_instance->functions[23]->func_type->results->result;
-  LiftLowerContext cx;
-  cx.canonical_opts = comp_instance->core_functions[53]->canon_options;
-  cx.inst = comp_instance;
+    ASSERT_TRUE(wasm_component_application_execute_func(
+        comp_instance, (char *)"call-fs-open-at()"));
 
-  wit_value_t loaded_value;
-  bool load_result = load(&cx, 0, ret_type, &loaded_value);
+    WASMComponentTypeInstance *ret_type =
+        comp_instance->functions[23]->func_type->results->result;
+    LiftLowerContext cx;
+    cx.canonical_opts = comp_instance->core_functions[53]->canon_options;
+    cx.inst = comp_instance;
 
-  ASSERT_TRUE(load_result);
-  ASSERT_NE(loaded_value, nullptr);
-  ASSERT_TRUE(loaded_value->value.list_value.size);
+    wit_value_t loaded_value;
+    bool load_result = load(&cx, 0, ret_type, &loaded_value);
+
+    ASSERT_TRUE(load_result);
+    ASSERT_NE(loaded_value, nullptr);
+    ASSERT_TRUE(loaded_value->value.list_value.size);
 }
 
 TEST_F(WasiP2FilesystemWrapperTest,

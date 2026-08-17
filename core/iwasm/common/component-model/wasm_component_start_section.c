@@ -53,10 +53,10 @@ wasm_component_parse_start_section(const uint8_t **payload,
     out->value_args_count = (uint32_t)args_count;
 
     if (args_count > 0) {
-        out->value_args = wasm_runtime_malloc(sizeof(uint32_t) * args_count);
+        out->value_args = wasm_component_checked_calloc(
+            (uint32_t)args_count, sizeof(uint32_t), p, end, 1,
+            "component start argument", error_buf, error_buf_size);
         if (!out->value_args) {
-            set_error_buf_ex(error_buf, error_buf_size,
-                             "Failed to allocate memory for value args");
             return false;
         }
 

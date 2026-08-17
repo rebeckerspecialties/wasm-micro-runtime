@@ -35,6 +35,12 @@ typedef void (*KeyDestroyFunc)(void *key);
    for each value when the hash map is destroyed. */
 typedef void (*ValueDestroyFunc)(void *value);
 
+/* Memory allocation function used for the hash map and its elements. */
+typedef void *(*HashMapMallocFunc)(uint32 size);
+
+/* Memory free function paired with HashMapMallocFunc. */
+typedef void (*HashMapFreeFunc)(void *ptr);
+
 /* traverse callback function:
    auto called when traverse every hash element */
 typedef void (*TraverseCallbackFunc)(void *key, void *value, void *user_data);
@@ -58,6 +64,21 @@ HashMap *
 bh_hash_map_create(uint32 size, bool use_lock, HashFunc hash_func,
                    KeyEqualFunc key_equal_func, KeyDestroyFunc key_destroy_func,
                    ValueDestroyFunc value_destroy_func);
+
+/**
+ * Create a hash map with a caller-provided allocator.
+ *
+ * The map structure and each element are allocated with malloc_func and freed
+ * with free_func. Both allocator callbacks must be specified.
+ *
+ * The remaining parameters and return value have the same semantics as
+ * bh_hash_map_create().
+ */
+HashMap *
+bh_hash_map_create_with_allocator(
+    uint32 size, bool use_lock, HashFunc hash_func, KeyEqualFunc key_equal_func,
+    KeyDestroyFunc key_destroy_func, ValueDestroyFunc value_destroy_func,
+    HashMapMallocFunc malloc_func, HashMapFreeFunc free_func);
 
 /**
  * Insert an element to the hash map

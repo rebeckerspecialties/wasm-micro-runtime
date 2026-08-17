@@ -40,12 +40,9 @@ wasm_component_parse_component_section(const uint8_t **payload,
     unsigned int new_depth = depth + 1;
 
     // Parse the nested component with incremented depth
-    bool status = wasm_component_parse_sections(*payload, payload_len, out,
-                                                args, new_depth);
+    bool status = wasm_component_parse_sections_ex(
+        *payload, payload_len, out, args, new_depth, error_buf, error_buf_size);
     if (!status) {
-        set_error_buf_ex(error_buf, error_buf_size,
-                         "Could not parse sub component with depth: %d",
-                         new_depth);
         return false;
     }
 
