@@ -1,0 +1,101 @@
+# Copyright (C) 2019 Intel Corporation.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# Runs the repository's existing .clang-tidy configuration, but only on the
+# lines a pull request changes. The .clang-tidy config (bugprone-*, cert-*,
+# clang-analyzer-*, ... with WarningsAsErrors) is already maintained in-tree but
+# is not run by any workflow today, so the null-deref / sign-conversion /
+# use-after-move class of bug it catches is currently caught only by a reviewer
+# reading the diff. Diff-scoping (clang-tidy-diff.py, same idea as the
+# git-clang-format-14 gate in coding_guidelines.yml) keeps it low-noise: a PR is
+# only flagged for issues it introduces on the lines it touches.
+#
+# Like coding_guidelines.yml this needs only `contents: read` and computes the
+# diff from the pull_request base SHA, so it behaves identically for pull
+# requests opened within a repository and from forks.
+name: Clang Tidy
+
+on:
+  # PR-only: the gate diffs against the pull-request base, so there is no
+  # meaningful base to diff for a manual (workflow_dispatch) run.
+  pull_request:
+
+# Cancel any in-flight run for the same PR/branch so there's only one active.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Match the clang tooling version pinned by the existing coding-guidelines
+  # gate (ci/coding_guidelines_check.py uses clang-format-14).
+  LLVM_VER: "14"
+
+jobs:
+  clang_tidy:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          # full history so the pull_request base SHA is available for the diff
+          fetch-depth: 0
+
+      - name: install clang-tidy-${{ env.LLVM_VER }} and build tools
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y -qq \
+            "clang-tidy-${LLVM_VER}" cmake ninja-build build-essential
+
+      - name: fetch clang-tidy-diff.py
+        run: |
+          # Pinned to the same LLVM major as clang-tidy-14; this helper ships in
+          # the llvm-project source tree, not in the Ubuntu clang-tidy package.
+          curl -fsSL -o clang-tidy-diff.py \
+            https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-14.0.6/clang-tools-extra/clang-tidy/tool/clang-tidy-diff.py
+          chmod +x clang-tidy-diff.py
+
+      - name: generate compile_commands.json
+        run: |
+          # Default linux iwasm config (interp + AOT runtime + libc), no LLVM
+          # required. Covers the highest-traffic loader / interpreter / common
+          # sources; building also materializes any generated headers so
+          # clang-tidy can parse the changed translation units.
+          cmake -S product-mini/platforms/linux -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build --target iwasm --parallel
+          test -f build/compile_commands.json
+
+      - name: clang-tidy on changed lines
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -o pipefail
+          TIDY="$(command -v "clang-tidy-${LLVM_VER}")"
+          echo "using: $("$TIDY" --version | head -1)"
+
+          # -U0: exact changed-line ranges. clang-tidy-diff.py turns those into
+          # -line-filter, so only lines this PR touches are analyzed.
+          if git diff -U0 --no-color "${BASE_SHA}" HEAD -- \
+                '*.c' '*.cc' '*.cpp' '*.h' \
+              | python3 clang-tidy-diff.py \
+                  -p1 -path build \
+                  -clang-tidy-binary "$TIDY" \
+                  -j "$(nproc)" 2>&1 \
+              | tee clang-tidy.log ; then
+            DIFF_RC=0
+          else
+            DIFF_RC=$?
+          fi
+
+          if [ "${DIFF_RC}" -ne 0 ] \
+             || grep -Eq ':[0-9]+:[0-9]+: (warning|error): ' clang-tidy.log ; then
+            echo "::error::clang-tidy reported issues on lines changed by this PR"
+            exit 1
+          fi
+          echo "clang-tidy is clean on the changed lines."
