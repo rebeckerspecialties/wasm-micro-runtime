@@ -15,6 +15,7 @@ WORKDIR="$PWD"
 WAMRC_ROOT_DIR="${WORKDIR}/../../../wamr-compiler"
 WAMRC="${WAMRC_ROOT_DIR}/build/wamrc"
 # CI installs wabt under /opt/wabt (not on PATH); prefer it, fall back to PATH.
+WAMRC_OPTIONS="--enable-gc"
 WAST2WASM="/opt/wabt/bin/wat2wasm"
 if [ ! -x "$WAST2WASM" ]; then WAST2WASM="$(command -v wat2wasm)"; fi
 
@@ -48,25 +49,25 @@ for file_name in "${file_names[@]}"; do
     case "$HOST_ARCH" in
         x86_64)
             # x86-64 host: compile both x86-64 and x86-32
-            $WAMRC -o "build/${file_name}.aot" "build/${file_name}.wasm"
-            $WAMRC --target=i386 -o "build/${file_name}_32.aot" "build/${file_name}.wasm"
-            $WAMRC --bounds-checks=1 -o "build/${file_name}_no_hw_bounds.aot" "build/${file_name}.wasm"
-            $WAMRC --bounds-checks=1 --target=i386 -o "build/${file_name}_no_hw_bounds_32.aot" "build/${file_name}.wasm"
+            $WAMRC $WAMRC_OPTIONS -o "build/${file_name}.aot" "build/${file_name}.wasm"
+            $WAMRC $WAMRC_OPTIONS --target=i386 -o "build/${file_name}_32.aot" "build/${file_name}.wasm"
+            $WAMRC $WAMRC_OPTIONS --bounds-checks=1 -o "build/${file_name}_no_hw_bounds.aot" "build/${file_name}.wasm"
+            $WAMRC $WAMRC_OPTIONS --bounds-checks=1 --target=i386 -o "build/${file_name}_no_hw_bounds_32.aot" "build/${file_name}.wasm"
             ;;
         i386|i686)
             # x86-32 host: compile only x86-32
-            $WAMRC -o "build/${file_name}.aot" "build/${file_name}.wasm"
-            $WAMRC --bounds-checks=1 -o "build/${file_name}_no_hw_bounds.aot" "build/${file_name}.wasm"
+            $WAMRC $WAMRC_OPTIONS -o "build/${file_name}.aot" "build/${file_name}.wasm"
+            $WAMRC $WAMRC_OPTIONS --bounds-checks=1 -o "build/${file_name}_no_hw_bounds.aot" "build/${file_name}.wasm"
             ;;
         aarch64|arm64)
             # ARM64 host: compile only aarch64
-            $WAMRC  -o "build/${file_name}.aot" "build/${file_name}.wasm"
-            $WAMRC  --bounds-checks=1 -o "build/${file_name}_no_hw_bounds.aot" "build/${file_name}.wasm"
+            $WAMRC $WAMRC_OPTIONS -o "build/${file_name}.aot" "build/${file_name}.wasm"
+            $WAMRC $WAMRC_OPTIONS --bounds-checks=1 -o "build/${file_name}_no_hw_bounds.aot" "build/${file_name}.wasm"
             ;;
         *)
             echo "Warning: Unsupported architecture '$HOST_ARCH'. Using default target."
-            $WAMRC -o "build/${file_name}.aot" "build/${file_name}.wasm"
-            $WAMRC --bounds-checks=1 -o "build/${file_name}_no_hw_bounds.aot" "build/${file_name}.wasm"
+            $WAMRC $WAMRC_OPTIONS -o "build/${file_name}.aot" "build/${file_name}.wasm"
+            $WAMRC $WAMRC_OPTIONS --bounds-checks=1 -o "build/${file_name}_no_hw_bounds.aot" "build/${file_name}.wasm"
             ;;
     esac
 done
