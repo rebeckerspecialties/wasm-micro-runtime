@@ -109,6 +109,11 @@ FetchContent_MakeAvailable(cmocka)
 include(GoogleTest)
 enable_testing()
 
+if(DEFINED UNITTEST_FOLDER AND NOT "${UNITTEST_FOLDER}" STREQUAL "")
+  add_subdirectory("${UNITTEST_FOLDER}")
+  return()
+endif()
+
 set(WAMR_UNIT_COMMON_HELPERS_ONLY TRUE)
 include(${CMAKE_CURRENT_LIST_DIR}/unit_common.cmake)
 unset(WAMR_UNIT_COMMON_HELPERS_ONLY)
@@ -128,8 +133,16 @@ set(UNIT_TEST_SUITES
   linear-memory-aot
   linux-perf
   gc
+  unsupported-features
   exception-handling
   running-modes
+  component
+  component-instantiation
+  component-execution
+  canonical-abi
+  canonical-execution
+  libc-wasi-p2
+  wave-parser
   mem-alloc
 )
 foreach(unit_test_suite IN LISTS UNIT_TEST_SUITES)

@@ -24,6 +24,23 @@
 #if WASM_ENABLE_SIMDE != 0
 #include "simde/wasm/simd128.h"
 #endif
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+#include "../common/component-model/wasm_component_runtime.h"
+#include "../common/component-model/wasm_component_flat.h"
+#include "../common/component-model/wasm_component_task.h"
+#include "../common/component-model/wasm_component_resource_table.h"
+#include "../common/component-model/wasm_component_resource.h"
+#include "../common/component-model/wasm_component_canon.h"
+#endif
+
+/* MSVC has no `__builtin_expect`; the cold-path hints below are
+ * GCC/Clang only. Provide a no-op fallback so the loop still
+ * compiles on the Windows MSVC build. Branch-predictor hints are
+ * an optimization, not correctness, so dropping them on MSVC is
+ * fine. */
+#if !defined(__GNUC__) && !defined(__clang__)
+#define __builtin_expect(expr, expected) (expr)
+#endif
 
 typedef int32 CellType_I32;
 typedef int64 CellType_I64;
@@ -100,6 +117,55 @@ typedef float64 CellType_F64;
 
 #else
 #define CHECK_INSTRUCTION_LIMIT() (void)0
+#endif
+
+#if WASM_ENABLE_EXCE_HANDLING != 0
+/* Per-frame eh-stack entries are 2 cells wide. Cell 0 packs the index
+ * into `func->exception_handlers[]` (low 31 bits) and a state bit
+ * (top bit): clear when the try-region's handler is *in scope* (TRY
+ * state — a throw matching one of its catches will dispatch into the
+ * handler), set once the throw walker has selected one of its
+ * handlers (CATCH state — further throws raised from inside that
+ * handler skip the entry and propagate outward). Cell 1 holds the
+ * wasm tag index of the exception currently being handled (written
+ * by the throw walker on dispatch; read by RETHROW). The tag is
+ * undefined while the entry is in TRY state. */
+#define EH_TRY_CATCH_STATE_BIT 0x80000000u
+#define EH_ENTRY_CELLS 2
+
+/* Base of the per-frame eh-stack, in cells from frame_lp.
+ *
+ * Frame setup (see the call-into-wasm-function path) reserves the
+ * eh-stack region *after* the locals + value stack and, in GC builds,
+ * *after* the frame_ref root bitmap as well. The accumulation order in
+ * `all_cell_num` is:
+ *
+ *   locals + value stack : cell_num_of_local_stack cells
+ *   [GC only] frame_ref  : (cell_num_of_local_stack + 3) / 4 cells
+ *   eh-stack             : exception_handler_count * EH_ENTRY_CELLS
+ *
+ * where cell_num_of_local_stack = param_cell_num + local_cell_num
+ * + max_stack_cell_num. The runtime pointer must skip the same regions.
+ * In non-GC builds the frame_ref bitmap doesn't exist, so the offset
+ * collapses to cell_num_of_local_stack — leaving non-GC behavior byte-
+ * for-byte identical. In GC builds, omitting the bitmap term made the
+ * eh-stack alias frame->frame_ref (both start at
+ * frame_lp + cell_num_of_local_stack), so WASM_OP_TRY corrupted GC
+ * roots; adding it lands the eh-stack in its reserved trailing cells. */
+#if WASM_ENABLE_GC != 0
+#define EH_FRAME_REF_CELLS(cur_func, cur_wasm_func)            \
+    ((((cur_func)->param_cell_num + (cur_func)->local_cell_num \
+       + (cur_wasm_func)->max_stack_cell_num)                  \
+      + 3)                                                     \
+     / 4)
+#else
+#define EH_FRAME_REF_CELLS(cur_func, cur_wasm_func) 0
+#endif
+
+#define EH_STACK_BASE(frame_lp, cur_func, cur_wasm_func)                  \
+    ((frame_lp) + (cur_func)->param_cell_num + (cur_func)->local_cell_num \
+     + (cur_wasm_func)->max_stack_cell_num                                \
+     + EH_FRAME_REF_CELLS(cur_func, cur_wasm_func))
 #endif
 
 static inline uint32
@@ -1233,14 +1299,24 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
 
     wasm_exec_env_set_cur_frame(exec_env, frame);
 
-    cur_func_index = (uint32)(cur_func - module_inst->e->functions);
-    bh_assert(cur_func_index < module_inst->module->import_function_count);
-    if (!func_import->call_conv_wasm_c_api) {
-        native_func_pointer = module_inst->import_func_ptrs[cur_func_index];
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    if (cur_func->module_instance != module_inst) {
+        bh_assert(cur_func->u.func_import->func_ptr_linked);
+        native_func_pointer = cur_func->u.func_import->func_ptr_linked;
     }
-    else if (module_inst->c_api_func_imports) {
-        c_api_func_import = module_inst->c_api_func_imports + cur_func_index;
-        native_func_pointer = c_api_func_import->func_ptr_linked;
+    else
+#endif
+    {
+        cur_func_index = (uint32)(cur_func - module_inst->e->functions);
+        bh_assert(cur_func_index < module_inst->module->import_function_count);
+        if (!func_import->call_conv_wasm_c_api) {
+            native_func_pointer = module_inst->import_func_ptrs[cur_func_index];
+        }
+        else if (module_inst->c_api_func_imports) {
+            c_api_func_import =
+                module_inst->c_api_func_imports + cur_func_index;
+            native_func_pointer = c_api_func_import->func_ptr_linked;
+        }
     }
 
     if (!native_func_pointer) {
@@ -1252,7 +1328,14 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
         return;
     }
 
-    if (func_import->call_conv_wasm_c_api) {
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    if (cur_func->canon_options && cur_func->component_function) {
+        ret = wasm_runtime_invoke_native_p2(exec_env, cur_func, frame->lp,
+                                            cur_func->param_cell_num, argv_ret);
+    }
+    else
+#endif
+        if (func_import->call_conv_wasm_c_api) {
         ret = wasm_runtime_invoke_c_api_native(
             (WASMModuleInstanceCommon *)module_inst, native_func_pointer,
             func_import->func_type, cur_func->param_cell_num, frame->lp,
@@ -1304,7 +1387,7 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     wasm_exec_env_set_cur_frame(exec_env, prev_frame);
 }
 
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
 static void
 wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                WASMExecEnv *exec_env,
@@ -1325,6 +1408,408 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
     WASMExecEnv *sub_module_exec_env = NULL;
     uintptr_t aux_stack_origin_boundary = 0;
     uintptr_t aux_stack_origin_bottom = 0;
+
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    if (cur_func->canon_options) {
+        // Lower opts (caller, C1)
+        CanonicalOptions *lower_opts = cur_func->canon_options;
+
+        // Lift opts (callee, C2)
+        WASMComponentFunctionInstance *callee_comp_func =
+            cur_func->component_function;
+        CanonicalOptions *lift_opts = callee_comp_func->canon_options;
+
+        // FuncType
+        WASMComponentFuncTypeInstance *ft = callee_comp_func->func_type;
+        // ft->params  -> WASMComponentParamListInstance* (parameter types)
+        // ft->results -> WASMComponentResultListInstance* (result types)
+
+        // C1's component instance (caller)
+        WASMComponentInstance *caller_comp_inst = module_inst->comp_instance;
+
+        // C2's component instance (callee)
+        WASMComponentInstance *callee_comp_inst =
+            callee_comp_func->core_func->module_instance->comp_instance;
+
+        Task *task = task_create(lift_opts, callee_comp_inst, ft, NULL);
+        if (!task) {
+            wasm_set_exception(module_inst, "failed to create task");
+            return;
+        }
+
+        Subtask *subtask = subtask_create();
+        if (!subtask) {
+            task_destroy(task);
+            wasm_set_exception(module_inst, "failed to create subtask");
+            return;
+        }
+
+        // Lower context (caller side, C1)
+        LiftLowerContext cx_lower;
+        cx_lower.canonical_opts = lower_opts;
+        cx_lower.inst = caller_comp_inst;
+        cx_lower.borrow_scope_type =
+            BORROW_SCOPE_SUBTASK; // canon lower uses subtask
+        cx_lower.borrow_scope.subtask = subtask;
+
+        // Lift context (callee side, C2)
+        LiftLowerContext cx_lift;
+        cx_lift.canonical_opts = lift_opts;
+        cx_lift.inst = callee_comp_inst;
+        cx_lift.borrow_scope_type = BORROW_SCOPE_TASK; // canon lift uses task
+        cx_lift.borrow_scope.task = task;
+
+        WASMInterpFrame *outs_area = wasm_exec_env_wasm_stack_top(exec_env);
+        uint32_t *raw_cells = outs_area->lp;
+
+        wit_value_t args = NULL;
+        wit_value_t results = NULL;
+
+        FlatTypes flat_param_types;
+        flat_types_init(&flat_param_types);
+        if (!flatten_param_types(&cx_lower, ft->params, &flat_param_types)) {
+            wasm_set_exception(module_inst, "failed to flatten param types");
+            goto canon_cleanup;
+        }
+
+        // Check if results need a retptr
+        FlatTypes flat_result_check;
+        flat_types_init(&flat_result_check);
+        if (!flatten_result_types(&cx_lower, ft->results, &flat_result_check)) {
+            wasm_set_exception(module_inst, "failed to flatten result types");
+            goto canon_cleanup;
+        }
+
+        bool use_retptr = (flat_result_check.count > MAX_FLAT_RESULTS);
+        uint32_t total_flat_params =
+            flat_param_types.count + (use_retptr ? 1 : 0);
+
+        CoreValue core_args[MAX_FLAT_TYPES];
+        uint32_t cell_idx = 0;
+
+        // Read component params
+        for (uint32_t i = 0; i < flat_param_types.count; i++) {
+            core_args[i].type = flat_param_types.types[i];
+            switch (flat_param_types.types[i]) {
+                case CORE_TYPE_I32:
+                {
+                    core_args[i].val.i32 = raw_cells[cell_idx++];
+                    break;
+                }
+                case CORE_TYPE_I64:
+                {
+                    // i64 takes 2 uint32_t cells
+                    memcpy(&core_args[i].val.i64, &raw_cells[cell_idx],
+                           sizeof(uint64));
+                    cell_idx += 2;
+                    break;
+                }
+                case CORE_TYPE_F32:
+                {
+                    memcpy(&core_args[i].val.f32, &raw_cells[cell_idx],
+                           sizeof(float));
+                    cell_idx++;
+                    break;
+                }
+                case CORE_TYPE_F64:
+                {
+                    // f64 takes 2 uint32_t cells
+                    memcpy(&core_args[i].val.f64, &raw_cells[cell_idx],
+                           sizeof(double));
+                    cell_idx += 2;
+                    break;
+                }
+                default:
+                {
+                    wasm_set_exception(module_inst, "invlid component param");
+                    goto canon_cleanup;
+                }
+            }
+        }
+
+        if (use_retptr) {
+            core_args[flat_param_types.count].type = CORE_TYPE_I32;
+            core_args[flat_param_types.count].val.i32 = raw_cells[cell_idx++];
+        }
+
+        // Single shared iterator:
+        //        -> lift_flat_values consumes params,
+        //        -> lower_flat_values reads the remaining retptr
+        CoreValueIter vi;
+        vi_init(&vi, core_args, total_flat_params);
+
+        // 1. CANON LOWER — lift Caller's flat params to WIT values
+        if (!lift_flat_values(&cx_lower, MAX_FLAT_PARAMS, &vi, ft->params, NULL,
+                              &args)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to lift parameters");
+            goto canon_cleanup;
+        }
+
+        // 2. CANON LIFT — lower WIT params to Callee's flat representation
+        CoreValueList flat_args_callee;
+        cvl_init(&flat_args_callee);
+        if (!lower_flat_values(&cx_lift, MAX_FLAT_PARAMS, args, ft->params,
+                               NULL, NULL, &flat_args_callee)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to lower parameters");
+            goto canon_cleanup;
+        }
+
+        // 3. Convert CoreValueList -> wasm_val_t[] and call Callee
+        WASMFunctionInstance *callee_core_func = callee_comp_func->core_func;
+        WASMExecEnv *callee_exec_env = wasm_runtime_get_exec_env_singleton(
+            (WASMModuleInstanceCommon *)callee_core_func->module_instance);
+
+        // Convert flat_args_callee to wasm_val_t array
+        wasm_val_t wasm_args[MAX_FLAT_TYPES];
+        for (uint32_t i = 0; i < flat_args_callee.count; i++) {
+            switch (flat_args_callee.values[i].type) {
+                case CORE_TYPE_I32:
+                {
+                    wasm_args[i].kind = WASM_I32;
+                    wasm_args[i].of.i32 = flat_args_callee.values[i].val.i32;
+                    break;
+                }
+                case CORE_TYPE_I64:
+                {
+                    wasm_args[i].kind = WASM_I64;
+                    wasm_args[i].of.i64 = flat_args_callee.values[i].val.i64;
+                    break;
+                }
+                case CORE_TYPE_F32:
+                {
+                    wasm_args[i].kind = WASM_F32;
+                    wasm_args[i].of.f32 = flat_args_callee.values[i].val.f32;
+                    break;
+                }
+                case CORE_TYPE_F64:
+                {
+                    wasm_args[i].kind = WASM_F64;
+                    wasm_args[i].of.f64 = flat_args_callee.values[i].val.f64;
+                    break;
+                }
+                default:
+                {
+                    wasm_set_exception(module_inst, "invalid wasm_val_t type");
+                    goto canon_cleanup;
+                }
+            }
+        }
+
+        // Determine how many results Callee will return
+        FlatTypes flat_result_types;
+        flat_types_init(&flat_result_types);
+        if (!flatten_result_types(&cx_lift, ft->results, &flat_result_types)) {
+            wasm_set_exception(module_inst, "failed to flatten result");
+            goto canon_cleanup;
+        }
+
+        uint32_t num_wasm_results = 0;
+
+        if (flat_result_types.count > MAX_FLAT_RESULTS) {
+            num_wasm_results = 1;
+        }
+        else {
+            num_wasm_results = flat_result_types.count;
+        }
+        wasm_val_t wasm_results[MAX_FLAT_TYPES];
+
+        // Ensure the callee exec_env points to the correct module
+        WASMModuleInstanceCommon *saved_callee_inst =
+            wasm_runtime_get_module_inst(callee_exec_env);
+        wasm_exec_env_set_module_inst(
+            callee_exec_env,
+            (WASMModuleInstanceCommon *)callee_core_func->module_instance);
+
+        // When OS_ENABLE_HW_BOUND_CHECK is active,
+        // call_wasm_with_hw_bound_check rejects any exec_env that differs from
+        // exec_env_tls.
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+        WASMExecEnv *saved_tls = wasm_runtime_get_exec_env_tls();
+        wasm_runtime_set_exec_env_tls(NULL);
+#endif
+        if (!wasm_runtime_call_wasm_a(
+                callee_exec_env, (WASMFunctionInstanceCommon *)callee_core_func,
+                num_wasm_results, wasm_results, flat_args_callee.count,
+                wasm_args)) {
+            // Propagate Callee's trap to Caller's module instance
+            const char *ex = wasm_runtime_get_exception(
+                (WASMModuleInstanceCommon *)callee_core_func->module_instance);
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+            wasm_runtime_set_exec_env_tls(saved_tls);
+#endif
+            wasm_exec_env_restore_module_inst(callee_exec_env,
+                                              saved_callee_inst);
+            wasm_set_exception(module_inst,
+                               ex ? ex : "cross-component call failed");
+            goto canon_cleanup;
+        }
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+        wasm_runtime_set_exec_env_tls(saved_tls);
+#endif
+
+        // Restore exec env
+        wasm_exec_env_restore_module_inst(callee_exec_env, saved_callee_inst);
+
+        // 4. CANON LIFT — lift results
+        CoreValue core_results[MAX_FLAT_TYPES];
+        for (uint32_t i = 0; i < num_wasm_results; i++) {
+            switch (wasm_results[i].kind) {
+                case WASM_I32:
+                {
+                    core_results[i].type = CORE_TYPE_I32;
+                    core_results[i].val.i32 = wasm_results[i].of.i32;
+                    break;
+                }
+                case WASM_I64:
+                {
+                    core_results[i].type = CORE_TYPE_I64;
+                    core_results[i].val.i64 = wasm_results[i].of.i64;
+                    break;
+                }
+                case WASM_F32:
+                {
+                    core_results[i].type = CORE_TYPE_F32;
+                    core_results[i].val.f32 = wasm_results[i].of.f32;
+                    break;
+                }
+                case WASM_F64:
+                {
+                    core_results[i].type = CORE_TYPE_F64;
+                    core_results[i].val.f64 = wasm_results[i].of.f64;
+                    break;
+                }
+                default:
+                {
+                    wasm_set_exception(module_inst, "Invalid lift result type");
+                    goto canon_cleanup;
+                }
+            }
+        }
+
+        CoreValueIter result_vi;
+        vi_init(&result_vi, core_results, num_wasm_results);
+
+        if (!lift_flat_values(&cx_lift, MAX_FLAT_RESULTS, &result_vi, NULL,
+                              ft->results, &results)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to lift results");
+            goto canon_cleanup;
+        }
+
+        // 5. CANON LOWER — lower WIT results into Caller's flat representation
+        CoreValueList flat_results_caller;
+        cvl_init(&flat_results_caller);
+        if (!lower_flat_values(&cx_lower, MAX_FLAT_RESULTS, results, NULL,
+                               ft->results, &vi, &flat_results_caller)) {
+            wasm_set_exception(module_inst,
+                               "component: failed to lower results");
+            goto canon_cleanup;
+        }
+
+        // 6. Mark subtask as returned
+        subtask->state = SUBTASK_STATE_RETURNED;
+
+        // 7. task_return — validate borrows are released
+        if (!task_return(task)) {
+            wasm_set_exception(module_inst, "task has a lot of borrows");
+            goto canon_cleanup;
+        }
+
+        // 8. Optional post_return on Callee, called with Callee's raw core
+        // results.
+        if (lift_opts->post_return_func) {
+            saved_callee_inst = wasm_runtime_get_module_inst(callee_exec_env);
+            wasm_exec_env_set_module_inst(
+                callee_exec_env, (WASMModuleInstanceCommon *)lift_opts
+                                     ->post_return_func->module_instance);
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+            WASMExecEnv *saved_tls_pr = wasm_runtime_get_exec_env_tls();
+            wasm_runtime_set_exec_env_tls(NULL);
+#endif
+            if (!wasm_runtime_call_wasm_a(
+                    callee_exec_env,
+                    (WASMFunctionInstanceCommon *)lift_opts->post_return_func,
+                    0, NULL, num_wasm_results, wasm_results)) {
+                const char *ex = wasm_runtime_get_exception(
+                    (WASMModuleInstanceCommon *)
+                        lift_opts->post_return_func->module_instance);
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+                wasm_runtime_set_exec_env_tls(saved_tls_pr);
+#endif
+                wasm_exec_env_restore_module_inst(callee_exec_env,
+                                                  saved_callee_inst);
+                wasm_set_exception(module_inst,
+                                   ex ? ex : "component: post-return failed");
+                goto canon_cleanup;
+            }
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+            wasm_runtime_set_exec_env_tls(saved_tls_pr);
+#endif
+            wasm_exec_env_restore_module_inst(callee_exec_env,
+                                              saved_callee_inst);
+        }
+
+        // 9. Release borrow lend counts
+        subtask_deliver_resolve(subtask);
+
+        // 10. Put results back on Caller's operand stack
+        // Fast interp: no sp pointer — results go to prev_frame->lp[ret_offset
+        // + N]
+        cell_idx = 0;
+        for (uint32_t i = 0; i < flat_results_caller.count; i++) {
+            switch (flat_results_caller.values[i].type) {
+                case CORE_TYPE_I32:
+                {
+                    // i64 takes 2 uint32_t cells
+                    prev_frame->lp[prev_frame->ret_offset + cell_idx++] =
+                        flat_results_caller.values[i].val.i32;
+                    break;
+                }
+                case CORE_TYPE_I64:
+                {
+                    memcpy(&prev_frame->lp[prev_frame->ret_offset + cell_idx],
+                           &flat_results_caller.values[i].val.i64,
+                           sizeof(uint64));
+                    cell_idx += 2;
+                    break;
+                }
+                case CORE_TYPE_F32:
+                {
+                    memcpy(&prev_frame->lp[prev_frame->ret_offset + cell_idx],
+                           &flat_results_caller.values[i].val.f32,
+                           sizeof(float));
+                    cell_idx++;
+                    break;
+                }
+                case CORE_TYPE_F64:
+                {
+                    // f64 takes 2 uint32_t cells
+                    memcpy(&prev_frame->lp[prev_frame->ret_offset + cell_idx],
+                           &flat_results_caller.values[i].val.f64,
+                           sizeof(double));
+                    cell_idx += 2;
+                    break;
+                }
+                default:
+                {
+                    wasm_set_exception(module_inst,
+                                       "invalid core type returned");
+                    goto canon_cleanup;
+                }
+            }
+        }
+
+    canon_cleanup:
+        free_wit_value(args);
+        free_wit_value(results);
+        task_destroy(task);
+        subtask_destroy(subtask);
+
+        return; // done, back to Caller's interpreter loop
+    }
+#endif
 
     /*
      * perform stack overflow check before calling
@@ -1538,6 +2023,30 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
     uint8 *maddr = NULL;
     uint32 local_idx, local_offset, global_idx;
     uint8 opcode = 0, local_type, *global_addr;
+#if WASM_ENABLE_EXCE_HANDLING != 0
+    /* Carries the wasm tag index from WASM_OP_THROW to the
+     * find_a_catch_handler label, and from a callee's return through
+     * frame->tag_index back to a caller-side find_a_catch_handler.
+     * Cold path only — the dispatch loop's hot ops never reference
+     * this variable, so the compiler is free to spill it. */
+    uint32 exception_tag_index = 0;
+    /* Tag-with-params payload routing for same-function dispatch.
+     * Read off the IR after THROW's tag_index immediate;
+     * `throw_src_offsets` points at the first src-slot int16 in the
+     * rewritten IR, and `throw_param_cell_num` is the total cell
+     * count across all of the tag's params. find_a_catch_handler
+     * uses these to copy frame_lp[src[i]] into the matched catch's
+     * pre-allocated dst slots. Both are cold-path-only — like
+     * exception_tag_index, the dispatch loop's hot ops never
+     * reference them. RETHROW re-points throw_src_offsets at the
+     * still-alive catch's `param_dst_offsets` (the original
+     * payload values, unchanged by the catch body since they live
+     * in a different slot range from locals) so the re-raised
+     * exception carries the same payload across outer try-regions
+     * in this frame. */
+    uint32 throw_param_cell_num = 0;
+    int16 *throw_src_offsets = NULL;
+#endif
 
 #if WASM_ENABLE_INSTRUCTION_METERING != 0
     int instructions_left = -1;
@@ -1774,21 +2283,47 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 val = GET_OPERAND(uint32, I32, 0);
                 frame_ip += 2;
 
-                if ((uint32)val >= tbl_inst->cur_size) {
+                /* Bounds / null / type-mismatch checks below are
+                 * structurally cold paths — well-formed wasm modules
+                 * pass them on every dispatched CALL_INDIRECT. Marking
+                 * them `__builtin_expect(cond, 0)` lets the compiler
+                 * (a) hint the branch predictor with a static-bias
+                 * fallback for unseen call sites, and (b) lay out the
+                 * error-handling tail away from the hot path so each
+                 * fall-through case stays in one straight-line I-cache
+                 * line. Apple Silicon E-cores (Icestorm, iPhone 12)
+                 * showed ~27 % `Discarded` (bad-spec / mispredict)
+                 * on the AS variant of graphql-validation under
+                 * fast-interp, where megamorphic vtable dispatch
+                 * hits CALL_INDIRECT thousands of times; the layout
+                 * hint matters more than the branch hint on Apple's
+                 * sophisticated predictor. PMU bucket shares stay
+                 * within run-to-run noise on both Porffor and AS
+                 * graphql-validation workloads, so the change is
+                 * documentation-as-code more than a speedup —
+                 * keep it because the cold-path semantic is real
+                 * and the cost is zero. */
+                if (__builtin_expect((uint32)val >= tbl_inst->cur_size, 0)) {
                     wasm_set_exception(module, "undefined element");
                     goto got_exception;
                 }
 
                 /* clang-format off */
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                if (tbl_inst->elem_type == VALUE_TYPE_EXTERNREF) {
+                    cur_func = (WASMFunctionInstance *) tbl_inst->elems[val];
+                    goto call_func_from_interp;
+                }
+#endif
 #if WASM_ENABLE_GC == 0
                 fidx = (uint32)tbl_inst->elems[val];
-                if (fidx == (uint32)-1) {
+                if (__builtin_expect(fidx == (uint32)-1, 0)) {
                     wasm_set_exception(module, "uninitialized element");
                     goto got_exception;
                 }
 #else
                 func_obj = (WASMFuncObjectRef)tbl_inst->elems[val];
-                if (!func_obj) {
+                if (__builtin_expect(!func_obj, 0)) {
                     wasm_set_exception(module, "uninitialized element");
                     goto got_exception;
                 }
@@ -1801,7 +2336,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                  * another module. in that case, we don't validate
                  * the elem value while loading
                  */
-                if (fidx >= module->e->function_count) {
+                if (__builtin_expect(fidx >= module->e->function_count, 0)) {
                     wasm_set_exception(module, "unknown function");
                     goto got_exception;
                 }
@@ -1816,12 +2351,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                 /* clang-format off */
 #if WASM_ENABLE_GC == 0
-                if (cur_type != cur_func_type) {
+                if (__builtin_expect(cur_type != cur_func_type, 0)) {
                     wasm_set_exception(module, "indirect call type mismatch");
                     goto got_exception;
                 }
 #else
-                if (!wasm_func_type_is_super_of(cur_type, cur_func_type)) {
+                if (__builtin_expect(
+                        !wasm_func_type_is_super_of(cur_type, cur_func_type),
+                        0)) {
                     wasm_set_exception(module, "indirect call type mismatch");
                     goto got_exception;
                 }
@@ -1836,14 +2373,406 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             }
 
 #if WASM_ENABLE_EXCE_HANDLING != 0
-            HANDLE_OP(WASM_OP_TRY)
-            HANDLE_OP(WASM_OP_CATCH)
             HANDLE_OP(WASM_OP_THROW)
-            HANDLE_OP(WASM_OP_RETHROW)
-            HANDLE_OP(WASM_OP_DELEGATE)
+            {
+                /* Loader emits
+                 *   `WASM_OP_THROW <tag_index:u32>
+                 *                  <param_cell_num:u32>
+                 *                  <src_offset_0:int16> ...
+                 * <src_offset_N-1:int16>`. Read the tag plus payload-source
+                 * metadata, then walk the eh-stack in find_a_catch_handler to
+                 * find a matching catch — first in this frame, then via
+                 * return_func's hook in caller frames, and finally
+                 * falling out to the host via got_exception when no
+                 * match is found anywhere.
+                 *
+                 * Payload routing: when a same-function catch matches,
+                 * find_a_catch_handler copies frame_lp[src[i]] into
+                 * the catch's pre-allocated dst slots (recorded on
+                 * `WASMFastEHCatch.param_dst_offsets` at load time).
+                 * For tag-without-params (the typical Porffor shape),
+                 * `throw_param_cell_num == 0` makes the copy a no-op.
+                 * For cross-function dispatch the source frame is
+                 * torn down before the caller's walker runs, so the
+                 * payload is dropped — this gap is documented in
+                 * AGENTS.md and exercised as
+                 * `cross_function_tag_with_params` (#[ignore]). */
+                exception_tag_index = read_uint32(frame_ip);
+                throw_param_cell_num = read_uint32(frame_ip);
+                throw_src_offsets = (int16 *)frame_ip;
+                frame_ip += sizeof(int16) * throw_param_cell_num;
+                goto find_a_catch_handler;
+            }
+
+        find_a_catch_handler:
+        {
+            /* The eh-stack lives in the trailing cells of
+             * frame->operand[] (see call_func_from_entry and the
+             * runtime push from WASM_OP_TRY). Each entry packs the
+             * eh-table index into the low 31 bits; the top bit
+             * (EH_TRY_CATCH_STATE_BIT) is set on entries whose
+             * catch handler is *already running* — those are
+             * skipped here so a throw raised from inside a catch
+             * body propagates outward rather than re-entering the
+             * same handler.
+             *
+             * Cost shape: the walk runs only on the throw path
+             * (cold). CALL / LOAD / STORE handlers are untouched,
+             * and the eh-stack cells share a cache line with the
+             * value stack they're allocated next to, so the walk
+             * hits warm memory.
+             *
+             * Known limitation in this patch: try-regions with a
+             * non-void result-type are *not yet supported* by the
+             * normal-flow path. The fix is a loader-side
+             * try-body→block-dynamic-offset COPY emit at CATCH
+             * processing time (mirrors how WASM_OP_ELSE aligns
+             * the if-body's result via reserve_block_ret). See the
+             * AGENTS.md "Open follow-up — WAMR fast-interp legacy
+             * exception handling" section for the architectural
+             * note. The throw → catch dispatch implemented here
+             * still works correctly for void-result try-regions
+             * (which is what graphql-validation-porf-accurate's
+             * single try-block is). */
+            WASMFunction *cur_wasm_func = cur_func->u.func;
+            uint32 *eh_stack = EH_STACK_BASE(frame_lp, cur_func, cur_wasm_func);
+            uint32 i;
+            for (i = frame->eh_count; i > 0; i--) {
+                uint32 *cells = eh_stack + (i - 1) * EH_ENTRY_CELLS;
+                uint32 packed = cells[0];
+                uint32 eh_idx;
+                WASMFastEHEntry *entry;
+                uint32 j;
+                if (packed & EH_TRY_CATCH_STATE_BIT)
+                    continue; /* in-progress catch — skip */
+                eh_idx = packed & ~EH_TRY_CATCH_STATE_BIT;
+                bh_assert(eh_idx < cur_wasm_func->exception_handler_count);
+                entry = &cur_wasm_func->exception_handlers[eh_idx];
+                if (entry->delegate_target_depth != UINT32_MAX) {
+                    /* This try-region was closed by `delegate N`,
+                     * not `end`. The spec says the exception is
+                     * re-raised at the location of the target
+                     * block — i.e. it propagates past every try
+                     * whose body the delegate's try sits inside
+                     * (but the target is also inside). The loader
+                     * already counted those tries as
+                     * `delegate_target_depth = delta`. Marking
+                     * THIS entry as consumed and decrementing `i`
+                     * by `delta` makes the for-loop's natural
+                     * i-- land on the first eh-stack entry
+                     * strictly *outside* the target block — which
+                     * is exactly where the spec wants the throw
+                     * to resume matching.
+                     *
+                     * If `delta + 1 >= i`, the target block is
+                     * outside this function's eh-stack entirely
+                     * (e.g. `delegate <function-block-depth>`):
+                     * break out to the "no handler in this
+                     * frame" path and let return_func forward the
+                     * exception to the caller.
+                     *
+                     * Cost: cold path; only THROW reaches here.
+                     * Hot ops untouched. */
+                    uint32 delta = entry->delegate_target_depth;
+                    cells[0] = packed | EH_TRY_CATCH_STATE_BIT;
+                    if (delta + 1 >= i) {
+                        /* Underflow guard + escape signal: any
+                         * `delta` that would skip past the start
+                         * of the eh-stack means the target lies
+                         * past this function's try-blocks. */
+                        break;
+                    }
+                    i -= delta;
+                    continue;
+                }
+                for (j = 0; j < entry->catch_count; j++) {
+                    if (entry->catches[j].tag_index == exception_tag_index) {
+                        /* Mark the entry as in-progress catch and
+                         * stash the tag that's being handled so a
+                         * RETHROW from this catch body can re-
+                         * raise it. */
+                        cells[0] = packed | EH_TRY_CATCH_STATE_BIT;
+                        cells[1] = exception_tag_index;
+                        /* Payload copy (same-function dispatch).
+                         * The loader guaranteed
+                         * `entry->catches[j].param_cell_num ==
+                         * throw_param_cell_num` by checking the
+                         * tag type at both THROW and CATCH; the
+                         * runtime just executes the cell-wise
+                         * frame_lp move. Tag-without-params makes
+                         * the loop trivial. */
+                        if (throw_param_cell_num > 0
+                            && entry->catches[j].param_dst_offsets) {
+                            uint32 c;
+                            int16 *dst = entry->catches[j].param_dst_offsets;
+                            for (c = 0; c < throw_param_cell_num; c++) {
+                                frame_lp[dst[c]] =
+                                    frame_lp[throw_src_offsets[c]];
+                            }
+                        }
+                        /* Pop the inner eh-stack entries that the
+                         * throw is jumping past. When the match is
+                         * at the topmost entry this is a no-op
+                         * (i == frame->eh_count). When the match is
+                         * an outer entry, the nested-try entries
+                         * above it (indices i .. eh_count-1) are
+                         * out of scope after the catch-dispatch;
+                         * leaving them counted would let a
+                         * subsequent throw inside the catch body
+                         * see stale in-scope entries (and a tight
+                         * loop of throw → outer-catch → throw
+                         * would eventually overflow the fixed
+                         * reservation). The matched entry stays
+                         * at index i-1 with its state bit set; the
+                         * catch body's END pops it when it
+                         * completes. Cost: one indexed store on
+                         * the cold throw path; CALL / LOAD / STORE
+                         * untouched. */
+                        frame->eh_count = i;
+                        frame_ip = entry->catches[j].handler_pc;
+                        HANDLE_OP_END();
+                    }
+                }
+                if (entry->catch_all_pc) {
+                    /* catch_all binds no payload (spec: catch_all
+                     * has no exception values), so we drop the
+                     * src cells here. RETHROW from inside a
+                     * catch_all body cannot re-emit a payload —
+                     * documented as a known limitation. */
+                    cells[0] = packed | EH_TRY_CATCH_STATE_BIT;
+                    cells[1] = exception_tag_index;
+                    /* Same unwind as the typed-catch path above —
+                     * pop any nested-try entries the throw is
+                     * jumping past so a subsequent throw inside
+                     * this catch_all body doesn't dispatch
+                     * against stale inner entries. */
+                    frame->eh_count = i;
+                    frame_ip = entry->catch_all_pc;
+                    HANDLE_OP_END();
+                }
+            }
+            /* No handler in this frame. Hand the exception off to
+             * the caller via return_func, which checks
+             * frame->exception_raised after RECOVER_CONTEXT and
+             * re-enters this label with the caller's frame in
+             * scope. If we're already at the top of the wasm
+             * stack, the existing got_exception path lets the
+             * host observe the trap via wasm_runtime_get_exception.
+             *
+             * Tag-with-params payload is intentionally NOT
+             * preserved across the frame boundary: the source
+             * cells (throw_src_offsets) live in *this* frame's
+             * frame_lp, which return_func is about to tear down.
+             * A caller-side typed catch would then bind
+             * uninitialized destination slots, producing wrong
+             * results in the catch body (or, if the typed catch
+             * uses the slots as a struct-of-pointers, memory
+             * corruption). The safe action when a payload-
+             * bearing throw escapes its callee is to trap to the
+             * host with a clear diagnostic. Same-function
+             * payload routing (the common Porffor / AS shape)
+             * is unaffected — it dispatches via the loop above
+             * before this branch runs. catch_all in the caller
+             * would technically tolerate a zero-payload bind,
+             * but the typed-vs-catch_all choice happens in the
+             * caller's walker, which we can't peek into here
+             * without coupling the frames; trap unconditionally
+             * for payload-bearing throws and let the test
+             * `cross_function_tag_with_params` document the
+             * shape. */
+            if (prev_frame && prev_frame->ip) {
+                if (throw_param_cell_num > 0) {
+                    wasm_set_exception(module,
+                                       "cross-function exception payload "
+                                       "not supported by fast-interp");
+                    goto got_exception;
+                }
+                prev_frame->tag_index = exception_tag_index;
+                prev_frame->exception_raised = true;
+                goto return_func;
+            }
+            {
+                char exception_buf[64];
+                snprintf(exception_buf, sizeof(exception_buf),
+                         "wasm exception thrown (tag %u)", exception_tag_index);
+                wasm_set_exception(module, exception_buf);
+            }
+            goto got_exception;
+        }
+
+            HANDLE_OP(WASM_OP_TRY)
+            {
+                /* Loader emits `WASM_OP_TRY <eh_idx:u32>`. Push one
+                 * entry onto the per-frame eh-stack so subsequent
+                 * THROW / RETHROW handlers can find the in-scope
+                 * catches by walking it.
+                 *
+                 * The eh-stack lives in the trailing cells of
+                 * frame->operand[] — EH_ENTRY_CELLS cells per try-
+                 * region, sized by
+                 * cur_wasm_func->exception_handler_count *
+                 * EH_ENTRY_CELLS at frame setup. Cell 1 (caught_tag)
+                 * is unspecified while the entry is in TRY state and
+                 * gets written by the throw walker on catch dispatch.
+                 * Cost: one indexed store + one increment, both on a
+                 * cold path; CALL / LOAD / STORE are untouched. */
+                uint32 eh_idx = read_uint32(frame_ip);
+                WASMFunction *cur_wasm_func = cur_func->u.func;
+                uint32 *eh_stack =
+                    EH_STACK_BASE(frame_lp, cur_func, cur_wasm_func);
+                bh_assert(frame->eh_count
+                          < cur_wasm_func->exception_handler_count);
+                eh_stack[frame->eh_count * EH_ENTRY_CELLS + 0] = eh_idx;
+                frame->eh_count++;
+                HANDLE_OP_END();
+            }
+
+            HANDLE_OP(WASM_OP_CATCH)
             HANDLE_OP(WASM_OP_CATCH_ALL)
+            {
+                /* Loader emits `<opcode> <eh_idx:u32>` (commit 1's
+                 * exception_handlers table records each catch body's
+                 * pc and the region's end_of_region_pc).
+                 *
+                 * Reached via *normal flow* — execution either ran the
+                 * try body to completion (CATCH is the first opcode
+                 * after the try body) or fell through from a previous
+                 * catch body. Either way: pop one eh-stack entry and
+                 * branch past the try-region's end. The THROW dispatch
+                 * (follow-up commit) jumps directly to a catch body's
+                 * first opcode, *skipping* the CATCH opcode itself, so
+                 * this handler never runs as a result of a caught
+                 * throw — only as a fall-through exit. */
+                uint32 eh_idx = read_uint32(frame_ip);
+                WASMFunction *cur_wasm_func = cur_func->u.func;
+                bh_assert(eh_idx < cur_wasm_func->exception_handler_count);
+                bh_assert(frame->eh_count > 0);
+                frame->eh_count--;
+                frame_ip =
+                    cur_wasm_func->exception_handlers[eh_idx].end_of_region_pc;
+                HANDLE_OP_END();
+            }
+
+            HANDLE_OP(WASM_OP_RETHROW)
+            {
+                /* Loader emits `WASM_OP_RETHROW <depth:u32>`. Re-raise
+                 * the exception currently being handled by an
+                 * enclosing catch (the (depth+1)-th `state=CATCH`
+                 * entry from the top of the eh-stack at this point —
+                 * each in-progress catch we're nested in contributes
+                 * one such entry, in source order). RETHROW is a
+                 * cold op (only fires inside catch bodies); the walk
+                 * runs across at most the number of catches nested
+                 * around the rethrow site. CALL / LOAD / STORE are
+                 * untouched. */
+                uint32 depth = read_uint32(frame_ip);
+                WASMFunction *cur_wasm_func = cur_func->u.func;
+                uint32 *eh_stack =
+                    EH_STACK_BASE(frame_lp, cur_func, cur_wasm_func);
+                uint32 i;
+                uint32 catch_seen = 0;
+                for (i = frame->eh_count; i > 0; i--) {
+                    uint32 *cells = eh_stack + (i - 1) * EH_ENTRY_CELLS;
+                    if (!(cells[0] & EH_TRY_CATCH_STATE_BIT))
+                        continue;
+                    if (catch_seen == depth) {
+                        /* Re-raise the caught tag against the *outer*
+                         * try-regions. find_a_catch_handler iterates
+                         * top-down and skips state=CATCH entries, so
+                         * this same entry won't re-match.
+                         *
+                         * Payload routing: the original throw's
+                         * payload values were copied into THIS
+                         * catch's dst slots by the previous
+                         * find_a_catch_handler dispatch. The wasm
+                         * spec says the catch body can't mutate
+                         * those exception values directly (they're
+                         * not addressable as locals, and the only
+                         * way to read them is to pop off the
+                         * operand stack at catch entry — which
+                         * advances past the dst slots without
+                         * writing them back). So at RETHROW time
+                         * the dst slots still hold the original
+                         * payload, and we can point throw_src_offsets
+                         * at them so the outer catch's copy lands
+                         * on a fresh set of dst slots with the
+                         * same values.
+                         *
+                         * If the original match was via catch_all
+                         * (no typed catch matched cells[1]),
+                         * `match->param_dst_offsets == NULL` and the
+                         * payload was already dropped at the
+                         * catch_all dispatch. RETHROW from
+                         * catch_all then re-raises with no payload
+                         * — documented as a known limitation. */
+                        uint32 ent_eh_idx = cells[0] & ~EH_TRY_CATCH_STATE_BIT;
+                        WASMFastEHEntry *ent =
+                            &cur_wasm_func->exception_handlers[ent_eh_idx];
+                        WASMFastEHCatch *match = NULL;
+                        uint32 mj;
+                        for (mj = 0; mj < ent->catch_count; mj++) {
+                            if (ent->catches[mj].tag_index == cells[1]) {
+                                match = &ent->catches[mj];
+                                break;
+                            }
+                        }
+                        if (match && match->param_dst_offsets) {
+                            throw_param_cell_num = match->param_cell_num;
+                            throw_src_offsets = match->param_dst_offsets;
+                        }
+                        else {
+                            throw_param_cell_num = 0;
+                            throw_src_offsets = NULL;
+                        }
+                        exception_tag_index = cells[1];
+                        goto find_a_catch_handler;
+                    }
+                    catch_seen++;
+                }
+                /* Loader validated rethrow's depth at compile time;
+                 * if we got here the eh-stack is inconsistent with
+                 * the IR (typically a runtime bug in the loader's
+                 * eh-table population). */
+                wasm_set_exception(module, "rethrow depth out of range");
+                goto got_exception;
+            }
+
+            HANDLE_OP(WASM_OP_DELEGATE)
+            {
+                /* Normal-flow exit from a `try ... delegate N` region:
+                 * the try body completed without throwing, so the
+                 * runtime just pops the eh-stack entry that
+                 * HANDLE_OP(WASM_OP_TRY) pushed and falls through to
+                 * the next op in the rewritten IR (which is whatever
+                 * came after the `delegate N` in source).
+                 *
+                 * The forwarding semantics ("if the try body throws,
+                 * re-raise at the target block") are handled by the
+                 * find_a_catch_handler walker reading the eh-table
+                 * entry's `delegate_target_depth` and skipping that
+                 * many nested-try eh-stack entries — DELEGATE itself
+                 * doesn't run in the throw path, only on fall-through.
+                 *
+                 * No immediate to read: the loader skipped emit_br_info
+                 * so the depth lives in the per-function eh-table
+                 * indexed by the eh_idx of *this* try-region (which is
+                 * the eh-stack's top). Cost: one decrement on a cold
+                 * path; CALL / LOAD / STORE untouched. */
+                bh_assert(frame->eh_count > 0);
+                frame->eh_count--;
+                HANDLE_OP_END();
+            }
+
             HANDLE_OP(EXT_OP_TRY)
             {
+                /* The fast-interp loader doesn't emit EXT_OP_TRY yet
+                 * (the eh-table records CATCH / CATCH_ALL / DELEGATE
+                 * indices directly on the per-function table; TRY's
+                 * uint32 immediate is the eh_idx, not a type-index
+                 * blocktype). Reaching this handler means a future
+                 * loader change started emitting EXT_OP_TRY without
+                 * the runtime catching up — surface that as an
+                 * explicit trap. */
                 wasm_set_exception(module, "unsupported opcode");
                 goto got_exception;
             }
@@ -7442,7 +8371,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 CHECK_SUSPEND_FLAGS();
 #endif
                 fidx = read_uint32(frame_ip);
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
                 if (fidx >= module->e->function_count) {
                     wasm_set_exception(module, "unknown function");
                     goto got_exception;
@@ -7459,7 +8388,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 CHECK_SUSPEND_FLAGS();
 #endif
                 fidx = read_uint32(frame_ip);
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
                 if (fidx >= module->e->function_count) {
                     wasm_set_exception(module, "unknown function");
                     goto got_exception;
@@ -7526,9 +8455,31 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         HANDLE_OP(WASM_OP_GET_LOCAL)
         HANDLE_OP(WASM_OP_DROP)
         HANDLE_OP(WASM_OP_DROP_64)
+#if WASM_ENABLE_EXCE_HANDLING != 0
+        HANDLE_OP(WASM_OP_END)
+        {
+            /* Block / loop / if / function-level `end` is stripped from
+             * the IR at load time (skip_label in the END case of
+             * wasm_loader_prepare_bytecode). Only try-region `end`s
+             * survive — the loader keeps them so the runtime can pop
+             * the matching eh-stack entry here when control falls
+             * through the bottom of a catch body (or runs the body of
+             * a catchless `try ... end`).
+             *
+             * Cost: one decrement on a cold path. CALL / LOAD / STORE
+             * are untouched. */
+            bh_assert(frame->eh_count > 0);
+            frame->eh_count--;
+            HANDLE_OP_END();
+        }
+
+        HANDLE_OP(WASM_OP_BLOCK)
+        HANDLE_OP(WASM_OP_LOOP)
+#else
         HANDLE_OP(WASM_OP_BLOCK)
         HANDLE_OP(WASM_OP_LOOP)
         HANDLE_OP(WASM_OP_END)
+#endif
         HANDLE_OP(WASM_OP_NOP)
         HANDLE_OP(EXT_OP_BLOCK)
         HANDLE_OP(EXT_OP_LOOP)
@@ -7602,7 +8553,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         WASMInterpFrame *outs_area = wasm_exec_env_wasm_stack_top(exec_env);
         int i;
 
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
         if (cur_func->is_import_func) {
             outs_area->lp = outs_area->operand
                             + (cur_func->import_func_inst
@@ -7620,6 +8571,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             wasm_set_exception(module, "wasm operand stack overflow");
             goto got_exception;
         }
+
+        /* Save lp base — must be restored after the copy so that any callee
+         * that reads raw params via outs_area->lp (e.g.
+         * wasm_interp_call_func_import for cross-component calls, or
+         * canon_outs_area->lp[0] for canon builtins) sees lp pointing at the
+         * FIRST param, not past the last one. The classic interp never advances
+         * lp during its word_copy. */
+        uint32 *lp_base = outs_area->lp;
 
         for (i = 0; i < cur_func->param_count; i++) {
             if (cur_func->param_types[i] == VALUE_TYPE_V128) {
@@ -7654,19 +8613,49 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 outs_area->lp++;
             }
         }
+        /* Restore lp to the start of params. */
+        outs_area->lp = lp_base;
         frame_ip += cur_func->param_count * sizeof(int16);
         if (cur_func->ret_cell_num != 0) {
             /* Get the first return value's offset. Since loader emit
              * all return values' offset so we must skip remain return
              * values' offsets.
              */
-            WASMFuncType *func_type;
-            if (cur_func->is_import_func)
-                func_type = cur_func->u.func_import->func_type;
+            uint32 result_count;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+            if (cur_func->is_import_func
+                && (cur_func->is_canon_func
+                    || (cur_func->import_func_inst
+                        && cur_func->import_func_inst->is_canon_func))) {
+                /* Canon resource funcs (resource.new, resource.rep) have no
+                 * real WASMFunction body — they're builtins dispatched in
+                 * call_func_from_entry. They always return exactly 1 i32,
+                 * so result_count=1 and no extra return offset slots to skip.
+                 */
+                result_count = 1;
+            }
             else
-                func_type = cur_func->u.func->func_type;
+#endif
+            {
+                WASMFuncType *func_type;
+                if (cur_func->is_import_func) {
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                    if (cur_func->import_func_inst
+                        && !cur_func->import_func_inst->is_import_func)
+                        func_type =
+                            cur_func->import_func_inst->u.func->func_type;
+                    else
+#endif
+                        func_type = cur_func->u.func_import->func_type;
+                }
+                else {
+                    func_type = cur_func->u.func->func_type;
+                }
+                result_count = func_type->result_count;
+            }
+
             frame->ret_offset = GET_OFFSET();
-            frame_ip += 2 * (func_type->result_count - 1);
+            frame_ip += 2 * (result_count - 1);
         }
         SYNC_ALL_TO_FRAME();
         prev_frame = frame;
@@ -7677,8 +8666,78 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
     call_func_from_entry:
     {
-        if (cur_func->is_import_func) {
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (cur_func->is_import_func && cur_func->import_func_inst
+            && cur_func->import_func_inst->is_canon_func) {
+            WASMInterpFrame *canon_outs_area =
+                wasm_exec_env_wasm_stack_top(exec_env);
+            WASMComponentInstance *comp_inst = module->comp_instance;
+            WASMFunctionInstance *canon_func =
+                cur_func->is_canon_func ? cur_func : cur_func->import_func_inst;
+
+            switch (canon_func->canon_type) {
+                case WASM_COMP_CANON_RESOURCE_NEW:
+                {
+                    uint32 rep = canon_outs_area->lp[0];
+                    uint32 handle_index = 0;
+
+                    if (!canon_resource_new(canon_func->resource, comp_inst,
+                                            rep, &handle_index)) {
+                        wasm_set_exception(module, "canon resource.new failed");
+                        goto got_exception;
+                    }
+
+                    /* Write result to caller's frame via ret_offset*/
+                    prev_frame->lp[prev_frame->ret_offset] = handle_index;
+                    break;
+                }
+
+                case WASM_COMP_CANON_RESOURCE_DROP:
+                {
+                    uint32 handle_index = canon_outs_area->lp[0];
+
+                    if (!canon_resource_drop(canon_func->resource, comp_inst,
+                                             handle_index)) {
+                        wasm_set_exception(module,
+                                           "canon resource.drop failed");
+                        goto got_exception;
+                    }
+                    /* No return value */
+                    break;
+                }
+
+                case WASM_COMP_CANON_RESOURCE_REP:
+                {
+                    uint32 handle_index = canon_outs_area->lp[0];
+                    uint32 rep = 0;
+
+                    if (!canon_resource_rep(canon_func->resource, comp_inst,
+                                            handle_index, &rep)) {
+                        wasm_set_exception(module, "canon resource.rep failed");
+                        goto got_exception;
+                    }
+
+                    /* Write result to caller's frame via ret_offset*/
+                    prev_frame->lp[prev_frame->ret_offset] = rep;
+                    break;
+                }
+
+                default:
+                {
+                    wasm_set_exception(module,
+                                       "unsupported canon function type");
+                    goto got_exception;
+                }
+            }
+
+            /* Recover caller context after canon func */
+            RECOVER_CONTEXT(prev_frame);
+            HANDLE_OP_END();
+        }
+        else
+#endif
+            if (cur_func->is_import_func) {
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
             if (cur_func->import_func_inst) {
                 wasm_interp_call_func_import(module, exec_env, cur_func,
                                              prev_frame);
@@ -7735,6 +8794,17 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             local_cell_num =
                 cur_func->param_cell_num + cur_func->local_cell_num;
 #endif
+#if WASM_ENABLE_EXCE_HANDLING != 0
+            /* EH_ENTRY_CELLS cells per try-region in the function,
+             * appended past the value stack — cell 0 holds the
+             * packed eh_idx | state_bit, cell 1 holds the caught tag
+             * for RETHROW. Functions without try blocks pay zero
+             * cells. Mirrors classic-interp's eh_size accounting at
+             * wasm_interp_classic.c:6786 (which also stores per-
+             * handler pointers on the value stack). */
+            all_cell_num +=
+                cur_wasm_func->exception_handler_count * EH_ENTRY_CELLS;
+#endif
             /* param_cell_num, local_cell_num, const_cell_num and
                max_stack_cell_num are all no larger than UINT16_MAX (checked
                in loader), all_cell_num must be smaller than 1MB */
@@ -7750,6 +8820,21 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             frame->function = cur_func;
             frame_ip = wasm_get_func_code(cur_func);
             frame_ip_end = wasm_get_func_code_end(cur_func);
+
+#if WASM_ENABLE_EXCE_HANDLING != 0
+            /* eh-stack starts empty; WASM_OP_TRY appends entries. */
+            frame->eh_count = 0;
+            /* exception_raised is the marker `return_func` reads on
+             * every wasm-to-wasm call return; if a callee's throw
+             * found no in-frame handler it stashes the tag on the
+             * caller's frame->tag_index and sets this flag, then
+             * goes to return_func. ALLOC_FRAME doesn't zero-init
+             * the frame header, so leaving the slot uninitialized
+             * trips the return_func hook on every call return with
+             * stale memory contents — turning a non-throwing run
+             * into "wasm exception thrown (tag N)" for random N. */
+            frame->exception_raised = false;
+#endif
 
             frame_lp = frame->lp =
                 frame->operand + cur_wasm_func->const_cell_num;
@@ -7807,6 +8892,34 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         RECOVER_CONTEXT(prev_frame);
 #if WASM_ENABLE_GC != 0
         local_cell_num = cur_func->param_cell_num + cur_func->local_cell_num;
+#endif
+#if WASM_ENABLE_EXCE_HANDLING != 0
+        /* Inter-function unwind: the callee stashed a wasm tag on
+         * this frame (now the active one after RECOVER_CONTEXT)
+         * when its eh-stack walk found no in-frame match. Re-enter
+         * find_a_catch_handler so the caller's eh-stack gets a
+         * chance to catch. Predicted strongly not-taken —
+         * exceptions are rare, this single check is the entire
+         * CALL-return-side cost of EH; the success path takes the
+         * HANDLE_OP_END() below.
+         *
+         * Cross-frame payload routing: the callee's throw site's
+         * source slots lived in the callee's frame_lp, which has
+         * already been freed by the time we get here. We zero out
+         * the throw_param_cell_num / throw_src_offsets pair so the
+         * caller's find_a_catch_handler doesn't try to dereference
+         * freed memory — the catch (if any matches) will fire with
+         * a zero-cell payload. This is the same gap documented at
+         * the WASM_OP_THROW handler and surfaced as
+         * `cross_function_tag_with_params` in the integration
+         * suite. */
+        if (frame->exception_raised) {
+            exception_tag_index = frame->tag_index;
+            throw_param_cell_num = 0;
+            throw_src_offsets = NULL;
+            frame->exception_raised = false;
+            goto find_a_catch_handler;
+        }
 #endif
         HANDLE_OP_END();
     }
@@ -7972,7 +9085,7 @@ wasm_interp_call_wasm(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
 #endif
 
     if (function->is_import_func) {
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
         if (function->import_module_inst) {
             LOG_DEBUG("it is a function of a sub module");
             wasm_interp_call_func_import(module_inst, exec_env, function,
