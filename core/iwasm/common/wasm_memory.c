@@ -36,6 +36,66 @@ static korp_mutex shared_heap_list_lock;
 static enlarge_memory_error_callback_t enlarge_memory_error_cb;
 static void *enlarge_memory_error_user_data;
 
+void
+wasm_memory_set_page_quota(WASMMemoryInstance *memory_inst,
+                           const struct InstantiationArgs2 *args)
+{
+    bh_assert(memory_inst);
+
+    memory_inst->page_quota_attachment =
+        args ? args->memory_page_quota_attachment : NULL;
+    memory_inst->page_quota_reserve =
+        args ? args->memory_page_quota_reserve : NULL;
+    memory_inst->page_quota_release =
+        args ? args->memory_page_quota_release : NULL;
+    memory_inst->page_quota_reserved_pages = 0;
+}
+
+bool
+wasm_memory_get_page_quota_units(uint64 byte_size, uint32 *page_count)
+{
+    uint64 pages;
+
+    bh_assert(page_count);
+    pages = byte_size / DEFAULT_NUM_BYTES_PER_PAGE
+            + (byte_size % DEFAULT_NUM_BYTES_PER_PAGE != 0);
+    if (pages > UINT32_MAX)
+        return false;
+    *page_count = (uint32)pages;
+    return true;
+}
+
+bool
+wasm_memory_reserve_page_quota(WASMMemoryInstance *memory_inst, uint32 pages)
+{
+    bh_assert(memory_inst);
+
+    if (pages == 0 || !memory_inst->page_quota_reserve)
+        return true;
+    if (UINT32_MAX - memory_inst->page_quota_reserved_pages < pages)
+        return false;
+    if (!memory_inst->page_quota_reserve(memory_inst->page_quota_attachment,
+                                         pages))
+        return false;
+
+    memory_inst->page_quota_reserved_pages += pages;
+    return true;
+}
+
+void
+wasm_memory_release_page_quota(WASMMemoryInstance *memory_inst, uint32 pages)
+{
+    bh_assert(memory_inst);
+
+    if (pages == 0 || !memory_inst->page_quota_release)
+        return;
+    bh_assert(pages <= memory_inst->page_quota_reserved_pages);
+    if (pages > memory_inst->page_quota_reserved_pages)
+        pages = memory_inst->page_quota_reserved_pages;
+    memory_inst->page_quota_reserved_pages -= pages;
+    memory_inst->page_quota_release(memory_inst->page_quota_attachment, pages);
+}
+
 #if WASM_MEM_ALLOC_WITH_USER_DATA != 0
 static void *allocator_user_data = NULL;
 #endif
@@ -1663,8 +1723,10 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
     uint8 *memory_data_old, *memory_data_new, *heap_data_old;
     uint32 num_bytes_per_page, heap_size;
     uint32 cur_page_count, max_page_count, total_page_count;
+    uint32 new_quota_pages, quota_page_delta;
     uint64 total_size_old = 0, total_size_new;
     bool ret = true, full_size_mmaped;
+    bool page_quota_reserved = false, page_quota_committed = false;
     enlarge_memory_error_reason_t failure_reason = INTERNAL_ERROR;
 
     if (!memory) {
@@ -1706,6 +1768,20 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
         ret = false;
         goto return_func;
     }
+
+    if (!wasm_memory_get_page_quota_units(total_size_new, &new_quota_pages)
+        || new_quota_pages < memory->page_quota_reserved_pages) {
+        failure_reason = MAX_SIZE_REACHED;
+        ret = false;
+        goto return_func;
+    }
+    quota_page_delta = new_quota_pages - memory->page_quota_reserved_pages;
+    if (!wasm_memory_reserve_page_quota(memory, quota_page_delta)) {
+        failure_reason = MAX_SIZE_REACHED;
+        ret = false;
+        goto return_func;
+    }
+    page_quota_reserved = true;
 
 #if WASM_ENABLE_SHARED_HEAP != 0
     shared_heap = get_shared_heap(module);
@@ -1823,9 +1899,14 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
     SET_LINEAR_MEMORY_SIZE(memory, total_size_new);
     memory->memory_data_end = memory->memory_data + total_size_new;
 
+    page_quota_committed = true;
+
     wasm_runtime_set_mem_bound_check_bytes(memory, total_size_new);
 
 return_func:
+    if (page_quota_reserved && !page_quota_committed)
+        wasm_memory_release_page_quota(memory, quota_page_delta);
+
     if (!ret && module && enlarge_memory_error_cb) {
         WASMExecEnv *exec_env = NULL;
 
@@ -2054,6 +2135,8 @@ wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
 #endif
 
     memory_inst->memory_data = NULL;
+    wasm_memory_release_page_quota(memory_inst,
+                                   memory_inst->page_quota_reserved_pages);
 }
 
 int
