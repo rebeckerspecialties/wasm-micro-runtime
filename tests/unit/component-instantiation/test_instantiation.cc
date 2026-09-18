@@ -549,6 +549,10 @@ TEST_F(ComponentInstantiationTest, TestResolveCoreInstance)
   index_count.core_tables = 1;
   index_count.core_memories = 1;
   index_count.core_globals = 1;
+  // Every core instance created below is also recorded in
+  // defined_core_instances: one here, and two on comp_instance_2, which
+  // reuses these counts
+  index_count.defined_core_instances = 2;
 
   WASMComponentInstance *comp_instance = wasm_component_instance_allocate(&index_count, NULL, 0);
   comp_instance->core_modules[0] = &test_core_module;
@@ -739,6 +743,10 @@ TEST_F(ComponentInstantiationTest, TestResolveCanons)
   index_count.types = 1;
   index_count.functions = 2;
   index_count.core_functions = 2;
+  // canon lift and canon lower each copy a function into the instance's own
+  // storage
+  index_count.defined_functions = 1;
+  index_count.defined_core_functions = 1;
 
   WASMComponentInstance *comp_instance = wasm_component_instance_allocate(&index_count, NULL, 0);
   comp_instance->functions[0]      = &dummy_comp_func;
