@@ -1230,7 +1230,10 @@ wasi_filesystem_open_at(wasi_descriptor_t fd, wasi_path_flags_t path_flags,
     int r = syscall(SYS_openat2, path_ref.parent_fd, path_ref.leaf, &how,
                     sizeof(how));
     if (r < 0) {
-        *err = wasi_sandbox_error(errno);
+        /* As on Apple: the parent is already held, so ELOOP can only come from
+         * the final component and stays open-at's loop error, while a beneath
+         * escape is normalized to the WASI capability error. */
+        *err = errno == EXDEV ? EPERM : errno;
         *ret = -1;
         wasi_beneath_path_ref_destroy(&path_ref);
         return;
