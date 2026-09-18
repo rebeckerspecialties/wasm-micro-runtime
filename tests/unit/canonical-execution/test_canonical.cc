@@ -698,15 +698,19 @@ TEST_F(CanonicalExecutionTest, test_wasi_ip_name_lookup)
   // resolver configuration, so accept any non-empty set of loopback addresses
   ASSERT_GE(i, 3u);
   ASSERT_TRUE(strstr(line[0], "Resolving: localhost")) << line[0];
-  for (uint32_t j = 1; j < i - 1; j++) {
+  uint32_t j = 1;
+  for (; j < i && strstr(line[j], "-> "); j++) {
     ASSERT_TRUE(strstr(line[j], "-> 127.0.0.1") || strstr(line[j], "-> ::1")
                 || strstr(line[j], "-> 0:0:0:0:0:0:0:1"))
         << line[j];
   }
+  uint32_t n_addrs = j - 1;
+  ASSERT_GE(n_addrs, 1u);
+  ASSERT_LT(j, i) << "no summary line after the addresses";
   char summary[64];
   snprintf(summary, sizeof(summary), "Resolved %u address(es) for localhost",
-           i - 2);
-  ASSERT_TRUE(strstr(line[i - 1], summary)) << line[i - 1];
+           n_addrs);
+  ASSERT_TRUE(strstr(line[j], summary)) << line[j];
 }
 
 // Test apps made with C WASi-SDK
