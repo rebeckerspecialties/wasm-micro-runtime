@@ -1988,6 +1988,12 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     cx.borrow_scope_type = BORROW_SCOPE_SUBTASK;
     cx.borrow_scope.subtask = subtask;
 
+    // cx lives in this frame: save the caller's context (a host function can
+    // be reached from inside another host call) and restore it on the way out
+    LiftLowerContext *prev_cx = exec_env->cx;
+    WASMMemoryInstance *prev_memory = exec_env->memory;
+    WASMFunctionInstance *prev_core_func = exec_env->core_func;
+
     exec_env->cx = &cx;
 
     exec_env->memory = memory;
@@ -2150,6 +2156,9 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     ret = !wasm_copy_exception(module, NULL);
 
 fail:
+    exec_env->cx = prev_cx;
+    exec_env->memory = prev_memory;
+    exec_env->core_func = prev_core_func;
     if (argv1 != argv_buf)
         wasm_runtime_free(argv1);
     subtask_destroy(subtask);
