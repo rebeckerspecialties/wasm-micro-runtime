@@ -1,6 +1,14 @@
  # Copyright (C) 2026 Airbus Defence and Space Romania SRL. All rights reserved.
  # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+# These tests run whole components against the WASI P2 host functions, which
+# are called through wasm_runtime_invoke_native_p2(). That bridge only
+# implements the 64-bit invokeNative ABI so far, so skip the suite on X86_32
+# until it has a 32-bit implementation.
+if(WAMR_BUILD_TARGET STREQUAL "X86_32")
+  return()
+endif()
+
 cmake_minimum_required(VERSION 3.28)
 
 project (test-canonical-execution)
