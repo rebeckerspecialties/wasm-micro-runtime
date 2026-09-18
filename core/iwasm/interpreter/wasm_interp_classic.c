@@ -7231,7 +7231,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                      */
                     PUSH_I32(import_exception);
                 }
-#endif /* end of WASM_ENABLE_EXCE_HANDLING != 0 && WASM_ENABLE_MULTI_MODULE != 0 */
+#endif /* WASM_ENABLE_EXCE_HANDLING && WASM_ENABLE_MULTI_MODULE */
             }
             else
 #endif /* end of WASM_ENABLE_MULTI_MODULE != 0 */
