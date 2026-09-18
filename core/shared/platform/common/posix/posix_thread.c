@@ -215,7 +215,11 @@ os_cond_wait(korp_cond *cond, korp_mutex *mutex)
 korp_sem *
 os_sem_open(const char *name, int oflags, int mode, int val)
 {
-    return sem_open(name, oflags, mode, val);
+    korp_sem *sem = sem_open(name, oflags, mode, val);
+
+    /* SEM_FAILED is not NULL everywhere ((sem_t *)-1 on macOS), but callers
+     * test for NULL */
+    return sem == SEM_FAILED ? NULL : sem;
 }
 
 int
