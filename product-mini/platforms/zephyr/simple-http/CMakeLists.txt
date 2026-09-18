@@ -3,6 +3,39 @@
 
 cmake_minimum_required(VERSION 3.14)
 
+if(DEFINED ZEPHYR_BASE)
+  set(ZEPHYR_VERSION_FILE "${ZEPHYR_BASE}/VERSION")
+elseif(DEFINED ENV{ZEPHYR_BASE})
+  set(ZEPHYR_VERSION_FILE "$ENV{ZEPHYR_BASE}/VERSION")
+else()
+  message(FATAL_ERROR "ZEPHYR_BASE is required to select the POSIX configuration")
+endif()
+
+if(NOT EXISTS "${ZEPHYR_VERSION_FILE}")
+  message(FATAL_ERROR "Zephyr version file not found: ${ZEPHYR_VERSION_FILE}")
+endif()
+
+file(STRINGS "${ZEPHYR_VERSION_FILE}" ZEPHYR_VERSION_LINES
+  REGEX "^VERSION_(MAJOR|MINOR) = [0-9]+$")
+foreach(VERSION_LINE ${ZEPHYR_VERSION_LINES})
+  if(VERSION_LINE MATCHES "^VERSION_MAJOR = ([0-9]+)$")
+    set(ZEPHYR_VERSION_MAJOR "${CMAKE_MATCH_1}")
+  elseif(VERSION_LINE MATCHES "^VERSION_MINOR = ([0-9]+)$")
+    set(ZEPHYR_VERSION_MINOR "${CMAKE_MATCH_1}")
+  endif()
+endforeach()
+
+if(NOT DEFINED ZEPHYR_VERSION_MAJOR OR NOT DEFINED ZEPHYR_VERSION_MINOR)
+  message(FATAL_ERROR "Invalid Zephyr version file: ${ZEPHYR_VERSION_FILE}")
+endif()
+
+if(ZEPHYR_VERSION_MAJOR GREATER 4
+   OR (ZEPHYR_VERSION_MAJOR EQUAL 4
+       AND ZEPHYR_VERSION_MINOR GREATER_EQUAL 3))
+  list(APPEND EXTRA_CONF_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/zephyr_4.3_plus.conf")
+endif()
+
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(wamr_simple_http)
 
@@ -14,7 +47,9 @@ target_sources(app PRIVATE src/main.c)
 ################  WebAssembly module  ################
 # wasm-app/ is compiled with the wasi-sdk toolchain in a nested build, and the
 # resulting http_get.wasm is turned into the byte array src/main.c embeds.
-set(WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../..)
+# The runtime is located through the Zephyr module system, never through a
+# relative path reaching outside this directory.
+set(WAMR_ROOT_DIR ${ZEPHYR_WASM_MICRO_RUNTIME_MODULE_DIR})
 list(APPEND CMAKE_MODULE_PATH ${WAMR_ROOT_DIR}/build-scripts)
 find_package(WASISDK REQUIRED)
 
@@ -23,6 +58,7 @@ ExternalProject_Add(wasm_app
   SOURCE_DIR        ${CMAKE_CURRENT_SOURCE_DIR}/wasm-app
   CONFIGURE_COMMAND ${CMAKE_COMMAND} -S ${CMAKE_CURRENT_SOURCE_DIR}/wasm-app -B build
                       -DCMAKE_TOOLCHAIN_FILE=${WASISDK_TOOLCHAIN}
+                      -DWAMR_ROOT_DIR=${WAMR_ROOT_DIR}
   BUILD_COMMAND     ${CMAKE_COMMAND} --build build
   INSTALL_COMMAND   ${CMAKE_COMMAND} --install build --prefix ${CMAKE_CURRENT_BINARY_DIR}/wasm-app
   BUILD_ALWAYS      TRUE

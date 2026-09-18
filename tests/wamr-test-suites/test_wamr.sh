@@ -17,7 +17,7 @@ function help()
     echo "test_wamr.sh [options]"
     echo "-c clean previous test results, not start test"
     echo "-s {suite_name} test only one suite (spec|standalone|malformed|wasi_certification|"
-    echo "                                     unit|wamr_compiler)"
+    echo "                                     unit|wamr_compiler|regression)"
     echo "-m set compile target of iwasm(x86_64|x86_32|armv7|armv7_vfp|thumbv7|thumbv7_vfp|"
     echo "                               riscv32|riscv32_ilp32f|riscv32_ilp32d|riscv64|"
     echo "                               riscv64_lp64f|riscv64_lp64d|aarch64|aarch64_vfp)"
@@ -454,15 +454,7 @@ function unit_test()
             echo "Unit tests FAILED" | tee -a ${REPORT_DIR}/unit_test_report.txt
             exit 1
         fi
-    else
-        # -u argument was not passed
-        echo "Skipping folder-specific tests."
-        cmake -S ${WORK_DIR}/../../unit -B unittest-build \
-              -DCOLLECT_CODE_COVERAGE=${COLLECT_CODE_COVERAGE} \
-              -DFULL_TEST=${UNIT_FULL_TEST} \
-              -DWAMRC_COMPILER_DIR=${WAMR_DIR}/wamr-compiler/build
-            cmake --build unittest-build
-            ctest --test-dir unittest-build --output-on-failure | tee -a ${REPORT_DIR}/unit_test_report.txt
+        return 0
     fi
 
     for unit_mode in "${TYPE[@]}"; do
@@ -518,6 +510,52 @@ function unit_test()
     done
 }
 
+function regression_test()
+{
+    cd ${WORK_DIR}
+    touch ${REPORT_DIR}/regression_test_report.txt
+
+    # build_run.py must run from the ba-issues directory (it uses relative
+    # paths for running_config.json, issues/ and build/).
+    local regression_dir="${WAMR_DIR}/tests/regression/ba-issues"
+
+    for reg_mode in "${TYPE[@]}"; do
+        case ${reg_mode} in
+            multi-tier-jit)
+                echo "Skip regression tests in ${reg_mode}: no test cases available"
+                continue
+                ;;
+            jit)
+                # test_wamr.sh names the LLVM JIT mode 'jit', build_run.py
+                # calls it 'llvm-jit'
+                run_mode="llvm-jit"
+                ;;
+            classic-interp|fast-interp|aot|fast-jit)
+                run_mode="${reg_mode}"
+                ;;
+            *)
+                echo "unexpected regression test mode: ${reg_mode}"
+                return 1
+                ;;
+        esac
+
+        echo "Now start regression tests in ${reg_mode}"
+        local build_run_args=("--mode" "${run_mode}")
+        if [[ ${COLLECT_CODE_COVERAGE} == 1 ]]; then
+            build_run_args+=("--coverage")
+        fi
+
+        ( cd "${regression_dir}" \
+            && ${PYTHON_EXE} build_run.py "${build_run_args[@]}" ) \
+            | tee -a "${REPORT_DIR}/regression_test_report.txt"
+        local reg_status=${PIPESTATUS[0]}
+        if [[ ${reg_status} -ne 0 ]]; then
+            return ${reg_status}
+        fi
+        echo "Finish regression tests in ${reg_mode}"
+    done
+}
+
 function sightglass_test()
 {
     echo "Now start sightglass benchmark tests"
@@ -542,6 +580,21 @@ function sightglass_test()
     fi
 
     echo "Finish sightglass benchmark tests"
+}
+
+# Fetch ${2} into ${1}. curl ships with every hosted runner image and wget no
+# longer does (windows-2022 dropped it), but container images may carry either
+# one, so fall back to wget when curl is missing.
+function download_file()
+{
+    local dest=$1
+    local url=$2
+
+    if command -v curl > /dev/null 2>&1; then
+        curl -fL -o "${dest}" "${url}"
+    else
+        wget -O "${dest}" --progress=dot:giga "${url}"
+    fi
 }
 
 function setup_wabt()
@@ -573,7 +626,7 @@ function setup_wabt()
         local WAT2WASM=${WORK_DIR}/wabt/out/gcc/Release/wat2wasm
         if [ ! -f ${WAT2WASM} ]; then
             pushd /tmp
-            curl -L -o wabt-tar.gz ${WABT_URL}
+            download_file wabt-tar.gz ${WABT_URL} || exit 1
             tar xf wabt-tar.gz
             popd
 
@@ -1057,25 +1110,30 @@ function collect_coverage()
         fi
 
         pushd ${WORK_DIR} > /dev/null 2>&1
-        if [[ $1 != "unit" && -d ${IWASM_LINUX_ROOT_DIR}/build ]]; then
+        if [[ $1 == "unit" ]]; then
+            # -u builds one directory per folder, the default run one per mode
+            for folder in "${UNITTEST_FOLDERS[@]}"; do
+                echo "Collect code coverage of unit test: ${folder}"
+                ./collect_coverage.sh ${CODE_COV_FILE} ${WORK_DIR}/unittest-build-${folder}
+            done
+            for unit_build_dir in "${UNIT_TEST_BUILD_DIRS[@]}"; do
+                echo "Collect code coverage of unit test: ${unit_build_dir}"
+                ./collect_coverage.sh ${CODE_COV_FILE} ${unit_build_dir}
+            done
+        elif [[ $1 == "regression" ]]; then
+            local regression_dir="${WAMR_DIR}/tests/regression/ba-issues"
+            for regression_build_dir in "${regression_dir}"/build/build-iwasm-*; do
+                if [[ -d "${regression_build_dir}" ]]; then
+                    echo "Collect code coverage of regression test: ${regression_build_dir}"
+                    ./collect_coverage.sh ${CODE_COV_FILE} ${regression_build_dir}
+                fi
+            done
+        elif [[ -d ${IWASM_LINUX_ROOT_DIR}/build ]]; then
             echo "Collect code coverage of iwasm"
             ./collect_coverage.sh ${CODE_COV_FILE} ${IWASM_LINUX_ROOT_DIR}/build
-        fi
-        if [[ $1 == "llvm-aot" ]]; then
-            echo "Collect code coverage of wamrc"
-            ./collect_coverage.sh ${CODE_COV_FILE} ${WAMR_DIR}/wamr-compiler/build
-        fi
-        for suite in "${TEST_CASE_ARR[@]}"; do
-            if [[ ${suite} = "unit" ]]; then
-                echo "Collect code coverage of unit test"
-                if [[ ${#UNITTEST_FOLDERS[@]} -gt 0 ]]; then
-                    for folder in "${UNITTEST_FOLDERS[@]}"; do
-                        ./collect_coverage.sh ${CODE_COV_FILE} ${WORK_DIR}/unittest-build-${folder}
-                    done
-                else
-                    ./collect_coverage.sh ${CODE_COV_FILE} ${WORK_DIR}/unittest-build
-                fi
-                break
+            if [[ $1 == "llvm-aot" ]]; then
+                echo "Collect code coverage of wamrc"
+                ./collect_coverage.sh ${CODE_COV_FILE} ${WAMR_DIR}/wamr-compiler/build
             fi
         fi
         popd > /dev/null 2>&1
@@ -1418,7 +1476,10 @@ fi
 
 # Unit tests use dedicated runtime mode configurations.
 if [[ " ${TEST_CASE_ARR[@]} " =~ " unit " ]]; then
-    unit_test || (echo "TEST FAILED"; exit 1)
+    if ! unit_test; then
+        echo "TEST FAILED"
+        exit 1
+    fi
     collect_coverage unit
 
     # remove 'unit' from TEST_CASE_ARR before running the other suites
@@ -1426,8 +1487,24 @@ if [[ " ${TEST_CASE_ARR[@]} " =~ " unit " ]]; then
     TEST_CASE_ARR=($(remove_empty_elements "${TEST_CASE_ARR[@]}"))
 fi
 
+# Regression tests use dedicated runtime mode configurations as well.
+if [[ " ${TEST_CASE_ARR[@]} " =~ " regression " ]]; then
+    if ! regression_test; then
+        echo "TEST FAILED"
+        exit 1
+    fi
+    collect_coverage regression
+
+    # remove 'regression' from TEST_CASE_ARR before running the other suites
+    TEST_CASE_ARR=("${TEST_CASE_ARR[@]/regression}")
+    TEST_CASE_ARR=($(remove_empty_elements "${TEST_CASE_ARR[@]}"))
+fi
+
 # loop all remaining suites through all running modes
-trigger || (echo "TEST FAILED"; exit 1)
+if ! trigger; then
+    echo "TEST FAILED"
+    exit 1
+fi
 
 echo -e "Test finish. Reports are under ${REPORT_DIR}"
 DEBUG set +exv
