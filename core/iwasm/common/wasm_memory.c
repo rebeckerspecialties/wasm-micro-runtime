@@ -414,7 +414,7 @@ wasm_runtime_reset_shared_heap_chain(WASMSharedHeap *shared_heap)
     return true;
 }
 
-static uint8 *
+uint8 *
 get_last_used_shared_heap_base_addr_adj(WASMModuleInstanceCommon *module_inst)
 {
 #if WASM_ENABLE_INTERP != 0
@@ -738,7 +738,7 @@ fail:
     return false;
 }
 
-static bool
+bool
 is_native_addr_in_shared_heap(WASMModuleInstanceCommon *module_inst,
                               bool is_memory64, uint8 *addr, uint64 bytes)
 {
