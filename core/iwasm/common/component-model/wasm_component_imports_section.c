@@ -192,6 +192,11 @@ wasm_import_find_in_args(WASMImport *import, WASMInstExpr *expression,
     }
 
     WASMCoreExport *found_export = wasm_runtime_malloc(sizeof(WASMCoreExport));
+    if (!found_export) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Failed to allocate core export\n");
+        return NULL;
+    }
     found_export->kind = import->kind;
 
     for (arg_idx = 0; arg_idx < expression->with_args.arg_len; arg_idx++) {
@@ -204,6 +209,7 @@ wasm_import_find_in_args(WASMImport *import, WASMInstExpr *expression,
                                  "ERROR: Instantiation argument Core instance "
                                  "%d not yet defined\n",
                                  arg->idx.instance_idx);
+                wasm_runtime_free(found_export);
                 return NULL;
             }
             arg_instance =
@@ -414,6 +420,9 @@ wasm_resolve_imports_WASI(WASMComponentImportSection *import_section,
         index_count.defined_functions = instance_type->func_count;
         new_inst = wasm_component_instance_allocate(&index_count, error_buf,
                                                     error_buf_size);
+        if (!new_inst) {
+            return false;
+        }
         for (idx = 0; idx < instance_type->types_count; idx++) {
             new_inst->types[new_inst->types_count] = instance_type->types[idx];
             if (new_inst->types[new_inst->types_count]->type

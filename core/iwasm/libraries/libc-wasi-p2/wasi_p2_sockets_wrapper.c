@@ -912,21 +912,34 @@ wasi_sockets_tcp_tcp_socket_finish_connect_wrapper(wasm_exec_env_t exec_env,
     else {
         HostResource *hr_input_stream = host_resource_create(
             WASI_P2_IO_INPUT_STREAM, sizeof(StreamResourceType));
+        HostResource *hr_output_stream = host_resource_create(
+            WASI_P2_IO_OUTPUT_STREAM, sizeof(StreamResourceType));
+        // The tuple takes ownership of its element array and frees it
+        // along with the result, so the array has to come from the heap
+        wit_value_t *elems =
+            (wit_value_t *)wasm_runtime_malloc(2 * sizeof(wit_value_t));
+        if (!hr_input_stream || !hr_output_stream || !elems) {
+            destroy_host_resource(hr_input_stream);
+            destroy_host_resource(hr_output_stream);
+            if (elems)
+                wasm_runtime_free(elems);
+            result =
+                get_result_error_val(WASI_NETWORK_ERROR_CODE_OUT_OF_MEMORY);
+            goto end;
+        }
+
         ((StreamResourceType *)hr_input_stream->data)->fd = input_stream_fd;
         ((StreamResourceType *)hr_input_stream->data)->type =
             STREAM_TYPE_SOCKET;
         uint32_t input_stream =
             host_resource_table_add(hr_table, hr_input_stream);
 
-        HostResource *hr_output_stream = host_resource_create(
-            WASI_P2_IO_OUTPUT_STREAM, sizeof(StreamResourceType));
         ((StreamResourceType *)hr_output_stream->data)->fd = output_stream_fd;
         ((StreamResourceType *)hr_output_stream->data)->type =
             STREAM_TYPE_SOCKET;
         uint32_t output_stream =
             host_resource_table_add(hr_table, hr_output_stream);
 
-        wit_value_t elems[2];
         elems[0] = wit_u32_ctor(input_stream);
         elems[1] = wit_u32_ctor(output_stream);
         wit_value_t result_tuple = wit_tuple_ctor(elems, 2);

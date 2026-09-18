@@ -983,6 +983,11 @@ wasm_component_instance_allocate(WASMComponentIndexCount *index_count,
                  + (index_count->canon_options
                     * sizeof(WASMComponentCanonOptInstance)));
     WASMComponentInstance *comp_instance = wasm_runtime_malloc(total_size);
+    if (!comp_instance) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Failed to allocate component instance\n");
+        return NULL;
+    }
     memset(comp_instance, 0, total_size);
     // The types defined in this component will be stored in the memory region
     // right after the component instance, similar to Wasm Module implementation
@@ -1992,7 +1997,7 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     /* fp as v128*: each step = 16 bytes; ints at byte offset MAX_REG_FLOATS*16
      */
     fps = (V128 *)argv1;
-    ints = (uint64 *)(fps + MAX_REG_FLOATS);
+    ints = (uint64 *)((uint8 *)argv1 + MAX_REG_FLOATS * sizeof(V128));
 #else
     /* fp as v128*: each step = 16 bytes; ints at byte offset MAX_REG_FLOATS*8
      */

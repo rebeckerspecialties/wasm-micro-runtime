@@ -443,6 +443,11 @@ wasm_create_core_inst_from_expression(WASMComponentCoreInst *core_inst,
                  + sizeof(WASMExportMemInstance) * mem_count;
     WASMModuleInstance *new_inst =
         (WASMModuleInstance *)wasm_runtime_malloc(total_size);
+    if (!new_inst) {
+        set_error_buf_ex(error_buf, error_buf_size,
+                         "ERROR: Failed to allocate core instance\n");
+        return false;
+    }
     memset(new_inst, 0, total_size);
 
     new_inst->export_functions =
@@ -627,7 +632,7 @@ wasm_resolve_core_instance(WASMComponentCoreInstSection *instance_section,
                 &inst_args, HEAP_SIZE);
             core_instance =
                 wasm_instantiate(target_module, NULL, NULL, &inst_args,
-                                 error_buf, sizeof(error_buf));
+                                 error_buf, error_buf_size);
             if (!core_instance) {
                 set_error_buf_ex(error_buf, error_buf_size,
                                  "ERROR: Core module instantiation failed\n");

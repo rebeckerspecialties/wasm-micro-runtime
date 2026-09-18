@@ -87,6 +87,10 @@ wasi_filesystem_get_directories_wrapper(wasm_exec_env_t exec_env,
 
         elems = (wit_value_t *)wasm_runtime_malloc(sizeof(wit_value_t)
                                                    * prestats->size);
+        if (!elems) {
+            result = wit_list_ctor(NULL, 0);
+            goto end;
+        }
 
         struct fd_table *curfds = wasi_ctx->curfds;
         for (uint32_t i = 3; i < prestats->size; i++) {
@@ -97,21 +101,24 @@ wasi_filesystem_get_directories_wrapper(wasm_exec_env_t exec_env,
             if (!fd_table_get_host_handle(curfds, i, &host_fd))
                 continue;
 
-            uint32_t dir_len = strlen(prestats->prestats[i].dir);
-            char *dir =
-                (char *)wasm_runtime_malloc(sizeof(char) * (dir_len + 1));
-            strcpy(dir, prestats->prestats[i].dir);
+            const char *dir = prestats->prestats[i].dir;
             HostResourceTable *hr_table = get_global_host_resource_table();
             HostResource *hr = host_resource_create(
                 WASI_P2_FILESYSTEM_DESCRIPTOR, sizeof(uint32_t));
+            wit_value_t *tuple_elems =
+                (wit_value_t *)wasm_runtime_malloc(2 * sizeof(wit_value_t));
+            if (!hr || !tuple_elems) {
+                // Out of memory: return the directories gathered so far
+                destroy_host_resource(hr);
+                if (tuple_elems)
+                    wasm_runtime_free(tuple_elems);
+                break;
+            }
 
             // FD opened from initialization, no resource destructor needed
             *((wasi_descriptor_t *)hr->data) = (wasi_descriptor_t)host_fd;
 
             uint32_t fs_rep = host_resource_table_add(hr_table, hr);
-
-            wit_value_t *tuple_elems =
-                (wit_value_t *)wasm_runtime_malloc(2 * sizeof(wit_value_t));
             tuple_elems[0] = wit_u32_ctor(fs_rep);
 
             StringEncoding encoding = wasm_get_string_encoding(exec_env);
@@ -1253,9 +1260,7 @@ wasi_filesystem_stat_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
         goto end;
     }
 
-    wasi_descriptor_stat_t *stat =
-        (wasi_descriptor_stat_t *)wasm_runtime_malloc(
-            sizeof(wasi_descriptor_stat_t));
+    wasi_descriptor_stat_t stat;
     int err = 0;
 
     if (!lift_borrow(
@@ -1280,7 +1285,7 @@ wasi_filesystem_stat_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
     // Get the actual descriptor fd from the host resource
     wasi_descriptor_t descriptor_fd = *((wasi_descriptor_t *)hr->data);
 
-    wasi_filesystem_stat(descriptor_fd, stat, &err);
+    wasi_filesystem_stat(descriptor_fd, &stat, &err);
 
     if (err != 0) {
         result = get_result_error_val(errno_to_wasi_filesystem(err));
@@ -1290,19 +1295,22 @@ wasi_filesystem_stat_wrapper(wasm_exec_env_t exec_env, wasi_descriptor_t fd,
     ComponentWITRecordField *fields =
         (ComponentWITRecordField *)wasm_runtime_malloc(
             6 * sizeof(ComponentWITRecordField));
+    if (!fields) {
+        result = get_result_error_val(WASI_FILESYSTEM_CODE_INSUFFICIENT_MEMORY);
+        goto end;
+    }
 
-    init_record_field(&fields[0], "type", 4, wit_enum_ctor(stat->type));
+    init_record_field(&fields[0], "type", 4, wit_enum_ctor(stat.type));
     init_record_field(&fields[1], "link-count", 11,
-                      wit_u64_ctor(stat->link_count));
-    init_record_field(&fields[2], "size", 4, wit_u64_ctor(stat->size));
+                      wit_u64_ctor(stat.link_count));
+    init_record_field(&fields[2], "size", 4, wit_u64_ctor(stat.size));
     init_record_field(&fields[3], "data-access-timestamp", 22,
-                      get_optional_datetime_val(&stat->data_access_timestamp));
+                      get_optional_datetime_val(&stat.data_access_timestamp));
     init_record_field(
         &fields[4], "data-modification-timestamp", 28,
-        get_optional_datetime_val(&stat->data_modification_timestamp));
-    init_record_field(
-        &fields[5], "status-change-timestamp", 24,
-        get_optional_datetime_val(&stat->status_change_timestamp));
+        get_optional_datetime_val(&stat.data_modification_timestamp));
+    init_record_field(&fields[5], "status-change-timestamp", 24,
+                      get_optional_datetime_val(&stat.status_change_timestamp));
 
     wit_value_t record_val = wit_record_ctor(fields, 6);
     result = wit_result_ctor(false, record_val);

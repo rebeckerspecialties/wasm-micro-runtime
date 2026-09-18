@@ -586,6 +586,9 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
             }
             WASMComponentInstance *new_inst = wasm_component_instance_allocate(
                 &index_count, error_buf, error_buf_size);
+            if (!new_inst) {
+                return false;
+            }
             new_inst->parent = comp_instance;
 
             for (idx = 0;
