@@ -4771,6 +4771,10 @@ llvm_jit_memory_init(WASMModuleInstance *module_inst, uint32 seg_index,
     bh_assert(module_inst->module_type == Wasm_Module_Bytecode);
 
     memory_inst = wasm_get_default_memory(module_inst);
+    if (!memory_inst) {
+        wasm_set_exception(module_inst, "out of bounds memory access");
+        return false;
+    }
 
     if (bh_bitmap_get_bit(module_inst->e->common.data_dropped, seg_index)) {
         seg_len = 0;
