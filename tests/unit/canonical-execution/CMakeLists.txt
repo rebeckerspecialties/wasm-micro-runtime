@@ -6,6 +6,14 @@ if(NOT WAMR_UNIT_TEST_SUITE_ENABLED)
   return()
 endif()
 
+# These tests run whole components against the WASI P2 host functions, which
+# are called through wasm_runtime_invoke_native_p2(). That bridge only
+# implements the 64-bit invokeNative ABI so far, so skip the suite on X86_32
+# until it has a 32-bit implementation.
+if(WAMR_BUILD_TARGET STREQUAL "X86_32")
+  return()
+endif()
+
 cmake_minimum_required(VERSION 3.28)
 
 project (test-canonical-execution)
