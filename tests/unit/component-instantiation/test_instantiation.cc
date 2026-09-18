@@ -635,11 +635,13 @@ TEST_F(ComponentInstantiationTest, TestResolveCoreInstance)
   printf("Name: %s\n",inline_expr->name->name );
   printf("Index: %d\n",inline_expr->sort_idx->idx );
 
-  WASMComponentInstArg *instance_args = &instance_section->instances[0].expression.with_args.args[0];
+  // Instance 0 has no args, so read instance 1's with_args: the two union
+  // members only happen to overlap on 64-bit. A core instantiate arg names
+  // a core instance by index, so idx holds instance_idx, not a sort_idx.
+  WASMComponentInstArg *instance_args = &instance_section->instances[1].expression.with_args.args[0];
   printf("\nCore instance 1 expression (with args):\n");
   printf("name: %s\n",instance_args->name->name);
-  printf("Sort; %d, Core Sort: %d\n",instance_args->idx.sort_idx->sort->sort, instance_args->idx.sort_idx->sort->core_sort);
-  printf("Core module index: %d, target core instance index: %d\n\n", instance_section->instances[0].expression.with_args.idx , instance_args->idx.sort_idx->idx);
+  printf("Core module index: %u, target core instance index: %u\n\n", instance_section->instances[1].expression.with_args.idx , instance_args->idx.instance_idx);
 
   ASSERT_EQ(instance_section->instances[1].instance_expression_tag, WASM_COMP_INSTANCE_EXPRESSION_WITH_ARGS);
   ASSERT_EQ(instance_section->instances[1].expression.with_args.idx, 0);
