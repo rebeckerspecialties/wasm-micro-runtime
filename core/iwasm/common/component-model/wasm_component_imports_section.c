@@ -356,7 +356,7 @@ wasm_resolve_imports_WASI(WASMComponentImportSection *import_section,
                           uint32 error_buf_size)
 {
     char *interface_name = NULL;
-    uint32 idx = 0;
+    uint32 import_idx = 0, idx = 0;
     uint32 func_export_count = 0;
     uint32 resource_count = 0;
     WASMComponentImport *import = NULL;
@@ -366,8 +366,9 @@ wasm_resolve_imports_WASI(WASMComponentImportSection *import_section,
     void *func_ptr = NULL;
     char *field_name = NULL;
 
-    for (idx = 0; idx < import_section->count; idx++) {
-        import = &import_section->imports[idx];
+    for (import_idx = 0; import_idx < import_section->count; import_idx++) {
+        import = &import_section->imports[import_idx];
+        func_export_count = 0;
         if (!import->extern_desc
             || import->extern_desc->type != WASM_COMP_EXTERN_INSTANCE) {
             set_error_buf_ex(
@@ -516,15 +517,16 @@ wasm_resolve_imports_WASI(WASMComponentImportSection *import_section,
                 return false;
             }
         }
+        comp_instance
+            ->component_instances[comp_instance->component_instances_count] =
+            new_inst;
+        comp_instance->component_instances_count++;
+        comp_instance
+            ->defined_instances[comp_instance->defined_instances_count] =
+            new_inst;
+        comp_instance->defined_instances_count++;
     }
     comp_instance->resources_count += resource_count;
-    comp_instance
-        ->component_instances[comp_instance->component_instances_count] =
-        new_inst;
-    comp_instance->component_instances_count++;
-    comp_instance->defined_instances[comp_instance->defined_instances_count] =
-        new_inst;
-    comp_instance->defined_instances_count++;
     return true;
 }
 

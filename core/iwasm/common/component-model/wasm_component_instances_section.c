@@ -386,12 +386,12 @@ wasm_resolve_instance(struct WASMComponentInstSection *instance_section,
                       WASMComponentInstance *comp_instance, char *error_buf,
                       uint32 error_buf_size)
 {
-    uint32 idx = 0, arg_idx = 0;
+    uint32 inst_idx = 0, idx = 0, arg_idx = 0;
     WASMComponentInst *instance = NULL;
     WASMComponent *target = NULL;
     WASMComponentInstArg *arg = NULL;
-    for (idx = 0; idx < instance_section->count; idx++) {
-        instance = &instance_section->instances[idx];
+    for (inst_idx = 0; inst_idx < instance_section->count; inst_idx++) {
+        instance = &instance_section->instances[inst_idx];
         if (instance->instance_expression_tag
             == WASM_COMP_INSTANCE_EXPRESSION_WITH_ARGS) {
             if (instance->expression.with_args.idx
