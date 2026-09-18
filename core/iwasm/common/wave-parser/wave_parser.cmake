@@ -12,11 +12,20 @@ set(BISON_SRC ${WAVE_GEN_DIR}/wave_parser.c)
 set(FLEX_SRC  ${WAVE_GEN_DIR}/wave_lexer.c)
 set(FLEX_HDR  ${WAVE_GEN_DIR}/wave_lexer.h)
 
+# --report=all and --feature=caret are diagnostic-only (a .output report and
+# caret-style error display) and require Bison >= 2.6. macOS/Xcode ships GNU
+# Bison 2.3, which aborts on --feature=caret, so only pass these when the host
+# Bison supports them; the generated parser is byte-for-byte identical either way.
+set(WAVE_BISON_COMPILE_FLAGS "")
+if (BISON_VERSION AND NOT BISON_VERSION VERSION_LESS "2.6")
+    set(WAVE_BISON_COMPILE_FLAGS "--report=all --feature=caret")
+endif ()
+
 BISON_TARGET(WaveParser
     ${CMAKE_CURRENT_LIST_DIR}/wave_parser.y
     ${BISON_SRC}
     DEFINES_FILE ${BISON_HDR}
-    COMPILE_FLAGS "--report=all --feature=caret"
+    COMPILE_FLAGS "${WAVE_BISON_COMPILE_FLAGS}"
 )
 
 FLEX_TARGET(WaveScanner

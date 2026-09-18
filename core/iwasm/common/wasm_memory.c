@@ -773,6 +773,21 @@ fail:
     return false;
 }
 
+uint8 *
+wasm_runtime_get_shared_heap_base_addr_adj(
+    WASMModuleInstanceCommon *module_inst)
+{
+    return get_last_used_shared_heap_base_addr_adj(module_inst);
+}
+
+bool
+wasm_runtime_is_native_addr_in_shared_heap(
+    WASMModuleInstanceCommon *module_inst, bool is_memory64, uint8 *addr,
+    uint64 bytes)
+{
+    return is_native_addr_in_shared_heap(module_inst, is_memory64, addr, bytes);
+}
+
 uint64
 wasm_runtime_shared_heap_malloc(WASMModuleInstanceCommon *module_inst,
                                 uint64 size, void **p_native_addr)

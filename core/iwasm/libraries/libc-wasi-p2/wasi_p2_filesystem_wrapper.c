@@ -98,7 +98,8 @@ wasi_filesystem_get_directories_wrapper(wasm_exec_env_t exec_env,
                 continue;
 
             uint32_t dir_len = strlen(prestats->prestats[i].dir);
-            char *dir = (char *)wasm_runtime_malloc(sizeof(char) * dir_len);
+            char *dir =
+                (char *)wasm_runtime_malloc(sizeof(char) * (dir_len + 1));
             strcpy(dir, prestats->prestats[i].dir);
             HostResourceTable *hr_table = get_global_host_resource_table();
             HostResource *hr = host_resource_create(

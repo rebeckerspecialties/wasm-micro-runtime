@@ -7189,7 +7189,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     UPDATE_ALL_FROM_FRAME();
                 }
 
-#if WASM_ENABLE_EXCE_HANDLING != 0
+/* Tag linkage (import_module, import_tag_index_linked) exists only with
+   multi-module; the enclosing guard also admits component-model builds. */
+#if WASM_ENABLE_EXCE_HANDLING != 0 && WASM_ENABLE_MULTI_MODULE != 0
                 char uncaught_exception[128] = { 0 };
                 bool has_exception =
                     wasm_copy_exception(module, uncaught_exception);
@@ -7229,7 +7231,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                      */
                     PUSH_I32(import_exception);
                 }
-#endif /* end of WASM_ENABLE_EXCE_HANDLING != 0 */
+#endif /* WASM_ENABLE_EXCE_HANDLING && WASM_ENABLE_MULTI_MODULE */
             }
             else
 #endif /* end of WASM_ENABLE_MULTI_MODULE != 0 */
