@@ -680,6 +680,10 @@ TEST_F(CanonicalExecutionTest, test_wasi_ip_name_lookup)
 
   char func_name[] = "run()";
   status = wasm_component_application_execute_func(comp_instance, func_name);
+  // Restore stdout before asserting, so a failure reaches the test log
+  // instead of the capture file that TearDown truncates
+  fflush(stdout);
+  dup2(log_file_fd, STDOUT_FILENO);
   ASSERT_TRUE(status);
 
   FILE *output = fopen(output_path, "r");
@@ -687,11 +691,26 @@ TEST_F(CanonicalExecutionTest, test_wasi_ip_name_lookup)
 
   char line[256][256];
   uint32_t i = 0;
-  while(fgets(line[i], sizeof(line[i]), output)) i++;
+  while(i < 256 && fgets(line[i], sizeof(line[i]), output)) i++;
+  fclose(output);
 
-  ASSERT_TRUE(strstr(line[0], "Resolving: localhost"));
-  ASSERT_TRUE(strstr(line[1], "-> 127.0.0.1")); // address found
-  ASSERT_TRUE(strstr(line[2], "Resolved 1 address(es) for localhost"));
+  // localhost resolves to 127.0.0.1, ::1 or both, depending on the host's
+  // resolver configuration, so accept any non-empty set of loopback addresses
+  ASSERT_GE(i, 3u);
+  ASSERT_TRUE(strstr(line[0], "Resolving: localhost")) << line[0];
+  uint32_t j = 1;
+  for (; j < i && strstr(line[j], "-> "); j++) {
+    ASSERT_TRUE(strstr(line[j], "-> 127.0.0.1") || strstr(line[j], "-> ::1")
+                || strstr(line[j], "-> 0:0:0:0:0:0:0:1"))
+        << line[j];
+  }
+  uint32_t n_addrs = j - 1;
+  ASSERT_GE(n_addrs, 1u);
+  ASSERT_LT(j, i) << "no summary line after the addresses";
+  char summary[64];
+  snprintf(summary, sizeof(summary), "Resolved %u address(es) for localhost",
+           n_addrs);
+  ASSERT_TRUE(strstr(line[j], summary)) << line[j];
 }
 
 // Test apps made with C WASi-SDK

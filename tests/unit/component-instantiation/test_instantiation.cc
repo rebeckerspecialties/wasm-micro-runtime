@@ -549,6 +549,10 @@ TEST_F(ComponentInstantiationTest, TestResolveCoreInstance)
   index_count.core_tables = 1;
   index_count.core_memories = 1;
   index_count.core_globals = 1;
+  // Every core instance created below is also recorded in
+  // defined_core_instances: one here, and two on comp_instance_2, which
+  // reuses these counts
+  index_count.defined_core_instances = 2;
 
   WASMComponentInstance *comp_instance = wasm_component_instance_allocate(&index_count, NULL, 0);
   comp_instance->core_modules[0] = &test_core_module;
@@ -631,11 +635,13 @@ TEST_F(ComponentInstantiationTest, TestResolveCoreInstance)
   printf("Name: %s\n",inline_expr->name->name );
   printf("Index: %d\n",inline_expr->sort_idx->idx );
 
-  WASMComponentInstArg *instance_args = &instance_section->instances[0].expression.with_args.args[0];
+  // Instance 0 has no args, so read instance 1's with_args: the two union
+  // members only happen to overlap on 64-bit. A core instantiate arg names
+  // a core instance by index, so idx holds instance_idx, not a sort_idx.
+  WASMComponentInstArg *instance_args = &instance_section->instances[1].expression.with_args.args[0];
   printf("\nCore instance 1 expression (with args):\n");
   printf("name: %s\n",instance_args->name->name);
-  printf("Sort; %d, Core Sort: %d\n",instance_args->idx.sort_idx->sort->sort, instance_args->idx.sort_idx->sort->core_sort);
-  printf("Core module index: %d, target core instance index: %d\n\n", instance_section->instances[0].expression.with_args.idx , instance_args->idx.sort_idx->idx);
+  printf("Core module index: %u, target core instance index: %u\n\n", instance_section->instances[1].expression.with_args.idx , instance_args->idx.instance_idx);
 
   ASSERT_EQ(instance_section->instances[1].instance_expression_tag, WASM_COMP_INSTANCE_EXPRESSION_WITH_ARGS);
   ASSERT_EQ(instance_section->instances[1].expression.with_args.idx, 0);
@@ -739,6 +745,10 @@ TEST_F(ComponentInstantiationTest, TestResolveCanons)
   index_count.types = 1;
   index_count.functions = 2;
   index_count.core_functions = 2;
+  // canon lift and canon lower each copy a function into the instance's own
+  // storage
+  index_count.defined_functions = 1;
+  index_count.defined_core_functions = 1;
 
   WASMComponentInstance *comp_instance = wasm_component_instance_allocate(&index_count, NULL, 0);
   comp_instance->functions[0]      = &dummy_comp_func;
