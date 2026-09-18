@@ -1134,6 +1134,26 @@ posix_memalign_wrapper(wasm_exec_env_t exec_env, void **memptr, int32 align,
 
 #if WASM_ENABLE_LIB_PTHREAD_SEMAPHORE != 0
 
+/* sem_open's oflags arrive with their Linux values (O_CREAT 0100, O_EXCL
+ * 0200; see samples/multi-thread), which other hosts number differently:
+ * on macOS 0100 is O_ASYNC. They are the only flags sem_open takes, so
+ * rebuild them from the host's definitions. */
+static int
+sem_open_host_oflags(int32 oflags)
+{
+#if defined(O_CREAT) && defined(O_EXCL)
+    int host_oflags = 0;
+
+    if (oflags & 0100)
+        host_oflags |= O_CREAT;
+    if (oflags & 0200)
+        host_oflags |= O_EXCL;
+    return host_oflags;
+#else
+    return oflags;
+#endif
+}
+
 static int32
 sem_open_wrapper(wasm_exec_env_t exec_env, const char *name, int32 oflags,
                  int32 mode, int32 val)
@@ -1155,7 +1175,7 @@ sem_open_wrapper(wasm_exec_env_t exec_env, const char *name, int32 oflags,
         return info_node->handle;
     }
 
-    if (!(psem = os_sem_open(name, oflags, mode, val))) {
+    if (!(psem = os_sem_open(name, sem_open_host_oflags(oflags), mode, val))) {
         goto fail1;
     }
 

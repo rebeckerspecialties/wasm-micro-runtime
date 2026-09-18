@@ -10,6 +10,9 @@
 *.obj
 *.a
 *.so
+.clangd
+.DS_Store
+code_analysis_report.log
 *.o
 *.toml
 

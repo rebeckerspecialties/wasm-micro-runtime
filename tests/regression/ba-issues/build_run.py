@@ -211,7 +211,8 @@ def build_iwasm(runtime: str, platform: str, coverage: bool) -> None:
 
     cmake_args = ["cmake", src_dir]
     cmake_args.extend(flags.split())
-    cmake_args.extend(["-DCMAKE_BUILD_TYPE=Debug", "-DWAMR_BUILD_SANITIZER=asan"])
+    cmake_args.extend(["-DCMAKE_BUILD_TYPE=Debug", "-DWAMR_BUILD_SANITIZER=asan",
+                       "-DWAMR_BUILD_COMPONENT_MODEL=0"])
     if coverage:
         cmake_args.append("-DCOLLECT_CODE_COVERAGE=1")
     run_cmd(cmake_args, cwd=build_dir, what=f"Configure iwasm {runtime} (cmake)")

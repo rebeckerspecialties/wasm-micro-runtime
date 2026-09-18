@@ -7,7 +7,9 @@
 #include "bh_platform.h"
 #include "bh_read_file.h"
 
-#define BUF_SIZE 4096
+/* A pre-allocated shared heap must be a whole number of system pages; 64 KiB
+ * qualifies for 4 KiB, 16 KiB (Apple silicon) and 64 KiB pages alike. */
+#define BUF_SIZE 65536
 static char preallocated_buf[BUF_SIZE];
 
 /* Message bodies carry shared-heap pointers that are owned by the wasm side
