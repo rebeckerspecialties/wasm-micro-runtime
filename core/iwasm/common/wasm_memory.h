@@ -86,6 +86,13 @@ bool
 is_app_addr_in_shared_heap(WASMModuleInstanceCommon *module_inst,
                            bool is_memory64, uint64 app_offset, uint64 bytes);
 
+bool
+is_native_addr_in_shared_heap(WASMModuleInstanceCommon *module_inst,
+                              bool is_memory64, uint8 *addr, uint64 bytes);
+
+uint8 *
+get_last_used_shared_heap_base_addr_adj(WASMModuleInstanceCommon *module_inst);
+
 WASMSharedHeap *
 wasm_runtime_create_shared_heap(SharedHeapInitArgs *init_args);
 

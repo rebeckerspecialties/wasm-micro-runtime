@@ -6,6 +6,7 @@
 #if WASM_ENABLE_COMPONENT_MODEL != 0
 #include "wasm.h"
 #include "wasm_runtime.h"
+#include "../wasm_memory.h"
 #include "wasm_component.h"
 #include "wasm_loader.h"
 #include "wasm_component_runtime.h"
@@ -1775,8 +1776,10 @@ wasm_runtime_addr_app_to_native_p2(WASMExecEnv *exec_env, uint64 app_offset)
 
     // TODO: to be seen if shared heap functionality is applicable in the
     // constext of component model
-#if WASM_ENABLE_SHARED_HEAP != 0
+#if WASM_ENABLE_SHARED_HEAP != 0 || WASM_CONFIGURABLE_BOUNDS_CHECKS != 0
     WASMModuleInstanceCommon *module_inst_comm = get_module_inst(exec_env);
+#endif
+#if WASM_ENABLE_SHARED_HEAP != 0
     if (is_app_addr_in_shared_heap(module_inst_comm, memory_inst->is_memory64,
                                    app_offset, 1)) {
         return get_last_used_shared_heap_base_addr_adj(module_inst_comm)
@@ -1832,7 +1835,7 @@ wasm_runtime_addr_native_to_app_p2(WASMExecEnv *exec_env, void *native_ptr)
               || module_inst_comm->module_type == Wasm_Module_AoT);
 
 #if WASM_CONFIGURABLE_BOUNDS_CHECKS != 0
-    bounds_checks = is_bounds_checks_enabled(module_inst_comm);
+    bounds_checks = wasm_runtime_is_bounds_checks_enabled(module_inst_comm);
 #endif
 
     memory_inst = exec_env->memory;
@@ -1974,6 +1977,9 @@ wasm_runtime_invoke_native_p2(WASMExecEnv *exec_env,
     }
 
     WASMMemoryInstance *memory = canon_get_memory(cur_func->canon_options);
+#if WASM_ENABLE_MEMORY64 != 0
+    bool is_memory64 = memory ? memory->is_memory64 : false;
+#endif
 
     Subtask *subtask = subtask_create();
     if (!subtask) {
