@@ -1782,7 +1782,7 @@ wasm_runtime_addr_app_to_native_p2(WASMExecEnv *exec_env, uint64 app_offset)
 #if WASM_ENABLE_SHARED_HEAP != 0
     if (is_app_addr_in_shared_heap(module_inst_comm, memory_inst->is_memory64,
                                    app_offset, 1)) {
-        return get_last_used_shared_heap_base_addr_adj(module_inst_comm)
+        return wasm_runtime_get_shared_heap_base_addr_adj(module_inst_comm)
                + app_offset;
     }
 #endif
@@ -1844,10 +1844,10 @@ wasm_runtime_addr_native_to_app_p2(WASMExecEnv *exec_env, void *native_ptr)
     }
 
 #if WASM_ENABLE_SHARED_HEAP != 0
-    if (is_native_addr_in_shared_heap(module_inst_comm,
-                                      memory_inst->is_memory64, addr, 1)) {
+    if (wasm_runtime_is_native_addr_in_shared_heap(
+            module_inst_comm, memory_inst->is_memory64, addr, 1)) {
         return (uint64)(uintptr_t)(addr
-                                   - get_last_used_shared_heap_base_addr_adj(
+                                   - wasm_runtime_get_shared_heap_base_addr_adj(
                                        module_inst_comm));
     }
 #endif
