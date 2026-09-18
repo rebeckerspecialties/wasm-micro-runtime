@@ -284,6 +284,7 @@ wasi_input_stream_read(wasi_input_stream_t stream, uint64_t len,
     ssize_t s = read(stream, buf, len);
     if (s < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            wasm_runtime_free(buf);
             ret->is_err = false;
             ret->u.ok.buf = NULL;
             ret->u.ok.buf_len = 0;
@@ -312,21 +313,15 @@ wasi_input_stream_read(wasi_input_stream_t stream, uint64_t len,
     }
 
     if ((uint64_t)s < len) {
-        if (s > 0) {
-            uint8_t *new_buf = wasm_runtime_realloc(buf, s);
-            if (!new_buf) {
-                wasm_runtime_free(buf);
-                ret->is_err = true;
-                ret->u.err.kind = WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED;
-                ret->u.err.payload.error = ENOMEM;
-                return;
-            }
-            buf = new_buf;
-        }
-        else {
+        uint8_t *new_buf = wasm_runtime_realloc(buf, s);
+        if (!new_buf) {
             wasm_runtime_free(buf);
-            buf = NULL;
+            ret->is_err = true;
+            ret->u.err.kind = WASI_STREAM_ERROR_KIND_LAST_OPERATION_FAILED;
+            ret->u.err.payload.error = ENOMEM;
+            return;
         }
+        buf = new_buf;
     }
 
     ret->is_err = false;

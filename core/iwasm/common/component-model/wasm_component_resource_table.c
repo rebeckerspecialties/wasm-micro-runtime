@@ -22,7 +22,7 @@ wasm_component_table_init(uint32_t initial_size, uint32_t resize_percent)
     }
 
     // Initialize table - start with index 0 reserved
-    table->array_size = (initial_size < 1) ? 1 : initial_size;
+    table->array_size = initial_size;
     table->array = (WASMTableElement **)wasm_runtime_malloc(
         sizeof(WASMTableElement *) * table->array_size);
     table->free_list =
