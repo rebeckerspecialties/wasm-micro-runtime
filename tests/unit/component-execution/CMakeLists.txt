@@ -1,6 +1,11 @@
  # Copyright (C) 2026 Airbus Defence and Space Romania SRL. All rights reserved.
  # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+wamr_unit_test_suite_run_modes(component-execution MODES classic-interp)
+if(NOT WAMR_UNIT_TEST_SUITE_ENABLED)
+  return()
+endif()
+
 cmake_minimum_required(VERSION 3.28)
 
 project (test-component-execution)
