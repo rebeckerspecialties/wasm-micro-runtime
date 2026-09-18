@@ -100,6 +100,12 @@ if (WAMR_BUILD_AOT EQUAL 1)
   if (WAMR_BUILD_GC EQUAL 1)
     list(APPEND WAMR_AOT_COMPILE_OPTIONS "--enable-gc")
   endif ()
+  # macOS has no MAP_32BIT to keep x86-64 AOT code within reach of the small
+  # code model's 32-bit relocations, so use the large one there, as the spec
+  # tests do for x86-64
+  if (APPLE AND WAMR_BUILD_TARGET STREQUAL "X86_64")
+    list(APPEND WAMR_AOT_COMPILE_OPTIONS "--size-level=0")
+  endif ()
 
   add_custom_target(
     wasm_to_aot
