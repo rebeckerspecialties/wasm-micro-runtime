@@ -350,13 +350,43 @@ jobs:
 
   test_aot_x18_reserve:
     name: x18 register reservation (macOS ARM64 only)
-    needs: build_iwasm
+    needs: [build_llvm_libraries_on_arm_macos, build_iwasm]
     runs-on: macos-15
     steps:
       - name: checkout
         uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.PR_REF }}
+
+      # run.sh assembles its test module with wat2wasm and compiles it with
+      # wamrc; both used to come from the samples job this test ran in.
+      - name: install-wasi-sdk-wabt
+        uses: ./.github/actions/install-wasi-sdk-wabt
+        with:
+          os: macos-15
+
+      - name: Get LLVM libraries
+        id: retrieve_llvm_libs
+        uses: actions/cache@v6
+        with:
+          path: |
+            ./core/deps/llvm/build/bin
+            ./core/deps/llvm/build/include
+            ./core/deps/llvm/build/lib
+            ./core/deps/llvm/build/libexec
+            ./core/deps/llvm/build/share
+          key: ${{ needs.build_llvm_libraries_on_arm_macos.outputs.cache_key }}
+
+      - name: Quit if cache miss
+        if: steps.retrieve_llvm_libs.outputs.cache-hit != 'true'
+        run: echo "::error::can not get prebuilt llvm libraries" && exit 1
+
+      - name: Build wamrc
+        run: |
+          mkdir build && cd build
+          cmake .. -DWAMR_BUILD_COMPONENT_MODEL=0
+          cmake --build . --config Release --parallel 4
+        working-directory: wamr-compiler
 
       - name: Test x18 register reservation (macOS ARM64 only)
         run: |
