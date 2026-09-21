@@ -17,25 +17,6 @@ on:
       - "main"
       - "release/**"
       - "dev/**"
-    # This list is also what the approval gate re-applies on
-    # pull_request_review (see gate.yml). Because `required` below treats a
-    # skipped job as success, anything missing here makes `zephyr CI` go green
-    # without building - so every input this workflow's result depends on must
-    # be listed, including the reusable workflows and composite actions it
-    # calls and the gate machinery that decides whether it runs at all.
-    paths:
-      - ".github/scripts/**"
-      - ".github/workflows/compilation_on_zephyr.yml"
-      - ".github/workflows/gate.yml"
-      - "build-scripts/**"
-      - "core/**"
-      - "!core/deps/**"
-      - "product-mini/platforms/common/**"
-      - "product-mini/platforms/zephyr/**"
-      - "samples/**"
-      - "!samples/workload/**"
-      - "tests/wamr-test-suites/**"
-      - "wamr-compiler/**"
   # Upstream CI: only spend upstream minutes once a PR is approved
   # (first approval only, enforced by the gate job below).
   pull_request_review:
@@ -78,33 +59,30 @@ jobs:
       contents: read
       pull-requests: read
     uses: ./.github/workflows/gate.yml
+    with:
+      paths: |
+        .github/scripts/**
+        .github/workflows/compilation_on_zephyr.yml
+        .github/workflows/gate.yml
+        build-scripts/**
+        core/**
+        !core/deps/**
+        product-mini/platforms/common/**
+        product-mini/platforms/zephyr/**
+        samples/**
+        !samples/workload/**
+        tests/wamr-test-suites/**
+        wamr-compiler/**
+  # One job, not a matrix: twister is handed every sample and every Ztest
+  # suite at once and already knows which may run where, from the
+  # platform_allow of each sample.yaml or testcase.yaml, and filters the rest
+  # out. The per-scenario breakdown a matrix would have given is in the job
+  # summary below.
   smoke_test:
     needs: gate
     if: ${{ !cancelled() && needs.gate.outputs.run == 'true' }}
     runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        # One entry per (sample, simulator) pair. Which scenarios exist for a
-        # sample, and on which platforms they may run, is declared in the
-        # sample's sample.yaml; twister decides pass/fail.
-        include:
-          - name: simple (native_sim)
-            sample: simple
-            sim: native_sim
-          - name: simple (ARC)
-            sample: simple
-            sim: qemu_arc
-          - name: simple-file (native_sim)
-            sample: simple-file
-            sim: native_sim
-          - name: simple-http (native_sim, build only)
-            sample: simple-http
-            sim: native_sim
-          - name: user-mode (ARC)
-            sample: user-mode
-            sim: qemu_arc
-    name: ${{ matrix.name }}
+    name: smoke test
     container:
       # For Zephyr 3.7 LTS, use the v0.26-branch or the latest v0.26.x release Docker image.
       # ci require a larger runner to avoid "no space left on device"
@@ -120,10 +98,16 @@ jobs:
       # ├─── zephyr/         --> Zephyr source code
       # ├─── zephyr-sdk/
       # ├─── modules/
-      # │    |─── wasm-micro-runtime   --> WAMR source code
+      # │    |─── wasm-micro-runtime   --> WAMR source code, this PR
       # ├─── tools/
       # ├─── vendor/
-      # └─── application/    --> DUMMY. keep west_lite.yml here
+      # └─── application/    --> a copy of product-mini/platforms/zephyr:
+      #                          west.yml plus the applications
+      #
+      # This is the layout a user of west.yml gets, with one difference: WAMR
+      # is marked inactive below, so `west update` leaves the checkout above
+      # alone and the runtime under test is the one from this PR rather than a
+      # fresh clone of main.
 
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -131,17 +115,29 @@ jobs:
           ref: ${{ env.PR_REF }}
           path: modules/wasm-micro-runtime
 
+      - name: Install wasi-sdk and wabt
+        uses: ./modules/wasm-micro-runtime/.github/actions/install-wasi-sdk-wabt
+        with:
+          os: ubuntu-22.04
+
       - name: Prepare Zephyr environment
         shell: bash
+        # The manifest repository is the whole application directory, copied
+        # out of the checkout - the same thing a user would copy.
+        #
+        # west.yml lists WAMR; marking the project inactive is what keeps the
+        # `west update` in the next step from cloning it over the checkout.
+        # Written to the config file rather than run through `west config`,
+        # because west is only installed by that step.
         run: |
-          mkdir -p application
-          cp modules/wasm-micro-runtime/product-mini/platforms/zephyr/west_lite.yml application/west_lite.yml
+          cp -r modules/wasm-micro-runtime/product-mini/platforms/zephyr application
+          printf '[manifest]\nproject-filter = -wasm-micro-runtime\n' >> ~/.westconfig
 
       - name: Setup Zephyr project
         uses: zephyrproject-rtos/action-zephyr-setup@v1
         with:
           app-path: application
-          manifest-file-name: west_lite.yml
+          manifest-file-name: west.yml
           sdk-version: ${{ env.ZEPHYR_SDK_VERSION }}
           # keep in sync with the setup.sh call in
           # product-mini/platforms/zephyr/Dockerfile
@@ -152,8 +148,7 @@ jobs:
         # The same command reproduces this job locally with the Docker image,
         # without --no-docker. twister reports the verdict.
         run: |
-          python3 product-mini/platforms/zephyr/build_and_run.py \
-            --no-docker --sim ${{ matrix.sim }} ${{ matrix.sample }}
+          python3 product-mini/platforms/zephyr/build_and_run.py --no-docker
         working-directory: modules/wasm-micro-runtime
 
       - name: Summarize twister results
@@ -193,19 +188,18 @@ jobs:
   # upstream job fails, and a skipped job counts as passing for a required
   # check - it would be a gate that is green forever.
   #
-  # `skipped` must count as success: when the gate resolves to run=false (the
-  # PR does not touch this workflow's paths, or it is not the first approval)
-  # every job below is skipped, and that is the normal path.
+  # `skipped` must count as success: when the gate resolves to run=false, every
+  # job below is skipped, and that is the normal path.
   required:
-    # Same as the `required` job in compilation_on_ubuntu.yml: keep the
-    # canonical required-check name only when gate.run=true.
-    name: zephyr CI${{ needs.gate.outputs.run != 'true' && ' (non-required)' || '' }}
-    # `always()` is mandatory: on approval-triggered runs this job must run
-    # and fail when any dependency failed (a skipped job counts as passing for
-    # a required check). Only an upstream push is exempt - the gate already
-    # resolved to run=false there, every dependency is skipped, and skipping
-    # this job too keeps the whole push run uniformly "did not run".
-    if: always() && !(github.event_name == 'push' && github.event.repository.fork == false)
+    name: >-
+      ${{ needs.gate.outputs.state == 'push' && 'zephyr CI on push'
+      || needs.gate.outputs.state == 'awaiting' && 'zephyr CI awaiting approval'
+      || needs.gate.outputs.state == 'approved' && 'zephyr CI approved'
+      || 'zephyr CI' }}
+    # `always()` keeps this aggregation check running even when upstream jobs
+    # fail or are skipped, so GitHub evaluates the dynamic check name and the
+    # script below can decide whether the workflow should pass.
+    if: always()
     needs: [gate, smoke_test]
     runs-on: ubuntu-22.04
     steps:
