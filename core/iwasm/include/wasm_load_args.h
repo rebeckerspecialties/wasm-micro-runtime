@@ -38,6 +38,16 @@ typedef void (*wasm_allocation_quota_attachment_release_callback_t)(
     void *attachment);
 
 /*
+ * Opaque owner of the native allocations charged to one quota attachment.
+ * A top-level load mints a fresh owner unless a token is already current on
+ * the loading thread, and the multi-module linker only binds a dependency to
+ * a parent that shares its owner.  Loads that must form one charged graph
+ * therefore run under one installed token; see
+ * wasm_runtime_allocation_quota_token_create().
+ */
+typedef struct WASMAllocationQuotaToken *wasm_allocation_quota_token_t;
+
+/*
  * Keep the legacy loader settings ABI unchanged.  LoadArgs has no size or
  * version field, so new runtimes must never read fields beyond this layout.
  */

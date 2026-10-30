@@ -787,6 +787,40 @@ wasm_runtime_load_ex2(uint8_t *buf, uint32_t size, const LoadArgs2 *args,
                       char *error_buf, uint32_t error_buf_size);
 
 /**
+ * Create the allocation-quota owner described by the quota fields of
+ * versioned loader settings. The token retains the attachment and charges
+ * its own storage to the quota until the last reference to it is released.
+ * Loaded modules keep their owner alive on their own, so the creator may
+ * release the token once it no longer needs to install it.
+ *
+ * @return the owner token, or NULL if the settings are malformed, the quota
+ *         fields are incomplete, or the quota denied the storage reservation
+ */
+WASM_RUNTIME_API_EXTERN wasm_allocation_quota_token_t
+wasm_runtime_allocation_quota_token_create(const LoadArgs2 *args);
+
+/**
+ * Drop one reference to an allocation-quota owner token.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_allocation_quota_token_release(
+    wasm_allocation_quota_token_t token);
+
+/**
+ * Install a token as the calling thread's current allocation-quota owner and
+ * return the token that was current before. While a token is current,
+ * wasm_runtime_load_ex2() and wasm_component_load_ex2() charge the module
+ * they load to that owner when the settings carry the same quota fields and
+ * fail closed otherwise; a module and the dependencies loaded for it under
+ * one token therefore pass the multi-module owner check. Pass the returned
+ * token back before the thread performs unrelated loads. The installed token
+ * must stay referenced for as long as it is current.
+ */
+WASM_RUNTIME_API_EXTERN wasm_allocation_quota_token_t
+wasm_runtime_allocation_quota_token_set_current(
+    wasm_allocation_quota_token_t token);
+
+/**
  * Resolve symbols for a previously loaded WASM module. Only useful when the
  * module was loaded with LoadArgs::no_resolve set to true
  */

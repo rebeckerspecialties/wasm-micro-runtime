@@ -348,6 +348,38 @@ test_nested_owner_mismatch_fails_closed(void)
     quota_destroy(&first);
 }
 
+static void
+test_public_token_create_validates_layout_before_quota_callbacks(void)
+{
+    QuotaState quota;
+    LoadArgs2 args;
+    wasm_allocation_quota_token_t token;
+
+    quota_init(&quota);
+    args = quota_load_args(&quota);
+    args.abi_version = WASM_LOAD_ARGS2_ABI_VERSION_1 + 1;
+    CHECK(wasm_runtime_allocation_quota_token_create(&args) == NULL);
+    CHECK(quota.reserve_calls == 0);
+    CHECK(quota.attachment_retain_calls == 0);
+
+    args = quota_load_args(&quota);
+    args.allocation_quota_attachment_release = NULL;
+    CHECK(wasm_runtime_allocation_quota_token_create(&args) == NULL);
+    CHECK(quota.reserve_calls == 0);
+    CHECK(quota.attachment_retain_calls == 0);
+
+    args = quota_load_args(&quota);
+    token = wasm_runtime_allocation_quota_token_create(&args);
+    CHECK(token != NULL);
+    CHECK(quota.attachment_retain_calls == 1);
+    CHECK(quota.live_allocations == 1);
+    CHECK(quota.live_bytes > 0);
+    wasm_runtime_allocation_quota_token_release(token);
+    CHECK(quota.attachment_release_calls == 1);
+    check_balanced(&quota);
+    quota_destroy(&quota);
+}
+
 #if WASM_ENABLE_MULTI_MODULE != 0
 static wasm_module_t
 load_legacy(uint8_t *binary, uint32_t binary_size, const char *name,
@@ -464,6 +496,124 @@ test_multi_module_dependency_same_owner_reuses_and_refunds(void)
     wasm_runtime_unload(dependency);
     CHECK(quota.attachment_release_calls == 1);
     check_balanced(&quota);
+    quota_destroy(&quota);
+}
+
+static void
+test_multi_module_same_attachment_without_installed_token_is_denied(void)
+{
+    uint8_t dependency_binary[sizeof(empty_module)];
+    uint8_t parent_binary[sizeof(empty_module)];
+    char error_buf[128] = { 0 };
+    QuotaState quota;
+    LoadArgs2 args;
+    wasm_module_t dependency;
+    wasm_module_t parent;
+
+    quota_init(&quota);
+    args = quota_load_args(&quota);
+    memcpy(dependency_binary, empty_module, sizeof(dependency_binary));
+    memcpy(parent_binary, empty_module, sizeof(parent_binary));
+    /* Each top-level load without a current token mints its own owner, even
+     * when both loads name the same attachment. */
+    dependency = wasm_runtime_load_ex2(
+        dependency_binary, (uint32_t)sizeof(dependency_binary), &args,
+        error_buf, (uint32_t)sizeof(error_buf));
+    CHECK(dependency != NULL);
+    parent =
+        wasm_runtime_load_ex2(parent_binary, (uint32_t)sizeof(parent_binary),
+                              &args, error_buf, (uint32_t)sizeof(error_buf));
+    CHECK(parent != NULL);
+    CHECK(quota.attachment_retain_calls == 2);
+    CHECK(!wasm_allocation_quota_allocations_share_owner(parent, dependency));
+    CHECK(wasm_runtime_register_module("quota-same-attachment-dependency",
+                                       dependency, error_buf,
+                                       (uint32_t)sizeof(error_buf)));
+
+    memset(error_buf, 0, sizeof(error_buf));
+    CHECK(wasm_runtime_load_depended_module(
+              parent, "quota-same-attachment-dependency", error_buf,
+              (uint32_t)sizeof(error_buf))
+          == NULL);
+    CHECK(strstr(error_buf, "owner mismatch") != NULL);
+
+    CHECK(wasm_runtime_unregister_module(parent));
+    wasm_runtime_unload(parent);
+    CHECK(wasm_runtime_unregister_module(dependency));
+    wasm_runtime_unload(dependency);
+    CHECK(quota.attachment_release_calls == 2);
+    check_balanced(&quota);
+    quota_destroy(&quota);
+}
+
+static void
+test_multi_module_installed_token_binds_parent_and_dependency(void)
+{
+    uint8_t dependency_binary[sizeof(empty_module)];
+    uint8_t parent_binary[sizeof(empty_module)];
+    uint8_t foreign_binary[sizeof(empty_module)];
+    char error_buf[128] = { 0 };
+    QuotaState quota;
+    QuotaState foreign_quota;
+    LoadArgs2 args;
+    LoadArgs2 foreign_args;
+    wasm_allocation_quota_token_t token;
+    wasm_module_t dependency;
+    wasm_module_t parent;
+    wasm_module_t reused;
+
+    quota_init(&quota);
+    quota_init(&foreign_quota);
+    args = quota_load_args(&quota);
+    foreign_args = quota_load_args(&foreign_quota);
+    token = wasm_runtime_allocation_quota_token_create(&args);
+    CHECK(token != NULL);
+    CHECK(wasm_runtime_allocation_quota_token_set_current(token) == NULL);
+
+    memcpy(dependency_binary, empty_module, sizeof(dependency_binary));
+    memcpy(parent_binary, empty_module, sizeof(parent_binary));
+    memcpy(foreign_binary, empty_module, sizeof(foreign_binary));
+    dependency = wasm_runtime_load_ex2(
+        dependency_binary, (uint32_t)sizeof(dependency_binary), &args,
+        error_buf, (uint32_t)sizeof(error_buf));
+    CHECK(dependency != NULL);
+    parent =
+        wasm_runtime_load_ex2(parent_binary, (uint32_t)sizeof(parent_binary),
+                              &args, error_buf, (uint32_t)sizeof(error_buf));
+    CHECK(parent != NULL);
+    CHECK(wasm_allocation_quota_allocations_share_owner(parent, dependency));
+
+    /* A load for another attachment must not borrow the installed owner. */
+    memset(error_buf, 0, sizeof(error_buf));
+    CHECK(wasm_runtime_load_ex2(foreign_binary,
+                                (uint32_t)sizeof(foreign_binary), &foreign_args,
+                                error_buf, (uint32_t)sizeof(error_buf))
+          == NULL);
+    CHECK(strstr(error_buf, "owner could not be established") != NULL);
+    CHECK(foreign_quota.reserve_calls == 0);
+    CHECK(foreign_quota.attachment_retain_calls == 0);
+
+    CHECK(wasm_runtime_register_module("quota-token-dependency", dependency,
+                                       error_buf, (uint32_t)sizeof(error_buf)));
+    CHECK(wasm_runtime_allocation_quota_token_set_current(NULL) == token);
+    wasm_runtime_allocation_quota_token_release(token);
+
+    reused = wasm_runtime_load_depended_module(parent, "quota-token-dependency",
+                                               error_buf,
+                                               (uint32_t)sizeof(error_buf));
+    CHECK(reused == dependency);
+    CHECK(wasm_runtime_search_sub_module(parent, "quota-token-dependency")
+          == dependency);
+    CHECK(quota.attachment_retain_calls == 1);
+
+    CHECK(wasm_runtime_unregister_module(parent));
+    wasm_runtime_unload(parent);
+    CHECK(wasm_runtime_unregister_module(dependency));
+    wasm_runtime_unload(dependency);
+    CHECK(quota.attachment_release_calls == 1);
+    check_balanced(&quota);
+    check_balanced(&foreign_quota);
+    quota_destroy(&foreign_quota);
     quota_destroy(&quota);
 }
 
@@ -613,8 +763,16 @@ test_c_api_versioned_load_owns_wrapper_graph(void)
 
     wasm_byte_vec_delete(&binary);
     wasm_store_delete(store);
+#if WASM_ENABLE_MULTI_MODULE != 0
+    /* Multi-module builds register every loaded module with the runtime and
+     * only release it in wasm_runtime_destroy(), so deleting the store keeps
+     * the charge and the attachment alive until the engine goes away. */
+    CHECK(quota.attachment_release_calls == 0);
+    CHECK(quota.live_allocations > 0);
+#else
     CHECK(quota.attachment_release_calls == 1);
     check_balanced(&quota);
+#endif
     wasm_engine_delete(engine);
     CHECK(quota.attachment_release_calls == 1);
     check_balanced(&quota);
@@ -806,9 +964,19 @@ test_c_api_owner_scopes_and_shared_module_use(void)
     wasm_store_delete(second_store);
     CHECK(first_quota.attachment_release_calls == 0);
     wasm_store_delete(first_store);
+#if WASM_ENABLE_MULTI_MODULE != 0
+    /* The runtime keeps every registered module until wasm_runtime_destroy(),
+     * which wasm_engine_delete() drives. */
+    CHECK(first_quota.attachment_release_calls == 0);
+    CHECK(first_quota.live_allocations > 0);
+    wasm_engine_delete(engine);
+    CHECK(first_quota.attachment_release_calls == 1);
+    check_balanced(&first_quota);
+#else
     CHECK(first_quota.attachment_release_calls == 1);
     check_balanced(&first_quota);
     wasm_engine_delete(engine);
+#endif
     quota_destroy(&first_quota);
 }
 
@@ -896,10 +1064,17 @@ test_c_api_cache_reuses_only_the_current_owner(void)
     wasm_store_delete(third_store);
     wasm_store_delete(second_store);
     wasm_store_delete(first_store);
+#if WASM_ENABLE_MULTI_MODULE != 0
+    /* Registered modules live until wasm_runtime_destroy(), which
+     * wasm_engine_delete() drives. */
+    CHECK(first_quota.attachment_release_calls == 0);
+    CHECK(second_quota.attachment_release_calls == 0);
+#else
     CHECK(first_quota.attachment_release_calls == 1);
     CHECK(second_quota.attachment_release_calls == 1);
     check_balanced(&first_quota);
     check_balanced(&second_quota);
+#endif
     wasm_engine_delete(engine);
     CHECK(first_quota.attachment_release_calls == 1);
     CHECK(second_quota.attachment_release_calls == 1);
@@ -919,9 +1094,12 @@ main(void)
     test_low_cap_fails_before_first_module_allocation();
     test_successful_load_retains_one_owner_until_unload();
     test_nested_owner_mismatch_fails_closed();
+    test_public_token_create_validates_layout_before_quota_callbacks();
 #if WASM_ENABLE_MULTI_MODULE != 0
     test_multi_module_dependency_owner_mismatch_is_denied();
     test_multi_module_dependency_same_owner_reuses_and_refunds();
+    test_multi_module_same_attachment_without_installed_token_is_denied();
+    test_multi_module_installed_token_binds_parent_and_dependency();
     test_multi_module_resolver_stays_bound_to_checked_dependency();
 #endif
     wasm_runtime_destroy();
