@@ -61,6 +61,7 @@ The same rule applies to the `product-mini` platform files and to the top-level 
 | [WAMR_BH_LOG](#host-defined-log)                                                                         | Host defined logging                 |
 | [WAMR_BH_VPRINTF](#host-defined-vprintf)                                                                 | Host defined vprintf                 |
 | [WAMR_BUILD_ALLOC_WITH_USAGE](#user-defined-linear-memory-allocator)                                     | Allocation with usage tracking       |
+| [WAMR_BUILD_ALLOCATION_QUOTA](#allocation-quota-accounting)                                              | allocation quota accounting          |
 | [WAMR_BUILD_ALLOC_WITH_USER_DATA](#user-defined-linear-memory-allocator)                                 | Allocation with user data            |
 | [WAMR_BUILD_AOT](#configure-aot)                                                                         | AoT compilation(wamrc)               |
 | [WAMR_BUILD_AOT](#configure-aot)                                                                         | AoT runtime                          |
@@ -256,6 +257,13 @@ Use fast jit as the first tier and LLVM JIT as the second tier.
 
 > [!WARNING]
 > WAMR is not a secure sandbox on every platform. On platforms where **WAMR_BUILD_LIBC_WASI** is unsupported (for example Windows), you can try the uvwasi-based WASI via **WAMR_BUILD_LIBC_UVWASI**, but it is unsafe.
+
+### **Allocation quota accounting**
+
+- **WAMR_BUILD_ALLOCATION_QUOTA**=1/0, default to off.
+
+> [!NOTE]
+> Attributes every native allocation the runtime makes on behalf of a module to an owner token created from the quota callbacks in `LoadArgs2`, so an embedder running untrusted guests can bound parser, loader and instance allocations per guest and refuse loads that exceed the budget. Each allocation carries a small ownership header. Builds that leave the option off keep the stock allocator path, add no metadata, and reject loader settings that request a quota, which suits memory-constrained deployments and high-trust embeddings. See the `wasm_runtime_load_args2_set_allocation_quota()` and `wasm_runtime_allocation_quota_token_*()` documentation in `wasm_export.h`.
 
 ### **Multi-Module feature**
 

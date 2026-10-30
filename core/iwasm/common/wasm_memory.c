@@ -29,6 +29,7 @@ static Memory_Mode memory_mode = MEMORY_MODE_UNKNOWN;
 
 static mem_allocator_t pool_allocator = NULL;
 
+#if WASM_ENABLE_ALLOCATION_QUOTA != 0
 struct WASMAllocationQuotaToken {
     korp_mutex lock;
     uint32 ref_count;
@@ -63,6 +64,7 @@ static _Thread_local WASMAllocationQuotaThreadLease
     *current_allocation_quota_thread_lease;
 static _Thread_local WASMAllocationQuotaScope *current_allocation_quota_scope;
 #endif
+#endif /* WASM_ENABLE_ALLOCATION_QUOTA != 0 */
 
 #if WASM_ENABLE_SHARED_HEAP != 0
 static WASMSharedHeap *shared_heap_list = NULL;
@@ -1109,6 +1111,7 @@ wasm_runtime_free_direct(void *ptr)
     }
 }
 
+#if WASM_ENABLE_ALLOCATION_QUOTA != 0
 static uint32
 wasm_allocation_quota_token_storage_size(void)
 {
@@ -1690,6 +1693,7 @@ wasm_runtime_allocate_owned(unsigned int size, unsigned int alignment,
     }
     return user_ptr;
 }
+#endif /* WASM_ENABLE_ALLOCATION_QUOTA != 0 */
 
 void *
 wasm_runtime_malloc(unsigned int size)
@@ -1710,15 +1714,21 @@ wasm_runtime_malloc(unsigned int size)
     }
 #endif
 
+#if WASM_ENABLE_ALLOCATION_QUOTA != 0
     return wasm_runtime_allocate_owned(size, WASM_ALLOCATION_MAX_ALIGNMENT,
                                        false);
+#else
+    return wasm_runtime_malloc_direct(size);
+#endif
 }
 
 void *
 wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment)
 {
     unsigned int allocator_alignment;
+#if WASM_ENABLE_ALLOCATION_QUOTA != 0
     unsigned int effective_alignment;
+#endif
 
     if (alignment == 0) {
         LOG_WARNING(
@@ -1742,9 +1752,11 @@ wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment)
     if (allocator_alignment > (unsigned int)os_getpagesize()
         || size % allocator_alignment != 0)
         return NULL;
+#if WASM_ENABLE_ALLOCATION_QUOTA != 0
     effective_alignment = allocator_alignment < WASM_ALLOCATION_MAX_ALIGNMENT
                               ? WASM_ALLOCATION_MAX_ALIGNMENT
                               : allocator_alignment;
+#endif
 
     if (memory_mode == MEMORY_MODE_UNKNOWN) {
         LOG_ERROR("wasm_runtime_aligned_alloc failed: memory hasn't been "
@@ -1766,12 +1778,18 @@ wasm_runtime_aligned_alloc(unsigned int size, unsigned int alignment)
     }
 #endif
 
+#if WASM_ENABLE_ALLOCATION_QUOTA != 0
     return wasm_runtime_allocate_owned(size, effective_alignment, true);
+#else
+    return mem_allocator_malloc_aligned(pool_allocator, size,
+                                        allocator_alignment);
+#endif
 }
 
 void *
 wasm_runtime_realloc(void *ptr, unsigned int size)
 {
+#if WASM_ENABLE_ALLOCATION_QUOTA != 0
     WASMAllocationHeader old_header;
     WASMAllocationHeader *header;
     WASMAllocationQuotaToken *owner;
@@ -1849,6 +1867,9 @@ wasm_runtime_realloc(void *ptr, unsigned int size)
             owner, old_header.data.raw_size - new_raw_size, 0);
     }
     return new_user_ptr;
+#else
+    return wasm_runtime_realloc_direct(ptr, size);
+#endif
 }
 
 void *
@@ -1874,6 +1895,7 @@ wasm_runtime_calloc(uint64_t count, unsigned int size)
 void
 wasm_runtime_free(void *ptr)
 {
+#if WASM_ENABLE_ALLOCATION_QUOTA != 0
     WASMAllocationHeader header_copy;
     WASMAllocationHeader *header;
 
@@ -1897,6 +1919,16 @@ wasm_runtime_free(void *ptr)
     wasm_allocation_quota_token_refund(header_copy.data.owner,
                                        header_copy.data.raw_size, 1);
     wasm_allocation_quota_token_release(header_copy.data.owner);
+#else
+    if (!ptr) {
+        LOG_WARNING("warning: wasm_runtime_free with NULL pointer\n");
+#if BH_ENABLE_GC_VERIFY != 0
+        exit(-1);
+#endif
+        return;
+    }
+    wasm_runtime_free_direct(ptr);
+#endif
 }
 
 bool

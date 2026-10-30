@@ -64,6 +64,7 @@ cmake_args=(
   -DWAMR_BUILD_SHARED_MEMORY=1
   -DWAMR_BUILD_REF_TYPES=1
   -DWAMR_BUILD_SIMD=0
+  -DWAMR_BUILD_ALLOCATION_QUOTA=1
   -DWAMR_BUILD_ALLOC_WITH_USER_DATA=1
   -DWAMR_BUILD_SANITIZER="$wamr_sanitizers"
 )
@@ -86,6 +87,7 @@ compile_args=(
   -DWASM_ENABLE_SHARED_MEMORY=1
   -DWASM_ENABLE_REF_TYPES=1
   -DWASM_MEM_ALLOC_WITH_USER_DATA=1
+  -DWASM_ENABLE_ALLOCATION_QUOTA=1
   -I "$repo_root/core"
   -I "$repo_root/core/iwasm/include"
   -I "$repo_root/core/iwasm/common"
