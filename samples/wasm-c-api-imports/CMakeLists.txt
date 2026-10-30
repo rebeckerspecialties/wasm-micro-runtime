@@ -13,13 +13,6 @@ include(FetchContent)
 # dependencies
 #
 set(WAMR_ROOT ${CMAKE_CURRENT_LIST_DIR}/../../)
-# wasm required headers
-execute_process(
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              ${WARM_ROOT}/${WAMR_ROOT}/wamr-sdk/app/libc-builtin-sysroot/include/pthread.h
-              ${CMAKE_CURRENT_LIST_DIR}/wasm/inc
-)
-
 # vmlib
 ################  runtime settings  ################
 string (TOLOWER ${CMAKE_HOST_SYSTEM_NAME} WAMR_BUILD_PLATFORM)
@@ -66,10 +59,13 @@ if (NOT DEFINED WAMR_BUILD_INTERP)
 endif ()
 set(WAMR_BUILD_JIT 0)
 set(WAMR_BUILD_FAST_INTERP 1)
-set(WAMR_BUILD_LIB_PTHREAD 1)
-set(WAMR_BUILD_LIBC_BUILTIN 1)
+set(WAMR_BUILD_LIB_WASI_THREADS 1)
+set(WAMR_BUILD_LIBC_BUILTIN 0)
 set(WAMR_BUILD_LIBC_WASI 1)
 set(WAMR_BUILD_SIMD 0)
+# wamrc emits reference types by default, so the runtime must enable them to
+# load the AOT module.
+set(WAMR_BUILD_REF_TYPES 1)
 
 # compiling and linking flags
 if (NOT (CMAKE_C_COMPILER MATCHES ".*clang.*" OR CMAKE_C_COMPILER_ID MATCHES ".*Clang"))
@@ -105,14 +101,11 @@ endif()
 # target_link_options(vmlib INTERFACE -fsanitize=memory)
 
 # wamrc
+# Use a pre-built wamrc (required tool) instead of building wamr-compiler
+# inside this sample. Missing wamrc makes configure fail.
 if(WAMR_BUILD_AOT EQUAL 1 AND WAMR_BUILD_INTERP EQUAL 0)
-  ExternalProject_Add(wamrc
-    PREFIX            wamrc-build
-    SOURCE_DIR        ${WAMR_ROOT}/wamr-compiler
-    CONFIGURE_COMMAND ${CMAKE_COMMAND} -S ${WAMR_ROOT}/wamr-compiler -B build
-    BUILD_COMMAND     ${CMAKE_COMMAND} --build build --target wamrc
-    INSTALL_COMMAND   ${CMAKE_COMMAND} -E copy_if_different build/wamrc ${CMAKE_CURRENT_BINARY_DIR}/wamrc
-  )
+  list(APPEND CMAKE_MODULE_PATH ${WAMR_ROOT}/build-scripts)
+  find_package(WAMRC REQUIRED)
 endif()
 
 #
@@ -128,7 +121,7 @@ add_custom_target(
 list(APPEND CMAKE_MODULE_PATH ${WAMR_ROOT}/build-scripts)
 find_package(WASISDK REQUIRED)
 set(WASI_SDK_DIR ${WASISDK_HOME})
-set(WASI_TOOLCHAIN_FILE ${WASISDK_TOOLCHAIN})
+set(WASI_TOOLCHAIN_FILE ${WASISDK_PTHREAD_TOOLCHAIN})
 set(WASI_SYS_ROOT ${WASISDK_SYSROOT})
 
 #
@@ -136,7 +129,6 @@ set(WASI_SYS_ROOT ${WASISDK_SYSROOT})
 if(WAMR_BUILD_AOT EQUAL 1 AND WAMR_BUILD_INTERP EQUAL 0)
   ExternalProject_Add(wasm
     PREFIX            wasm-build
-    DEPENDS           wamrc
     BUILD_ALWAYS      TRUE
     SOURCE_DIR        ${CMAKE_CURRENT_LIST_DIR}/wasm
     CONFIGURE_COMMAND ${CMAKE_COMMAND} -S ${CMAKE_CURRENT_LIST_DIR}/wasm -B build
@@ -144,7 +136,7 @@ if(WAMR_BUILD_AOT EQUAL 1 AND WAMR_BUILD_INTERP EQUAL 0)
                         -DCMAKE_TOOLCHAIN_FILE=${WASI_TOOLCHAIN_FILE}
                         -DCMAKE_SYSROOT=${WASI_SYS_ROOT}
                         -DWASM_TO_AOT=ON
-                        -DWAMRC_PATH=${CMAKE_CURRENT_BINARY_DIR}/wamrc
+                        -DWAMRC_PATH=${WAMRC_BIN}
                         -DSOCKET_WASI_CMAKE=${WAMR_ROOT}/core/iwasm/libraries/lib-socket/lib_socket_wasi.cmake
     BUILD_COMMAND     ${CMAKE_COMMAND} --build build
     INSTALL_COMMAND   ${CMAKE_COMMAND} --install build --prefix ${CMAKE_CURRENT_BINARY_DIR}
@@ -167,8 +159,12 @@ endif()
 #
 # Test
 #
-add_test(
-  NAME run_example1
-  COMMAND ./example1
-  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-)
+include(${CMAKE_CURRENT_LIST_DIR}/../samples_common.cmake)
+
+if(BUILD_TESTING)
+  add_dependencies(install_host wasm)
+
+  samples_add_test(run_example1
+    "Receive [0-9]+ bytes successfully!|Done\\."
+    ./example1)
+endif()

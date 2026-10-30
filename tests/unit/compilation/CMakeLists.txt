@@ -1,59 +1,36 @@
 # Copyright (C) 2019 Intel Corporation.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-cmake_minimum_required(VERSION 3.14)
+wamr_unit_test_suite_run_modes(compilation MODES aot)
+if(NOT WAMR_UNIT_TEST_SUITE_ENABLED)
+  return()
+endif()
 
-project (test-compilation)
+add_definitions(-DWASM_ENABLE_WAMR_COMPILER=1)
 
-add_definitions (-DRUN_ON_LINUX)
+# The cases drive the in-process AOT compiler.
+include(../unit_common.cmake)
 
-add_definitions (-Dattr_container_malloc=malloc)
-add_definitions (-Dattr_container_free=free)
-add_definitions (-DWASM_ENABLE_WAMR_COMPILER=1)
-add_definitions (-DWASM_ENABLE_DUMP_CALL_STACK=1)
-add_definitions (-DWASM_ENABLE_AOT_STACK_FRAME=1)
+include(${IWASM_DIR}/compilation/iwasm_compl.cmake)
 
-set (WAMR_BUILD_LIBC_WASI 0)
-set (WAMR_BUILD_LIBC_BUILTIN 1)
-set (WAMR_BUILD_MULTI_MODULE 1)
-set (WAMR_BUILD_APP_FRAMEWORK 0)
-set (WAMR_BUILD_THREAD_MGR 1)
-set (WAMR_BUILD_AOT 1)
-set (WAMR_BUILD_FAST_INTERP 0)
-set (WAMR_BUILD_INTERP 1)
-set (WAMR_BUILD_JIT 0)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
-include (../unit_common.cmake)
+file(GLOB_RECURSE source_all ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
 
-find_package(LLVM REQUIRED CONFIG)
-include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
-add_definitions(${LLVM_DEFINITIONS})
-
-include (${IWASM_DIR}/compilation/iwasm_compl.cmake)
-
-include_directories (${CMAKE_CURRENT_SOURCE_DIR})
-
-file (GLOB_RECURSE source_all ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
-
-set (UNIT_SOURCE ${source_all})
-
-set (unit_test_sources
-  ${UNIT_SOURCE}
+set(unit_test_sources
+  ${source_all}
   ${WAMR_RUNTIME_LIB_SOURCE}
   ${IWASM_COMPL_SOURCE}
-  ${UNCOMMON_SHARED_SOURCE}   
+  ${UNCOMMON_SHARED_SOURCE}
 )
 
-# Now simply link against gtest or gtest_main as needed. Eg
-add_executable (compilation_test ${unit_test_sources})
+add_executable(compilation_test ${unit_test_sources})
+target_link_libraries(compilation_test ${LLVM_AVAILABLE_LIBS} gtest_main)
 
-target_link_libraries (compilation_test ${LLVM_AVAILABLE_LIBS} gtest_main )
-
-add_custom_command(TARGET compilation_test POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy
-  ${CMAKE_CURRENT_LIST_DIR}/wasm-apps/main.wasm
-  ${CMAKE_CURRENT_BINARY_DIR}
-  COMMENT "Copy main.wasm to the directory: build/compilation."
+# main.wasm has no .wat/.c source to compile it from.
+wamr_unit_test_copy_wasm_files(compilation_test
+  FILES ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps/main.wasm
+  DEST_DIR ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 gtest_discover_tests(compilation_test)

@@ -1,37 +1,33 @@
-# Copyright (C) 2019 Intel Corporation.  All rights reserved.
+# Copyright (C) 2026 Intel Corporation.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+# Standalone CMake project for the spawn-thread sample's wasm application.
+# Built by the parent project via samples_build_wasm_app() (ExternalProject)
+# with the wasi-sdk toolchain; libc-builtin expressed through compile/link
+# options (pthread model provided by the WAMR lib-pthread).
+#
+# Tools: wasi-sdk (REQUIRED - missing wasi-sdk makes configure fail).
 
 cmake_minimum_required(VERSION 3.14)
-project(wasm-apps)
+project(spawn_thread_wasm_apps LANGUAGES C)
 
-set(WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
-list(APPEND CMAKE_MODULE_PATH ${WAMR_ROOT_DIR}/build-scripts)
-find_package(WASISDK REQUIRED)
+set(WAMR_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 
-if (APPLE)
-    set (HAVE_FLAG_SEARCH_PATHS_FIRST 0)
-    set (CMAKE_C_LINK_FLAGS "")
-    set (CMAKE_CXX_LINK_FLAGS "")
-endif ()
-set(CMAKE_SYSTEM_PROCESSOR wasm32)
-set (CMAKE_SYSROOT                  ${WAMR_ROOT_DIR}/wamr-sdk/app/libc-builtin-sysroot)
+set(CMAKE_SYSROOT "${WAMR_ROOT_DIR}/wamr-sdk/app/libc-builtin-sysroot")
 
-set (CMAKE_C_FLAGS                  "-nostdlib -pthread -Qunused-arguments")
-set (CMAKE_C_FLAGS                  "${CMAKE_C_FLAGS} -z stack-size=32768")
-set (CMAKE_C_COMPILER_TARGET        "wasm32")
-set (CMAKE_C_COMPILER               "${WASISDK_CC_COMMAND}")
+add_executable(test.wasm sum.c)
 
-set (DEFINED_SYMBOLS
-"${WAMR_ROOT_DIR}/wamr-sdk/app/libc-builtin-sysroot/share/defined-symbols.txt")
+target_compile_options(test.wasm PRIVATE
+  -nostdlib -pthread -Qunused-arguments -z stack-size=32768)
+target_link_options(test.wasm PRIVATE
+  -nostdlib
+  -Wl,--shared-memory,--max-memory=131072
+  -Wl,--no-entry,--strip-all
+  "LINKER:--export=sum"
+  "LINKER:--export=return_bss"
+  "LINKER:--export=__heap_base"
+  "LINKER:--export=__data_end"
+  "LINKER:--export=__wasm_call_ctors"
+  -Wl,--allow-undefined-file=${WAMR_ROOT_DIR}/wamr-sdk/app/libc-builtin-sysroot/share/defined-symbols.txt)
 
-set (CMAKE_EXE_LINKER_FLAGS
-    "-Wl,--shared-memory,--max-memory=131072,       \
-    -Wl,--no-entry,--strip-all,--export=sum,        \
-    -Wl,--export=return_bss,        \
-    -Wl,--export=__heap_base,--export=__data_end    \
-    -Wl,--export=__wasm_call_ctors  \
-    -Wl,--allow-undefined-file=${DEFINED_SYMBOLS}"
-)
-
-add_executable(test.wasm  sum.c)
-target_link_libraries(test.wasm)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/test.wasm DESTINATION wasm-apps)

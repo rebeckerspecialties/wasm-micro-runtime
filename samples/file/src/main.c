@@ -43,12 +43,12 @@ main(int argc, char *argv_main[])
                 return 0;
             case '?':
                 print_usage();
-                return 0;
+                return 1;
         }
     }
     if (wasm_path == NULL || wasi_dir == NULL) {
         print_usage();
-        return 0;
+        return 1;
     }
 
     init_args.mem_alloc_type = Alloc_With_Pool;
@@ -67,7 +67,8 @@ main(int argc, char *argv_main[])
         goto fail;
     }
 
-    module = wasm_runtime_load(buffer, buf_size, error_buf, sizeof(error_buf));
+    module = wasm_runtime_load((uint8 *)buffer, buf_size, error_buf,
+                               sizeof(error_buf));
     if (!module) {
         printf("Load wasm module failed. error: %s\n", error_buf);
         goto fail;

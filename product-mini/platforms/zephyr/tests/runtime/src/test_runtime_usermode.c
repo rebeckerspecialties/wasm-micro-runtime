@@ -1,0 +1,306 @@
+/*
+ * Copyright (C) 2026 Intel Corporation.  All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ */
+
+#include <stdint.h>
+#include <string.h>
+
+#include <zephyr/app_memory/app_memdomain.h>
+#include <zephyr/kernel.h>
+#include <zephyr/ztest.h>
+
+#include "runtime_fixture.h"
+#include "wasm_fixtures.h"
+
+#define USER_WORKER_STACK_SIZE 8192U
+#define USER_WORKER_PRIORITY 5
+#define USER_WORKER_TIMEOUT K_SECONDS(1)
+#define SMALL_POOL_SIZE 1024U
+#define FIXTURE_ACCESS_TOKEN 0x57414d52U
+
+struct runtime_user_mode_fixture {
+    bool worker_was_user;
+    bool workflow_succeeded;
+    bool negative_observed;
+    bool diagnostic_present;
+    bool small_pool_initialized;
+    bool recovery_succeeded;
+    uint32_t result;
+    uint32_t run_count;
+    uint32_t access_token;
+    char diagnostic[WAMR_TEST_ERROR_SIZE];
+};
+
+extern struct k_mem_partition z_libc_partition;
+extern struct k_mem_partition ztest_mem_partition;
+
+K_APPMEM_PARTITION_DEFINE(wamr_partition);
+
+static struct k_mem_domain wamr_domain;
+static struct k_thread runtime_worker;
+K_THREAD_STACK_DEFINE(runtime_worker_stack, USER_WORKER_STACK_SIZE);
+static struct k_sem worker_done;
+
+K_APP_BMEM(wamr_partition) static struct loaded_runtime user_runtime;
+K_APP_BMEM(wamr_partition)
+static uint8_t small_pool[SMALL_POOL_SIZE] __aligned(8);
+ZTEST_DMEM static struct runtime_user_mode_fixture user_results = { 0 };
+
+static bool
+run_add_lifecycle(uint32_t *result)
+{
+    char error[WAMR_TEST_ERROR_SIZE] = { 0 };
+
+    return wamr_test_run_add_copy(
+        &user_runtime.runtime, user_runtime.pool, sizeof(user_runtime.pool),
+        wasm_add, sizeof(wasm_add), result, error, sizeof(error));
+}
+
+static void
+complete_worker(struct runtime_user_mode_fixture *results)
+{
+    results->worker_was_user = k_is_user_context();
+    k_sem_give(&worker_done);
+}
+
+static void
+valid_worker(void *arg1, void *arg2, void *arg3)
+{
+    struct runtime_user_mode_fixture *results = arg1;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    results->workflow_succeeded = run_add_lifecycle(&results->result);
+    complete_worker(results);
+}
+
+static void
+valid_recovery_worker(void *arg1, void *arg2, void *arg3)
+{
+    struct runtime_user_mode_fixture *results = arg1;
+    uint32_t result = 0U;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    results->recovery_succeeded = run_add_lifecycle(&result) && result == 42U;
+    complete_worker(results);
+}
+
+static void
+twice_worker(void *arg1, void *arg2, void *arg3)
+{
+    struct runtime_user_mode_fixture *results = arg1;
+    uint32_t result = 0U;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    if (run_add_lifecycle(&result) && result == 42U) {
+        results->run_count++;
+    }
+    result = 0U;
+    if (run_add_lifecycle(&result) && result == 42U) {
+        results->run_count++;
+    }
+    results->workflow_succeeded = results->run_count == 2U;
+    complete_worker(results);
+}
+
+static void
+fixture_access_worker(void *arg1, void *arg2, void *arg3)
+{
+    struct runtime_user_mode_fixture *results = arg1;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    results->access_token = FIXTURE_ACCESS_TOKEN;
+    complete_worker(results);
+}
+
+static void
+malformed_worker(void *arg1, void *arg2, void *arg3)
+{
+    struct runtime_user_mode_fixture *results = arg1;
+    char error[WAMR_TEST_ERROR_SIZE] = { 0 };
+    bool started = wamr_test_runtime_start_copy(
+        &user_runtime.runtime, user_runtime.pool, sizeof(user_runtime.pool),
+        malformed_wasm, sizeof(malformed_wasm), error, sizeof(error));
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    if (started) {
+        wamr_test_runtime_stop(&user_runtime.runtime);
+    }
+    results->negative_observed = !started;
+    results->diagnostic_present = error[0] != '\0';
+    memcpy(results->diagnostic, error, sizeof(results->diagnostic));
+    complete_worker(results);
+}
+
+static void
+small_pool_worker(void *arg1, void *arg2, void *arg3)
+{
+    struct runtime_user_mode_fixture *results = arg1;
+    struct wamr_test_runtime small_runtime = { 0 };
+    char error[WAMR_TEST_ERROR_SIZE] = { 0 };
+    bool started;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    started = wamr_test_runtime_start_copy(
+        &small_runtime, small_pool, sizeof(small_pool), wasm_add,
+        sizeof(wasm_add), error, sizeof(error));
+    results->negative_observed = !started;
+    results->small_pool_initialized = !started && error[0] != '\0';
+    if (started) {
+        wamr_test_runtime_stop(&small_runtime);
+    }
+    memcpy(results->diagnostic, error, sizeof(results->diagnostic));
+    results->diagnostic_present = error[0] != '\0';
+    complete_worker(results);
+}
+
+static void
+missing_export_worker(void *arg1, void *arg2, void *arg3)
+{
+    struct runtime_user_mode_fixture *results = arg1;
+    char error[WAMR_TEST_ERROR_SIZE] = { 0 };
+    wasm_function_inst_t missing = NULL;
+    bool exception_set = false;
+    bool started = wamr_test_runtime_start_copy(
+        &user_runtime.runtime, user_runtime.pool, sizeof(user_runtime.pool),
+        wasm_add, sizeof(wasm_add), error, sizeof(error));
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    if (started) {
+        missing = wasm_runtime_lookup_function(user_runtime.runtime.instance,
+                                               "missing");
+        exception_set =
+            wasm_runtime_get_exception(user_runtime.runtime.instance) != NULL;
+        wamr_test_runtime_stop(&user_runtime.runtime);
+    }
+    results->negative_observed = started && missing == NULL && !exception_set;
+    memcpy(results->diagnostic, error, sizeof(results->diagnostic));
+    results->diagnostic_present = error[0] != '\0';
+    complete_worker(results);
+}
+
+static void
+run_user_worker(struct runtime_user_mode_fixture *results,
+                k_thread_entry_t entry)
+{
+    k_tid_t tid = k_thread_create(&runtime_worker, runtime_worker_stack,
+                                  K_THREAD_STACK_SIZEOF(runtime_worker_stack),
+                                  entry, results, NULL, NULL,
+                                  USER_WORKER_PRIORITY, K_USER, K_FOREVER);
+    int domain_result;
+    int completion_result;
+    int join_result;
+
+    zassert_not_null(tid, "user worker creation failed");
+    domain_result = k_mem_domain_add_thread(&wamr_domain, tid);
+    if (domain_result != 0) {
+        k_thread_abort(tid);
+        zassert_equal(domain_result, 0, "adding user worker to domain failed");
+        return;
+    }
+
+    k_object_access_grant(&worker_done, tid);
+    k_thread_start(tid);
+    completion_result = k_sem_take(&worker_done, USER_WORKER_TIMEOUT);
+    join_result = k_thread_join(tid, USER_WORKER_TIMEOUT);
+    if (join_result != 0) {
+        k_thread_abort(tid);
+    }
+
+    zassert_equal(completion_result, 0,
+                  "user worker did not signal completion");
+    zassert_equal(join_result, 0, "user worker did not join within the bound");
+    zassert_true(results->worker_was_user,
+                 "runtime worker did not execute in user mode");
+}
+
+static void *
+runtime_user_mode_setup(void)
+{
+    struct k_mem_partition *partitions[] = {
+        &wamr_partition,
+        &z_libc_partition,
+        &ztest_mem_partition,
+    };
+
+    zassert_equal(
+        k_mem_domain_init(&wamr_domain, ARRAY_SIZE(partitions), partitions), 0,
+        "WAMR memory domain initialization failed");
+    return &user_results;
+}
+
+static void
+runtime_user_mode_before(void *fixture)
+{
+    memset(fixture, 0, sizeof(struct runtime_user_mode_fixture));
+    k_sem_init(&worker_done, 0, 1);
+}
+
+ZTEST_SUITE(runtime_user_mode, NULL, runtime_user_mode_setup,
+            runtime_user_mode_before, NULL, NULL);
+
+ZTEST_F(runtime_user_mode, test_valid_module_workflow)
+{
+    run_user_worker(fixture, valid_worker);
+    zassert_true(fixture->workflow_succeeded,
+                 "valid user-mode workflow failed");
+    zassert_equal(fixture->result, 42U, "valid user-mode workflow returned %u",
+                  fixture->result);
+}
+
+ZTEST_F(runtime_user_mode, test_workflow_runs_twice)
+{
+    run_user_worker(fixture, twice_worker);
+    zassert_true(fixture->workflow_succeeded,
+                 "repeated user-mode workflow failed");
+    zassert_equal(fixture->run_count, 2U,
+                  "user-mode workflow completed %u times", fixture->run_count);
+}
+
+ZTEST_F(runtime_user_mode, test_fixture_memory_is_accessible)
+{
+    run_user_worker(fixture, fixture_access_worker);
+    zassert_equal(fixture->access_token, FIXTURE_ACCESS_TOKEN,
+                  "user worker could not update shared fixture memory");
+}
+
+ZTEST_F(runtime_user_mode, test_malformed_module_is_rejected)
+{
+    run_user_worker(fixture, malformed_worker);
+    run_user_worker(fixture, valid_recovery_worker);
+    zassert_true(fixture->negative_observed,
+                 "malformed module was accepted in user mode");
+    zassert_true(fixture->diagnostic_present,
+                 "malformed module had no diagnostic");
+    zassert_true(fixture->recovery_succeeded,
+                 "valid workflow failed after malformed module");
+}
+
+ZTEST_F(runtime_user_mode, test_small_pool_fails_cleanly)
+{
+    run_user_worker(fixture, small_pool_worker);
+    run_user_worker(fixture, valid_recovery_worker);
+    zassert_true(fixture->small_pool_initialized,
+                 "small pool initialization failed early");
+    zassert_true(fixture->negative_observed,
+                 "small pool unexpectedly instantiated module");
+    zassert_true(fixture->recovery_succeeded,
+                 "valid workflow failed after small pool rejection");
+}
+
+ZTEST_F(runtime_user_mode, test_missing_export_then_valid_workflow)
+{
+    run_user_worker(fixture, missing_export_worker);
+    run_user_worker(fixture, valid_recovery_worker);
+    zassert_true(fixture->negative_observed,
+                 "missing export lookup did not fail cleanly");
+    zassert_true(fixture->recovery_succeeded,
+                 "valid workflow failed after missing export lookup");
+}

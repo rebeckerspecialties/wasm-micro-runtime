@@ -20,22 +20,12 @@ on:
       - "main"
       - "release/**"
       - "dev/**"
-    # Narrower than the ubuntu workflow: android builds iwasm only, so
-    # wamr-compiler, the test suites and wamr-ide are irrelevant here.
-    # Every input the result depends on must be listed, including the gate
-    # machinery - see the same block in compilation_on_ubuntu.yml.
-    paths:
-      - ".github/scripts/**"
-      - ".github/workflows/compilation_on_android.yml"
-      - ".github/workflows/gate.yml"
-      - "build-scripts/**"
-      - "core/**"
-      - "!core/deps/**"
-      - "product-mini/platforms/android/**"
-  # Upstream CI: only spend upstream minutes once a PR is approved
+  # Upstream CI: only do a full run once a PR is approved
   # (first approval only, enforced by the gate job below).
   pull_request_review:
     types: [submitted]
+  pull_request:
+    types: [synchronize]
   # allow to be triggered manually
   workflow_dispatch:
 
@@ -48,7 +38,7 @@ concurrency:
 env:
   # Merge ref to check out on approval-gated review events; empty elsewhere
   # so checkout falls back to the event's default ref.
-  PR_REF: ${{ github.event_name == 'pull_request_review' && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
+  PR_REF: ${{ (github.event_name == 'pull_request_review' || github.event_name == 'pull_request') && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
   # For BUILD. The JIT modes are omitted on purpose: android has no prebuilt
   # LLVM and Fast JIT / Multi-Tier JIT do not support the platform.
   AOT_BUILD_OPTIONS: "           -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_FAST_INTERP=0 -DWAMR_BUILD_INTERP=0 -DWAMR_BUILD_FAST_JIT=0 -DWAMR_BUILD_JIT=0 -DWAMR_BUILD_LAZY_JIT=0"
@@ -59,16 +49,29 @@ permissions:
   contents: read
 
 jobs:
-  # Gate upstream minutes: always runs (a few-second no-op on push/dispatch)
+  # Full-run gate: always runs (a few-second no-op on push/dispatch)
   # and outputs `run`, "true" only for a PR's first approval. It must NOT be
   # skipped: a skipped job propagates the skip down the needs chain to every
   # descendant, even ones that broke the chain with their own `if`.
   gate:
     name: approval gate
     permissions:
+      # `checks: read`: the gate reads the head commit's check runs to see
+      # whether it already has a verdict.
+      checks: read
       contents: read
       pull-requests: read
     uses: ./.github/workflows/gate.yml
+    with:
+      check_name: android CI
+      paths: |
+        .github/scripts/**
+        .github/workflows/compilation_on_android.yml
+        .github/workflows/gate.yml
+        build-scripts/**
+        core/**
+        !core/deps/**
+        product-mini/platforms/android/**
 
   # TODO: 44 jobs is far more android coverage than the incremental signal
   # justifies - android differs from linux only by core/shared/platform/android
@@ -81,7 +84,7 @@ jobs:
   # See the same document, section 3.5.
   build_iwasm:
     needs: gate
-    if: ${{ !cancelled() && (github.event_name != 'pull_request_review' || needs.gate.outputs.run == 'true') }}
+    if: ${{ !cancelled() && needs.gate.outputs.run == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -136,7 +139,7 @@ jobs:
             make_options_feature: "-DWAMR_BUILD_MULTI_MEMORY=1"
     steps:
       - name: checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.PR_REF }}
 
@@ -152,15 +155,32 @@ jobs:
   # Single stable check for branch protection - see the same job in
   # compilation_on_ubuntu.yml for why an individual matrix job must not be used.
   required:
-    name: android CI
+    name: ${{ needs.gate.outputs.check_name || 'android CI interrupted' }}
+    # `always()` keeps this aggregation check running even when upstream jobs
+    # fail or are skipped, so GitHub evaluates the dynamic check name and the
+    # script below can decide whether the workflow should pass.
     if: always()
     needs: [gate, build_iwasm]
     runs-on: ubuntu-22.04
     steps:
+      # state=concluded republishes the verdict that still stands on this head
+      # commit. A green is published by the steps below; a red has to be
+      # published the same way it was earned - by failing.
+      - name: Replay the standing verdict
+        if: ${{ needs.gate.outputs.state == 'concluded' && needs.gate.outputs.verdict == 'failure' }}
+        run: |
+          echo "::error title=android CI::replaying the failure that still stands on this head commit"
+          exit 1
       - name: Report which dependency failed
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"' | sort
+          failed_jobs=$(echo "$NEEDS" | jq -r \
+            'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key' \
+            | paste -sd ', ' -)
+          if [ -n "$failed_jobs" ]; then
+            echo "::error title=android CI::failed or cancelled dependency jobs: $failed_jobs"
+          fi
           echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' \
             > /dev/null

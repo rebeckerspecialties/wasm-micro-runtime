@@ -40,10 +40,18 @@ endif()
 
 add_definitions(-DWASM_ENABLE_INTERP=1)
 add_definitions(-DWASM_ENABLE_WAMR_COMPILER=1)
+# This project does not go through config_common.cmake, so the macros that the
+# platform headers read before core/config.h is reached have to be given a
+# value here.  Both keep the value they have always had in this build.
+add_definitions(-DWASM_DISABLE_WAKEUP_BLOCKING_OP=0)
+add_definitions(-DWASM_DISABLE_WRITE_GS_BASE=0)
 add_definitions(-DWASM_ENABLE_BULK_MEMORY=1)
 add_definitions(-DWASM_ENABLE_BULK_MEMORY_OPT=1)
 add_definitions(-DWASM_DISABLE_HW_BOUND_CHECK=1)
 add_definitions(-DWASM_ENABLE_SHARED_MEMORY=1)
+# Keep the cmake option in sync with the definition above, so that
+# iwasm_common.cmake compiles wasm_shared_memory.c for the compiler as well.
+set (WAMR_BUILD_SHARED_MEMORY 1)
 add_definitions(-DWASM_ENABLE_THREAD_MGR=1)
 add_definitions(-DWASM_ENABLE_TAIL_CALL=1)
 add_definitions(-DWASM_ENABLE_REF_TYPES=1)
@@ -167,17 +175,11 @@ if (WAMR_BUILD_PLATFORM STREQUAL "windows" AND MSVC)
   add_compile_options($<$<CONFIG:Debug>:/MD>)
 endif()
 
-if (NOT WAMR_BUILD_WITH_CUSTOM_LLVM)
-  set (LLVM_SRC_ROOT "${PROJECT_SOURCE_DIR}/../core/deps/llvm")
-  if (NOT EXISTS "${LLVM_SRC_ROOT}/build")
-    message (FATAL_ERROR "Cannot find LLVM dir: ${LLVM_SRC_ROOT}/build")
-  endif ()
-  set (CMAKE_PREFIX_PATH "${LLVM_SRC_ROOT}/build;${CMAKE_PREFIX_PATH}")
-endif ()
-
-find_package(LLVM REQUIRED CONFIG)
-include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
-add_definitions(${LLVM_DEFINITIONS})
+# Resolve LLVM_DIR (or use a custom LLVM via WAMR_BUILD_WITH_CUSTOM_LLVM)
+# and load the LLVM package; its zlib/zstd dependencies are handled by
+# find_package(LLVM) itself.  Shared with the main build and the unit
+# tests (see llvm_env.cmake).
+include (${PROJECT_SOURCE_DIR}/../build-scripts/llvm_env.cmake)
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
