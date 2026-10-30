@@ -1716,6 +1716,14 @@ wasm_runtime_load_args2_normalize(const LoadArgs2 *args, LoadArgs *legacy_args,
                       "callbacks");
         return false;
     }
+#if WASM_ENABLE_ALLOCATION_QUOTA == 0
+    if (any_quota_field) {
+        set_error_buf(error_buf, error_buf_size,
+                      "WASM module load failed: allocation quota accounting "
+                      "is not enabled in this build");
+        return false;
+    }
+#endif
 
     memset(legacy_args, 0, sizeof(*legacy_args));
     legacy_args->name = args->name;

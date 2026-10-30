@@ -85,6 +85,7 @@ cmake_args=(
   -DWAMR_BUILD_MULTI_MODULE="$multi_module"
   -DWAMR_BUILD_THREAD_MGR=0
   -DWAMR_BUILD_SIMD=0
+  -DWAMR_BUILD_ALLOCATION_QUOTA=1
   -DWAMR_BUILD_ALLOC_WITH_USER_DATA="$alloc_with_user_data"
   -DWAMR_BUILD_SANITIZER="$wamr_sanitizers"
 )
@@ -107,6 +108,7 @@ compile_args=(
   -DWASM_ENABLE_INTERP=1
   -DWASM_ENABLE_FAST_INTERP=1
   -DWASM_ENABLE_MULTI_MODULE="$multi_module"
+  -DWASM_ENABLE_ALLOCATION_QUOTA=1
   -DWASM_MEM_ALLOC_WITH_USER_DATA="$alloc_with_user_data"
   -I "$repo_root/core/iwasm/include"
   -I "$repo_root/core/iwasm/common"

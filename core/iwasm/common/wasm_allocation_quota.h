@@ -7,8 +7,13 @@
 #define _WASM_ALLOCATION_QUOTA_H
 
 #include <stddef.h>
+#include <string.h>
 
 #include "wasm_load_args.h"
+
+#ifndef WASM_ENABLE_ALLOCATION_QUOTA
+#define WASM_ENABLE_ALLOCATION_QUOTA 0
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,6 +90,8 @@ typedef union WASMAllocationHeader {
     } data;
     WASMAllocationMaxAlign alignment;
 } WASMAllocationHeader;
+
+#if WASM_ENABLE_ALLOCATION_QUOTA != 0
 
 WASMAllocationQuotaToken *
 wasm_allocation_quota_token_create(const LoadArgs2 *args);
@@ -187,6 +194,180 @@ wasm_allocation_header_initialize(void *raw_ptr, uint32_t raw_size,
 
 WASMAllocationHeader *
 wasm_allocation_header_from_user(void *user_ptr);
+
+#else /* WASM_ENABLE_ALLOCATION_QUOTA == 0 */
+
+/*
+ * Disabled builds compile every quota site to a no-op: scopes always enter,
+ * owners always match, no allocation carries metadata, and a load that asks
+ * for a quota is rejected by wasm_runtime_load_args2_normalize() before any
+ * quota callback can run.
+ */
+
+static inline WASMAllocationQuotaToken *
+wasm_allocation_quota_token_create(const LoadArgs2 *args)
+{
+    (void)args;
+    return NULL;
+}
+
+static inline void
+wasm_allocation_quota_token_release(WASMAllocationQuotaToken *token)
+{
+    (void)token;
+}
+
+static inline bool
+wasm_allocation_quota_token_retain(WASMAllocationQuotaToken *token)
+{
+    (void)token;
+    return true;
+}
+
+static inline bool
+wasm_allocation_quota_token_reserve(WASMAllocationQuotaToken *token,
+                                    uint64_t bytes, uint32_t allocations)
+{
+    (void)token;
+    (void)bytes;
+    (void)allocations;
+    return true;
+}
+
+static inline void
+wasm_allocation_quota_token_refund(WASMAllocationQuotaToken *token,
+                                   uint64_t bytes, uint32_t allocations)
+{
+    (void)token;
+    (void)bytes;
+    (void)allocations;
+}
+
+static inline WASMAllocationQuotaToken *
+wasm_allocation_quota_get_current(void)
+{
+    return NULL;
+}
+
+static inline WASMAllocationQuotaToken *
+wasm_allocation_quota_set_current(WASMAllocationQuotaToken *token)
+{
+    (void)token;
+    return NULL;
+}
+
+static inline bool
+wasm_allocation_quota_scope_enter_for_load(WASMAllocationQuotaScope *scope,
+                                           const LoadArgs2 *args)
+{
+    if (scope)
+        memset(scope, 0, sizeof(*scope));
+    return args && !args->allocation_quota_attachment
+           && !args->allocation_quota_reserve && !args->allocation_quota_release
+           && !args->allocation_quota_attachment_retain
+           && !args->allocation_quota_attachment_release;
+}
+
+static inline bool
+wasm_allocation_quota_scope_enter_for_allocation(
+    WASMAllocationQuotaScope *scope, const void *allocation)
+{
+    if (scope)
+        memset(scope, 0, sizeof(*scope));
+    return allocation != NULL;
+}
+
+static inline bool
+wasm_allocation_quota_borrowed_scope_enter_for_allocation(
+    WASMAllocationQuotaBorrowedScope *scope, const void *allocation)
+{
+    if (scope)
+        memset(scope, 0, sizeof(*scope));
+    return allocation != NULL;
+}
+
+static inline void
+wasm_allocation_quota_borrowed_scope_leave(
+    WASMAllocationQuotaBorrowedScope *scope)
+{
+    (void)scope;
+}
+
+static inline bool
+wasm_allocation_quota_reservation_acquire_for_allocation(
+    WASMAllocationQuotaReservation *reservation, const void *allocation,
+    uint64_t bytes, uint32_t allocations)
+{
+    (void)bytes;
+    (void)allocations;
+    if (reservation)
+        memset(reservation, 0, sizeof(*reservation));
+    return allocation != NULL;
+}
+
+static inline void
+wasm_allocation_quota_reservation_release(
+    WASMAllocationQuotaReservation *reservation)
+{
+    (void)reservation;
+}
+
+static inline void
+wasm_allocation_quota_reservation_move(
+    WASMAllocationQuotaReservation *destination,
+    WASMAllocationQuotaReservation *source)
+{
+    if (destination && source) {
+        *destination = *source;
+        memset(source, 0, sizeof(*source));
+    }
+}
+
+static inline bool
+wasm_allocation_quota_thread_lease_enter_for_allocation(
+    WASMAllocationQuotaThreadLease *lease, const void *allocation)
+{
+    if (lease)
+        memset(lease, 0, sizeof(*lease));
+    return allocation != NULL;
+}
+
+static inline void
+wasm_allocation_quota_thread_lease_leave(WASMAllocationQuotaThreadLease *lease)
+{
+    (void)lease;
+}
+
+static inline void
+wasm_allocation_quota_thread_scope_unwind_current(void)
+{
+}
+
+static inline void
+wasm_allocation_quota_thread_lease_leave_current(void)
+{
+}
+
+static inline bool
+wasm_allocation_quota_allocations_share_owner(const void *first,
+                                              const void *second)
+{
+    return first != NULL && second != NULL;
+}
+
+static inline bool
+wasm_allocation_quota_allocation_matches_current(const void *allocation)
+{
+    return allocation != NULL;
+}
+
+static inline void
+wasm_allocation_quota_scope_leave(WASMAllocationQuotaScope *scope)
+{
+    (void)scope;
+}
+
+#endif /* WASM_ENABLE_ALLOCATION_QUOTA */
 
 #ifdef __cplusplus
 }

@@ -321,6 +321,13 @@
 #define WASM_ENABLE_MULTI_MODULE 0
 #endif
 
+/* Owner-attributed accounting of the runtime's native allocations for
+ * untrusted guests. Disabled builds keep the stock allocator path, add no
+ * per-allocation metadata, and reject loader settings that request a quota. */
+#ifndef WASM_ENABLE_ALLOCATION_QUOTA
+#define WASM_ENABLE_ALLOCATION_QUOTA 0
+#endif
+
 /* Enable wasm mini loader or not */
 #ifndef WASM_ENABLE_MINI_LOADER
 #define WASM_ENABLE_MINI_LOADER 0
