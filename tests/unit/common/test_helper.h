@@ -14,16 +14,36 @@
 #include <limits.h>
 #include <string>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
+/* The directory of the running test binary, which is also where the cmake
+   helpers put the suite's fixtures (DEST_DIR/OUTPUT is its
+   CMAKE_CURRENT_BINARY_DIR).  Not getcwd(): a suite may be started from
+   anywhere. */
 static inline std::string
 get_test_binary_dir()
 {
-    char cwd[PATH_MAX] = { 0 };
-    if (!getcwd(cwd, sizeof(cwd))) {
+    char path[PATH_MAX] = { 0 };
+
+#if defined(__APPLE__)
+    uint32_t size = sizeof(path);
+    if (_NSGetExecutablePath(path, &size) != 0) {
         return std::string();
     }
+#else
+    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (len <= 0) {
+        return std::string();
+    }
+    path[len] = '\0';
+#endif
 
-    return std::string(cwd);
+    std::string executable(path);
+    size_t slash = executable.find_last_of('/');
+    return slash == std::string::npos ? std::string(".")
+                                      : executable.substr(0, slash);
 }
 
 template<int Size = 512 * 1024>
@@ -130,7 +150,7 @@ class DummyExecEnv
     std::vector<uint8_t> my_wasm_buffer;
 
   private:
-    void construct(uint8_t *buf, uint32_t len)
+    void construct(uint8_t *buf, uint32_t len, uint32_t heap_size)
     {
         std::vector<uint8_t> buffer(buf, buf + len);
         my_wasm_buffer = buffer;
@@ -138,16 +158,24 @@ class DummyExecEnv
         mod_ = std::make_shared<WAMRModule>(my_wasm_buffer.data(),
                                             my_wasm_buffer.size());
         EXPECT_NE(mod_.get(), nullptr);
-        inst_ = std::make_shared<WAMRInstance>(*mod_);
+        inst_ = std::make_shared<WAMRInstance>(*mod_, 8192, heap_size);
         EXPECT_NE(inst_.get(), nullptr);
         dummy_exec_env_ = std::make_shared<WAMRExecEnv>(*inst_);
         EXPECT_NE(dummy_exec_env_.get(), nullptr);
     }
 
   public:
-    DummyExecEnv() { construct(dummy_wasm_buffer, sizeof(dummy_wasm_buffer)); }
+    DummyExecEnv()
+    {
+        construct(dummy_wasm_buffer, sizeof(dummy_wasm_buffer), 8192);
+    }
 
-    DummyExecEnv(uint8_t *buf, uint32_t len) { construct(buf, len); }
+    DummyExecEnv(uint8_t *buf, uint32_t len) { construct(buf, len, 8192); }
+
+    DummyExecEnv(uint8_t *buf, uint32_t len, uint32_t heap_size)
+    {
+        construct(buf, len, heap_size);
+    }
 
     DummyExecEnv(std::string filename)
     {
@@ -155,7 +183,7 @@ class DummyExecEnv
         std::vector<uint8_t> buffer(std::istreambuf_iterator<char>(wasm_file),
                                     {});
 
-        construct(buffer.data(), buffer.size());
+        construct(buffer.data(), buffer.size(), 8192);
     }
 
     ~DummyExecEnv() {}
@@ -301,28 +329,27 @@ class AppMemory
     uint32_t get_app_addr() const { return app_addr_; }
 };
 
-/* Put the data to app */
+/*
+ * Put the data to app.
+ *
+ * The size is always the caller's to state.  An earlier overload derived it
+ * from strlen() instead, which sized an output buffer by whatever happened to
+ * be in it -- for a zeroed buffer that is one byte, and the callee then wrote
+ * past it and corrupted the app heap.  Pass sizeof(buf) for a buffer the
+ * callee writes into, strlen(str) + 1 for a string it only reads.
+ */
 class AppData
 {
   private:
     wasm_exec_env_t exec_env_;
-    void *native_addr_;
     uint32_t app_addr_;
 
   public:
-    AppData(wasm_exec_env_t exec_env, void *data, uint32_t size)
+    AppData(wasm_exec_env_t exec_env, const void *data, uint64_t size)
       : exec_env_(exec_env)
     {
         app_addr_ = wasm_runtime_module_dup_data(get_module_inst(exec_env_),
                                                  (const char *)data, size);
-    }
-
-    AppData(wasm_exec_env_t exec_env, std::string str)
-      : exec_env_(exec_env)
-    {
-        app_addr_ = wasm_runtime_module_dup_data(get_module_inst(exec_env_),
-                                                 (const char *)str.c_str(),
-                                                 str.size() + 1);
     }
 
     ~AppData()

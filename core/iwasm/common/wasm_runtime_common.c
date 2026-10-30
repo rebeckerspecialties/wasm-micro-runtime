@@ -1640,6 +1640,36 @@ wasm_runtime_load_args2_quota_enabled(const LoadArgs2 *args)
            && args->allocation_quota_attachment_release;
 }
 
+wasm_allocation_quota_token_t
+wasm_runtime_allocation_quota_token_create(const LoadArgs2 *args)
+{
+    LoadArgs legacy_args;
+    char error_buf[128];
+
+    /* Reject an unknown layout before any quota callback can run. */
+    if (!wasm_runtime_load_args2_normalize(args, &legacy_args, error_buf,
+                                           (uint32)sizeof(error_buf))) {
+        return NULL;
+    }
+    if (!wasm_runtime_load_args2_quota_enabled(args)) {
+        return NULL;
+    }
+    return wasm_allocation_quota_token_create(args);
+}
+
+void
+wasm_runtime_allocation_quota_token_release(wasm_allocation_quota_token_t token)
+{
+    wasm_allocation_quota_token_release(token);
+}
+
+wasm_allocation_quota_token_t
+wasm_runtime_allocation_quota_token_set_current(
+    wasm_allocation_quota_token_t token)
+{
+    return wasm_allocation_quota_set_current(token);
+}
+
 bool
 wasm_runtime_load_args2_normalize(const LoadArgs2 *args, LoadArgs *legacy_args,
                                   char *error_buf, uint32 error_buf_size)
