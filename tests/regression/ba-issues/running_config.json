@@ -1916,6 +1916,354 @@
                 "stdout content": "0x2a:i32",
                 "description": "no heap buffer overflow from return_call when callee has a larger const pool than caller"
             }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980006
+            ],
+            "runtime": "iwasm-default",
+            "file": "const_table_overflow.wasm",
+            "mode": "fast-interp",
+            "options": "-f test",
+            "argument": "",
+            "expected return": {
+                "ret code": 0,
+                "stdout content": "0x1:i32",
+                "description": "heap-buffer-overflow in fast interp loader when const table overflow check fires prematurely due to duplicate accumulation"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980017
+            ],
+            "compile_options": {
+                "compiler": "wamrc",
+                "only compile": false,
+                "in file": "memory64_const_fold_load_wraparound.wasm",
+                "out file": "out.aot",
+                "options": "",
+                "expected return": {
+                    "ret code": 0,
+                    "stdout content": "Compile success",
+                    "description": "expected compile successfully"
+                }
+            },
+            "runtime": "iwasm-memory64-aot",
+            "file": "out.aot",
+            "mode": "aot",
+            "options": "-f _start",
+            "argument": "",
+            "expected return": {
+                "ret code": 1,
+                "stdout content": "Exception: out of bounds memory access",
+                "description": "memory64 constant-fold load must trap when value + offset wraps uint64"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980017
+            ],
+            "compile_options": {
+                "compiler": "wamrc",
+                "only compile": false,
+                "in file": "memory64_bulk_copy_const_wraparound.wasm",
+                "out file": "out.aot",
+                "options": "",
+                "expected return": {
+                    "ret code": 0,
+                    "stdout content": "Compile success",
+                    "description": "expected compile successfully"
+                }
+            },
+            "runtime": "iwasm-memory64-aot",
+            "file": "out.aot",
+            "mode": "aot",
+            "options": "-f _start",
+            "argument": "",
+            "expected return": {
+                "ret code": 1,
+                "stdout content": "Exception: out of bounds memory access",
+                "description": "memory64 constant-fold memory.copy must trap when src + len wraps uint64"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980017
+            ],
+            "compile_options": {
+                "compiler": "wamrc",
+                "only compile": false,
+                "in file": "memory64_bulk_copy_dynamic_wraparound.wasm",
+                "out file": "out.aot",
+                "options": "",
+                "expected return": {
+                    "ret code": 0,
+                    "stdout content": "Compile success",
+                    "description": "expected compile successfully"
+                }
+            },
+            "runtime": "iwasm-memory64-aot",
+            "file": "out.aot",
+            "mode": "aot",
+            "options": "-f _start",
+            "argument": "",
+            "expected return": {
+                "ret code": 1,
+                "stdout content": "Exception: out of bounds memory access",
+                "description": "memory64 dynamic memory.copy must trap when src + len wraps uint64"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980009
+            ],
+            "runtime": "iwasm-default-extended-const-expr",
+            "file": "extended_const_expr_null_deref.wasm",
+            "mode": "classic-interp",
+            "options": "",
+            "argument": "",
+            "expected return": {
+                "ret code": 255,
+                "stdout content": "WASM module load failed: illegal opcode or constant expression required or type mismatch",
+                "description": "load_init_expr fail path must not dereference the NULL expr of a leaf const left on the stack"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980011
+            ],
+            "runtime": "iwasm-default",
+            "file": "fd_renumber_self.wasm",
+            "mode": "classic-interp",
+            "options": "-f _start",
+            "argument": "",
+            "expected return": {
+                "ret code": 0,
+                "stdout content": "",
+                "description": "fd_renumber(fd, fd) succeeds instead of dereferencing NULL"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980011
+            ],
+            "runtime": "iwasm-default",
+            "file": "fd_renumber_used_leak.wasm",
+            "mode": "classic-interp",
+            "options": "-f _start",
+            "argument": "",
+            "expected return": {
+                "ret code": 0,
+                "stdout content": "",
+                "description": "fd_renumber keeps the fd table used count exact; later fd allocation does not hang"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980014
+            ],
+            "runtime": "iwasm-wasi-threads",
+            "file": "wasi_iovec_race.wasm",
+            "mode": "fast-interp",
+            "options": "",
+            "argument": "",
+            "expected return": {
+                "ret code": 0,
+                "stdout content": "race done",
+                "description": "libc-wasi iovec double fetch: sock_send sizes and copies from a snapshot of the iovec array while another wasm thread rewrites buf_len"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980015
+            ],
+            "runtime": "iwasm-default-wasi-disabled",
+            "file": "module_malloc_oob_offset.wasm",
+            "mode": "classic-interp",
+            "options": "--heap-size=0 -f to_test",
+            "argument": "",
+            "expected return": {
+                "ret code": 1,
+                "stdout content": "Exception: allocate memory failed",
+                "description": "offset returned by the module's exported malloc is range checked before the runtime writes to it"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980016
+            ],
+            "runtime": "iwasm-wasi-threads-classic-asan",
+            "file": "thread_start_result_i64x4.wasm",
+            "mode": "classic-interp",
+            "options": "",
+            "argument": "",
+            "expected return": {
+                "ret code": 0,
+                "stdout content": "Thread start function wasi_thread_start must be (param i32 i32) with no results",
+                "description": "wasi_thread_start with four i64 results is rejected at spawn, no host stack buffer overflow"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980016
+            ],
+            "runtime": "iwasm-pthread-classic-asan",
+            "file": "pthread_routine_multi_result.wasm",
+            "mode": "classic-interp",
+            "options": "-f _start",
+            "argument": "",
+            "expected return": {
+                "ret code": 0,
+                "stdout content": "Thread routine (table index 0) must be (param i32) (result i32)",
+                "description": "pthread routine with three i32 results is rejected at pthread_create, no host stack buffer overflow"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980013
+            ],
+            "runtime": "iwasm-default",
+            "file": "realloc_guest_ptr.wasm",
+            "mode": "classic-interp",
+            "options": "--heap-size=65536 -f to_test",
+            "argument": "",
+            "expected return": {
+                "ret code": 0,
+                "stdout content": "0x0:i32,0x0:i32,0x0:i32,0x0:i32",
+                "description": "realloc validates its guest pointer and rejects offsets outside the app heap"
+            }
+        },
+         {
+            "deprecated": false,
+            "ids": [
+                980013
+            ],
+            "compile_options": {
+                "compiler": "wamrc",
+                "only compile": false,
+                "in file": "realloc_guest_ptr.wasm",
+                "out file": "out.aot",
+                "options": "",
+                "expected return": {
+                    "ret code": 0,
+                    "stdout content": "Compile success",
+                    "description": "expected compile successfully"
+                }
+            },
+            "runtime": "iwasm-default",
+            "file": "out.aot",
+            "mode": "aot",
+            "options": "--heap-size=65536 -f to_test",
+            "argument": "",
+            "expected return": {
+                "ret code": 0,
+                "stdout content": "0x0:i32,0x0:i32,0x0:i32,0x0:i32",
+                "description": "AOT module: realloc validates its guest pointer and rejects offsets outside the app heap"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980013
+            ],
+            "runtime": "iwasm-default",
+            "file": "realloc_guest_ptr_trap.wasm",
+            "mode": "classic-interp",
+            "options": "--heap-size=65536 -f to_test",
+            "argument": "",
+            "expected return": {
+                "ret code": 1,
+                "stdout content": "Exception: out of bounds memory access",
+                "description": "a guest pointer beyond linear memory is rejected by the (*i)i signature validation"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980013
+            ],
+            "compile_options": {
+                "compiler": "wamrc",
+                "only compile": false,
+                "in file": "realloc_guest_ptr_trap.wasm",
+                "out file": "out.aot",
+                "options": "",
+                "expected return": {
+                    "ret code": 0,
+                    "stdout content": "Compile success",
+                    "description": "expected compile successfully"
+                }
+            },
+            "runtime": "iwasm-default",
+            "file": "out.aot",
+            "mode": "aot",
+            "options": "--heap-size=65536 -f to_test",
+            "argument": "",
+            "expected return": {
+                "ret code": 1,
+                "stdout content": "Exception: out of bounds memory access",
+                "description": "AOT module: a guest pointer beyond linear memory is rejected by the (*i)i signature validation"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980010
+            ],
+            "runtime": "iwasm-default-wasi-disabled",
+            "file": "libc_builtin_strtol_endptr_oob.wasm",
+            "mode": "fast-interp",
+            "options": "--heap-size=0 -f to_test",
+            "argument": "",
+            "expected return": {
+                "ret code": 0,
+                "stdout content": "0x64:i32",
+                "description": "strtol stores only the 4-byte guest offset through an endptr slot at the end of linear memory"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980010
+            ],
+            "runtime": "iwasm-default-wasi-disabled",
+            "file": "libc_builtin_strtol_endptr_oob.wasm",
+            "mode": "classic-interp",
+            "options": "--heap-size=0 -f to_test",
+            "argument": "",
+            "expected return": {
+                "ret code": 0,
+                "stdout content": "0x64:i32",
+                "description": "strtol stores only the 4-byte guest offset through an endptr slot at the end of linear memory"
+            }
+        },
+        {
+            "deprecated": false,
+            "ids": [
+                980012
+            ],
+            "runtime": "iwasm-default",
+            "file": "fd_readdir_device.wasm",
+            "mode": "classic-interp",
+            "options": "--dir=/dev",
+            "argument": "",
+            "expected return": {
+                "ret code": 54,
+                "stdout content": "",
+                "description": "fd_readdir on a character device returns ENOTDIR instead of using the directory stream"
+            }
         }
     ]
 }

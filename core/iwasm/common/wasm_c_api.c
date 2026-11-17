@@ -1016,6 +1016,12 @@ wasm_store_delete(wasm_store_t *store)
     }
 
     DEINIT_VEC(store->instances, wasm_instance_vec_delete);
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if (store->link_domain) {
+        wasm_runtime_free(store->link_domain->functions);
+        wasm_runtime_free(store->link_domain);
+    }
+#endif
     DEINIT_VEC(store->modules, wasm_module_vec_delete);
     if (store->foreigns) {
         destroy_store_foreigns(store);
@@ -4928,6 +4934,19 @@ wasm_table_get(const wasm_table_t *table, wasm_table_size_t index)
     else
 #endif
     {
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+        if (((WASMModuleInstance *)table->inst_comm_rt)->e->c_api_domain) {
+            WASMFunctionInstance *function = wasm_c_api_resolve_ref(
+                (WASMModuleInstance *)table->inst_comm_rt, ref_idx);
+            if (!function)
+                goto done;
+            result = wasm_ref_new_internal(
+                table->store, WASM_REF_func,
+                (uint32)(function - function->c_api_owner->e->functions),
+                (WASMModuleInstanceCommon *)function->c_api_owner);
+        }
+        else
+#endif
         result = wasm_ref_new_internal(table->store, WASM_REF_func, ref_idx,
                                        ref_inst_comm_rt);
     }
@@ -5052,6 +5071,21 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index, wasm_ref_t *ref)
     else
 #endif
     {
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+        if (ref) {
+            WASMModuleInstance *owner = (WASMModuleInstance *)ref->inst_comm_rt;
+            if (ref->store != table->store || !owner
+                || owner->module_type != Wasm_Module_Bytecode
+                || owner->e->c_api_domain
+                       != ((WASMModuleInstance *)table->inst_comm_rt)
+                              ->e->c_api_domain
+                || ref->ref_idx_rt >= owner->e->function_count)
+                return false;
+            *p_ref_idx = wasm_c_api_function_ref(owner, ref->ref_idx_rt);
+        }
+        else
+            *p_ref_idx = NULL_REF;
+#else
         if (ref) {
             if (NULL_REF != ref->ref_idx_rt) {
 #if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0
@@ -5096,6 +5130,7 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index, wasm_ref_t *ref)
             }
 #endif
         }
+#endif
     }
 
     result = true;
@@ -6018,6 +6053,10 @@ failed:
     return false;
 }
 
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+#include "wasm_c_api_linking.inc"
+#endif
+
 wasm_instance_t *
 wasm_instance_new(wasm_store_t *store, const wasm_module_t *module,
                   const wasm_extern_vec_t *imports, own wasm_trap_t **trap)
@@ -6055,6 +6094,11 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
     uint32 import_binding_snapshot_count = 0;
     uint64 total_size;
     bool build_exported = false;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    WASMCApiCoreImports bindings = { 0 };
+    struct InstantiationArgs2 core_args;
+    bool store_owned = false;
+#endif
 
     bh_assert(singleton_engine);
 
@@ -6079,13 +6123,58 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
         goto failed;
     }
 
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if ((*module)->module_type != Wasm_Module_Bytecode
+        || !c_api_core_imports_prepare(store, MODULE_INTERP(module), imports,
+                                       &bindings, sub_error_buf,
+                                       sizeof(sub_error_buf)))
+        goto failed;
+    if (imports && imports->num_elems) {
+        wasm_extern_vec_copy(&instance->retained_imports, imports);
+        if (instance->retained_imports.num_elems != imports->num_elems) {
+            c_api_core_imports_destroy(&bindings);
+            snprintf(sub_error_buf, sizeof(sub_error_buf),
+                     "Failed to retain core imports");
+            goto failed;
+        }
+    }
+    wasm_runtime_instantiation_args_set_defaults(&core_args);
+    core_args.v1 = *inst_args;
+    core_args.c_api_imports = &bindings;
+    /* Reserve ownership before active segments or start functions can publish
+       references. A failed instantiation does not undo store side effects. */
+    if (!host_vector_append((Vector *)store->instances, &instance)) {
+        c_api_core_imports_destroy(&bindings);
+        snprintf(sub_error_buf, sizeof(sub_error_buf),
+                 "Failed to retain core instance");
+        goto failed;
+    }
+    store_owned = true;
+    bindings.domain->count += MODULE_INTERP(module)->import_function_count
+                              + MODULE_INTERP(module)->function_count;
+    instance->inst_comm_rt = wasm_runtime_instantiate_ex2(
+        *module, &core_args, sub_error_buf, sizeof(sub_error_buf));
+    if (!instance->inst_comm_rt) {
+        instance->inst_comm_rt =
+            (WASMModuleInstanceCommon *)bindings.failed_instance;
+        c_api_core_imports_destroy(&bindings);
+        goto failed;
+    }
+    c_api_core_imports_destroy(&bindings);
+    if (!instance->inst_comm_rt)
+        goto failed;
+    if (!wasm_runtime_create_exec_env_singleton(instance->inst_comm_rt)) {
+        snprintf(sub_error_buf, sizeof(sub_error_buf),
+                 "Failed to create exec env singleton");
+        goto failed;
+    }
+#else
     if (!snapshot_import_bindings(imports, &import_binding_snapshots,
                                   &import_binding_snapshot_count)) {
         snprintf(sub_error_buf, sizeof(sub_error_buf),
                  "Failed to snapshot import bindings");
         goto failed;
     }
-
     /* executes the instantiate-time linking if provided */
     if (imports) {
         if (!do_link(instance, module, imports)) {
@@ -6207,6 +6296,8 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
         }
     }
 
+#endif /* WASM_ENABLE_C_API_CORE_LINKING */
+
     /* build the exports list */
 #if WASM_ENABLE_INTERP != 0
     if (instance->inst_comm_rt->module_type == Wasm_Module_Bytecode) {
@@ -6263,11 +6354,13 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
     }
 
     /* add it to a watching list in store */
+#if WASM_ENABLE_C_API_CORE_LINKING == 0
     if (!host_vector_append((Vector *)store->instances, &instance)) {
         snprintf(sub_error_buf, sizeof(sub_error_buf),
                  "Failed to add to store instances");
         goto failed;
     }
+#endif
 
     WASM_C_DUMP_PROC_MEM();
 
@@ -6288,7 +6381,10 @@ failed:
         wasm_byte_vec_delete(&message);
     }
     LOG_DEBUG("%s", error_buf);
-    wasm_instance_delete_internal(instance);
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if (!store_owned)
+#endif
+        wasm_instance_delete_internal(instance);
     wasm_allocation_quota_scope_leave(&scope);
     return NULL;
 }
@@ -6319,6 +6415,9 @@ wasm_instance_delete_internal(wasm_instance_t *instance)
         wasm_runtime_deinstantiate(instance->inst_comm_rt);
         instance->inst_comm_rt = NULL;
     }
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    wasm_extern_vec_delete(&instance->retained_imports);
+#endif
     wasm_runtime_free(instance);
     wasm_allocation_quota_scope_leave(&scope);
 }

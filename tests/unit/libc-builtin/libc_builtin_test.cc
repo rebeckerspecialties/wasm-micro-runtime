@@ -777,29 +777,45 @@ TEST_F(LibcBuiltinTest, calloc)
 TEST_F(LibcBuiltinTest, realloc)
 {
     unsigned int ptr = 0;
-
-    // ptr = 0;
-    // EXPECT_EQ(CALL_FUNC(realloc, ptr, 1024), 0);
-
-    // ptr = 1;
-    // EXPECT_GT(CALL_FUNC(realloc, ptr, 1024), 0);
-
-    // ptr = 3;
-    // EXPECT_GT(CALL_FUNC(realloc, ptr, 1024), 0);
+    void *native_ptr = NULL;
+    char *data = NULL;
 
     /* If ptr is NULL, then the call is equivalent to malloc(size), for all
      * values of size */
-    ptr = CALL_FUNC(realloc, ptr, 1024);
-    EXPECT_EQ(ptr, ptr);
-    EXPECT_EQ(CALL_FUNC(realloc, ptr, 10), ptr);
-    EXPECT_EQ(CALL_FUNC(realloc, ptr, 15), ptr);
+    ptr = CALL_FUNC(realloc, NULL, 1024);
+    EXPECT_GT(ptr, 0);
 
-    ptr = CALL_FUNC(realloc, ptr, 2048);
-    EXPECT_EQ(ptr, ptr);
+    native_ptr = dummy_exec_env.app_to_native(ptr);
+    data = (char *)native_ptr;
+    memset(data, 0x5a, 16);
+
+    /* grow in place / move: content must be preserved */
+    EXPECT_EQ(CALL_FUNC(realloc, native_ptr, 10), ptr);
+    EXPECT_EQ(CALL_FUNC(realloc, native_ptr, 15), ptr);
+    for (int i = 0; i < 10; i++)
+        EXPECT_EQ(data[i], 0x5a);
+
+    ptr = CALL_FUNC(realloc, native_ptr, 2048);
+    EXPECT_GT(ptr, 0);
+    native_ptr = dummy_exec_env.app_to_native(ptr);
+    data = (char *)native_ptr;
+    for (int i = 0; i < 10; i++)
+        EXPECT_EQ(data[i], 0x5a);
+
+    /* a valid address inside linear memory but outside the app heap is
+       rejected by the module heap check, without raising an exception */
+    native_ptr = dummy_exec_env.app_to_native(1);
+    EXPECT_EQ(CALL_FUNC(realloc, native_ptr, 1024), 0);
+    EXPECT_EQ(dummy_exec_env.get_exception(), nullptr);
+
+    native_ptr = dummy_exec_env.app_to_native(3);
+    EXPECT_EQ(CALL_FUNC(realloc, native_ptr, 1024), 0);
+    EXPECT_EQ(dummy_exec_env.get_exception(), nullptr);
 
     /* If size is equal to zero, and ptr is not NULL, then
        the call is equivalent to free(ptr) */
-    CALL_FUNC(realloc, ptr, 0);
+    native_ptr = dummy_exec_env.app_to_native(ptr);
+    CALL_FUNC(realloc, native_ptr, 0);
 }
 
 TEST_F(LibcBuiltinTest, free)
@@ -1014,6 +1030,177 @@ TEST_F(LibcBuiltinTest, strtoul)
     char *str_native_addr = (char *)dummy_exec_env.app_to_native(str_app_addr);
     EXPECT_NE(str_native_addr, nullptr);
     EXPECT_STREQ(str_native_addr, "cend$3");
+}
+
+/* Linear memory end (app offset), used to place endptr at a boundary */
+static uint32_t
+get_memory_end_app(wasm_exec_env_t exec_env)
+{
+    uint64_t end = 0;
+    wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
+
+    EXPECT_TRUE(wasm_runtime_get_app_addr_range(inst, 0, NULL, &end));
+    return (uint32_t)end;
+}
+
+TEST_F(LibcBuiltinTest, strtol_endptr_writes_only_slot)
+{
+    char str[] = "100";
+    AppData src_app{ dummy_exec_env.get(), str, sizeof(str) };
+    AppMemory slot_app{ dummy_exec_env.get(), 8 };
+    uint32_t *slot = (uint32_t *)slot_app.get_native_addr();
+    uint32_t src_app_addr = dummy_exec_env.native_to_app(src_app.get_native_addr());
+
+    slot[0] = 0;
+    slot[1] = 0x41414141;
+
+    EXPECT_EQ(CALL_FUNC(strtol, (char *)src_app.get_native_addr(),
+                        (char **)slot, 10),
+              100);
+    EXPECT_EQ(slot[0], src_app_addr + 3);
+    /* The high word must not expose the host pointer */
+    EXPECT_EQ(slot[1], 0x41414141u);
+}
+
+TEST_F(LibcBuiltinTest, strtoul_endptr_writes_only_slot)
+{
+    char str[] = "100";
+    AppData src_app{ dummy_exec_env.get(), str, sizeof(str) };
+    AppMemory slot_app{ dummy_exec_env.get(), 8 };
+    uint32_t *slot = (uint32_t *)slot_app.get_native_addr();
+    uint32_t src_app_addr = dummy_exec_env.native_to_app(src_app.get_native_addr());
+
+    slot[0] = 0;
+    slot[1] = 0x41414141;
+
+    EXPECT_EQ(CALL_FUNC(strtoul, (char *)src_app.get_native_addr(),
+                        (char **)slot, 10),
+              100u);
+    EXPECT_EQ(slot[0], src_app_addr + 3);
+    EXPECT_EQ(slot[1], 0x41414141u);
+}
+
+TEST_F(LibcBuiltinTest, strtol_endptr_guest_null)
+{
+    char str[] = "20";
+    AppData src_app{ dummy_exec_env.get(), str, sizeof(str) };
+    /* guest offset 0 is NULL: no write-back, no validation */
+    char *base = (char *)dummy_exec_env.app_to_native(0);
+    uint8_t saved[8];
+
+    memcpy(saved, base, sizeof(saved));
+    EXPECT_EQ(CALL_FUNC(strtol, (char *)src_app.get_native_addr(),
+                        (char **)base, 10),
+              20);
+    EXPECT_EQ(dummy_exec_env.get_exception(), nullptr);
+    EXPECT_EQ(memcmp(saved, base, sizeof(saved)), 0);
+}
+
+TEST_F(LibcBuiltinTest, strtoul_endptr_guest_null)
+{
+    char str[] = "20";
+    AppData src_app{ dummy_exec_env.get(), str, sizeof(str) };
+    char *base = (char *)dummy_exec_env.app_to_native(0);
+    uint8_t saved[8];
+
+    memcpy(saved, base, sizeof(saved));
+    EXPECT_EQ(CALL_FUNC(strtoul, (char *)src_app.get_native_addr(),
+                        (char **)base, 10),
+              20u);
+    EXPECT_EQ(dummy_exec_env.get_exception(), nullptr);
+    EXPECT_EQ(memcmp(saved, base, sizeof(saved)), 0);
+}
+
+TEST_F(LibcBuiltinTest, strtol_endptr_at_memory_end)
+{
+    char str[] = "7";
+    AppData src_app{ dummy_exec_env.get(), str, sizeof(str) };
+    uint32_t src_app_addr = dummy_exec_env.native_to_app(src_app.get_native_addr());
+    uint32_t end_app = get_memory_end_app(dummy_exec_env.get());
+    /* Slot ends exactly at the memory end: passes the 4-byte check */
+    char *slot = (char *)dummy_exec_env.app_to_native(end_app - 4);
+    uint8_t saved[4];
+
+    memcpy(saved, slot, sizeof(saved));
+    EXPECT_EQ(CALL_FUNC(strtol, (char *)src_app.get_native_addr(),
+                        (char **)slot, 10),
+              7);
+    EXPECT_EQ(dummy_exec_env.get_exception(), nullptr);
+    EXPECT_EQ(*(uint32_t *)slot, src_app_addr + 1);
+    memcpy(slot, saved, sizeof(saved));
+}
+
+TEST_F(LibcBuiltinTest, strtoul_endptr_at_memory_end)
+{
+    char str[] = "7";
+    AppData src_app{ dummy_exec_env.get(), str, sizeof(str) };
+    uint32_t src_app_addr = dummy_exec_env.native_to_app(src_app.get_native_addr());
+    uint32_t end_app = get_memory_end_app(dummy_exec_env.get());
+    char *slot = (char *)dummy_exec_env.app_to_native(end_app - 4);
+    uint8_t saved[4];
+
+    memcpy(saved, slot, sizeof(saved));
+    EXPECT_EQ(CALL_FUNC(strtoul, (char *)src_app.get_native_addr(),
+                        (char **)slot, 10),
+              7u);
+    EXPECT_EQ(dummy_exec_env.get_exception(), nullptr);
+    EXPECT_EQ(*(uint32_t *)slot, src_app_addr + 1);
+    memcpy(slot, saved, sizeof(saved));
+}
+
+TEST_F(LibcBuiltinTest, strtol_endptr_out_of_bounds)
+{
+    char str[] = "7";
+    AppData src_app{ dummy_exec_env.get(), str, sizeof(str) };
+    uint32_t end_app = get_memory_end_app(dummy_exec_env.get());
+    /* Only 3 bytes left: validation must fail and nothing is written */
+    char *slot = (char *)dummy_exec_env.app_to_native(end_app - 3);
+    uint8_t saved[3];
+
+    memcpy(saved, slot, sizeof(saved));
+    EXPECT_EQ(CALL_FUNC(strtol, (char *)src_app.get_native_addr(),
+                        (char **)slot, 10),
+              0);
+    EXPECT_STREQ(dummy_exec_env.get_exception(),
+                 "Exception: out of bounds memory access");
+    dummy_exec_env.clear_exception();
+    EXPECT_EQ(memcmp(saved, slot, sizeof(saved)), 0);
+}
+
+TEST_F(LibcBuiltinTest, strtoul_endptr_out_of_bounds)
+{
+    char str[] = "7";
+    AppData src_app{ dummy_exec_env.get(), str, sizeof(str) };
+    uint32_t end_app = get_memory_end_app(dummy_exec_env.get());
+    char *slot = (char *)dummy_exec_env.app_to_native(end_app - 3);
+    uint8_t saved[3];
+
+    memcpy(saved, slot, sizeof(saved));
+    EXPECT_EQ(CALL_FUNC(strtoul, (char *)src_app.get_native_addr(),
+                        (char **)slot, 10),
+              0u);
+    EXPECT_STREQ(dummy_exec_env.get_exception(),
+                 "Exception: out of bounds memory access");
+    dummy_exec_env.clear_exception();
+    EXPECT_EQ(memcmp(saved, slot, sizeof(saved)), 0);
+}
+
+TEST_F(LibcBuiltinTest, strtoul_endptr_negative)
+{
+    char str[] = "-20";
+    AppData src_app{ dummy_exec_env.get(), str, sizeof(str) };
+    AppMemory slot_app{ dummy_exec_env.get(), 8 };
+    uint32_t *slot = (uint32_t *)slot_app.get_native_addr();
+    uint32_t src_app_addr = dummy_exec_env.native_to_app(src_app.get_native_addr());
+
+    slot[0] = 0;
+    slot[1] = 0x41414141;
+
+    EXPECT_EQ(CALL_FUNC(strtoul, (char *)src_app.get_native_addr(),
+                        (char **)slot, 10),
+              (uint32_t)-20);
+    EXPECT_EQ(slot[0], src_app_addr + 3);
+    EXPECT_EQ(slot[1], 0x41414141u);
 }
 
 TEST_F(LibcBuiltinTest, memchr)

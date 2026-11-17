@@ -6579,7 +6579,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         bh_assert(elem_idx < module->module->table_seg_count);
 
                         read_leb_uint32(frame_ip, frame_ip_end, tbl_idx);
-                        bh_assert(tbl_idx < module->module->table_count);
+                        bh_assert(tbl_idx < module->table_count);
 
                         tbl_inst = wasm_get_table_inst(module, tbl_idx);
 #if WASM_ENABLE_MEMORY64 != 0

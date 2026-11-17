@@ -417,6 +417,9 @@ fd_object_new(__wasi_filetype_t type, bool is_stdio, struct fd_object **fo)
     (*fo)->type = type;
     (*fo)->file_handle = os_get_invalid_handle();
     (*fo)->is_stdio = is_stdio;
+    // The memory may come from a released directory object, so the stale
+    // DIR handle must not survive into a non-directory object.
+    (*fo)->directory.handle = os_get_invalid_dir_stream();
     return 0;
 }
 
@@ -567,6 +570,7 @@ fd_object_release(wasm_exec_env_t env, struct fd_object *fo)
                 mutex_destroy(&fo->directory.lock);
                 if (os_is_dir_stream_valid(&fo->directory.handle)) {
                     error = os_closedir(fo->directory.handle);
+                    fo->directory.handle = os_get_invalid_dir_stream();
                     break;
                 }
                 // Fallthrough.
@@ -620,7 +624,6 @@ fd_table_insert_existing(struct fd_table *ft, __wasi_fd_t in,
             fd_object_release(NULL, fo);
             return false;
         }
-        fo->directory.handle = os_get_invalid_dir_stream();
     }
 
     // Grow the file descriptor table if needed.
@@ -705,7 +708,6 @@ fd_table_insert_fd(wasm_exec_env_t exec_env, struct fd_table *ft,
             fd_object_release(exec_env, fo);
             return (__wasi_errno_t)-1;
         }
-        fo->directory.handle = os_get_invalid_dir_stream();
     }
     return fd_table_insert(exec_env, ft, fo, rights_base, rights_inheriting,
                            out);
@@ -929,6 +931,11 @@ wasmtime_ssp_fd_renumber(wasm_exec_env_t exec_env, struct fd_table *curfds,
         rwlock_unlock(&ft->lock);
         return error;
     }
+    if (from == to) {
+        rwlock_unlock(&prestats->lock);
+        rwlock_unlock(&ft->lock);
+        return __WASI_ESUCCESS;
+    }
     struct fd_entry *fe_to;
     error = fd_table_get_entry(ft, to, 0, 0, &fe_to);
     if (error != 0) {
@@ -947,7 +954,6 @@ wasmtime_ssp_fd_renumber(wasm_exec_env_t exec_env, struct fd_table *curfds,
     // Remove the old fd from the file descriptor table.
     fd_table_detach(ft, from, &fo);
     fd_object_release(exec_env, fo);
-    --ft->used;
 
     // Handle renumbering of any preopened resources
     struct fd_prestat *prestat_from;
@@ -1779,6 +1785,13 @@ wasmtime_ssp_fd_readdir(wasm_exec_env_t exec_env, struct fd_table *curfds,
         fd_object_get(curfds, &fo, fd, __WASI_RIGHT_FD_READDIR, 0);
     if (error != 0) {
         return error;
+    }
+
+    // FD_READDIR is also granted to character and block devices, which have
+    // no directory stream. Reject them before touching directory state.
+    if (fo->type != __WASI_FILETYPE_DIRECTORY) {
+        fd_object_release(exec_env, fo);
+        return __WASI_ENOTDIR;
     }
 
     // Create a directory handle if none has been opened yet.

@@ -6,6 +6,26 @@ cmake_minimum_required(VERSION 3.14)
 project(unit-test)
 option(FULL_TEST "Build all unit tests including llm-enhanced-test" OFF)
 
+# By default, disable non-classic runtime modes. Users can enable one runtime
+# mode by setting the corresponding option.
+foreach(_unit_option WAMR_BUILD_FAST_INTERP WAMR_BUILD_JIT
+                     WAMR_BUILD_AOT WAMR_BUILD_FAST_JIT)
+  if(NOT DEFINED ${_unit_option})
+    set(${_unit_option} 0 CACHE BOOL "Unit test runtime mode")
+  endif()
+endforeach()
+
+if(NOT DEFINED WAMR_BUILD_INTERP)
+  set(WAMR_BUILD_INTERP 1 CACHE BOOL "Build classic interpreter")
+endif()
+
+# Unit tests build without logging by default; the log is not under test.
+if(NOT DEFINED WAMR_BUILD_LOG)
+  set(WAMR_BUILD_LOG 0 CACHE BOOL "Enable runtime logging")
+endif()
+
+unset(_unit_option)
+
 # Yes. To solve the compatibility issue with CMAKE (>= 4.0), we need to update
 # our `cmake_minimum_required()` to 3.5. However, there are CMakeLists.txt
 # from 3rd parties that we should not alter. Therefore, in addition to
@@ -14,30 +34,30 @@ option(FULL_TEST "Build all unit tests including llm-enhanced-test" OFF)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 SET(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_STANDARD 17)
 
-#TODO: modularization me
 # Detect Hosting target info
 string(TOLOWER ${CMAKE_HOST_SYSTEM_NAME} WAMR_BUILD_PLATFORM)
 # Set WAMR_BUILD_TARGET, currently values supported:
 # "X86_64", "AMD_64", "X86_32", "AARCH64[sub]", "ARM[sub]", "THUMB[sub]",
 # "MIPS", "XTENSA", "RISCV64[sub]", "RISCV32[sub]"
-if (NOT DEFINED WAMR_BUILD_TARGET)
-  if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)")
-    set (WAMR_BUILD_TARGET "AARCH64")
-  elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")
-    set (WAMR_BUILD_TARGET "RISCV64")
-  elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(NOT DEFINED WAMR_BUILD_TARGET)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)")
+    set(WAMR_BUILD_TARGET "AARCH64")
+  elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")
+    set(WAMR_BUILD_TARGET "RISCV64")
+  elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
     # Build as X86_64 by default in 64-bit platform
-    set (WAMR_BUILD_TARGET "X86_64")
-  elseif (CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(WAMR_BUILD_TARGET "X86_64")
+  elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
     # Build as X86_32 by default in 32-bit platform
-    set (WAMR_BUILD_TARGET "X86_32")
-  else ()
+    set(WAMR_BUILD_TARGET "X86_32")
+  else()
     message(SEND_ERROR "Unsupported build target platform!")
-  endif ()
-endif ()
+  endif()
+endif()
 
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS}")
@@ -55,7 +75,7 @@ if(WAMR_BUILD_TARGET STREQUAL "X86_32")
 endif()
 
 # Fetch Google test
-include (FetchContent)
+include(FetchContent)
 if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.24")
   FetchContent_Declare (
     googletest
@@ -94,49 +114,59 @@ FetchContent_MakeAvailable(cmocka)
 include(GoogleTest)
 enable_testing()
 
-set(COMPONENT_MODEL_UNIT_TEST_FOLDERS
-  component
-  component-instantiation
-  component-execution
-  canonical-abi
-  canonical-execution
-  libc-wasi-p2
-  wave-parser
-)
+set(WAMR_UNIT_COMMON_HELPERS_ONLY TRUE)
+include(${CMAKE_CURRENT_LIST_DIR}/unit_common.cmake)
+unset(WAMR_UNIT_COMMON_HELPERS_ONLY)
 
+# Validate and report the single runtime mode before configuring any suite.
+wamr_unit_test_get_current_run_mode(_unit_test_run_mode)
+message(STATUS "Unit test runtime mode: ${_unit_test_run_mode}")
+unset(_unit_test_run_mode)
+
+set(COMPONENT_MODEL_UNIT_TEST_FOLDERS
+  component component-instantiation component-execution canonical-abi
+  canonical-execution libc-wasi-p2 wave-parser)
 if(DEFINED UNITTEST_FOLDER AND NOT "${UNITTEST_FOLDER}" STREQUAL "")
   if(WAMR_BUILD_TARGET STREQUAL "X86_32"
      AND UNITTEST_FOLDER IN_LIST COMPONENT_MODEL_UNIT_TEST_FOLDERS)
-    message(FATAL_ERROR
-      "${UNITTEST_FOLDER} requires the 64-bit Preview 2 native-call bridge")
+    message(FATAL_ERROR "${UNITTEST_FOLDER} requires the 64-bit Preview 2 native-call bridge")
   endif()
   add_subdirectory("${UNITTEST_FOLDER}")
   return()
 endif()
-
-add_subdirectory(wasm-vm)
-add_subdirectory(interpreter)
-add_subdirectory(wasm-c-api)
-add_subdirectory(libc-builtin)
-add_subdirectory(shared-utils)
-add_subdirectory(linear-memory-wasm)
-add_subdirectory(linear-memory-aot)
-add_subdirectory(linux-perf)
-add_subdirectory(gc)
-add_subdirectory(unsupported-features)
-add_subdirectory(exception-handling)
-add_subdirectory(relaxed-simd)
-add_subdirectory(running-modes)
-
-# The Preview 2 native-call bridge currently uses the 64-bit invokeNative ABI.
-# Keep the component runtime suites out of X86_32 until that bridge has a
-# dedicated 32-bit argument/result implementation.
 if(NOT WAMR_BUILD_TARGET STREQUAL "X86_32")
   foreach(component_test_folder IN LISTS COMPONENT_MODEL_UNIT_TEST_FOLDERS)
     add_subdirectory("${component_test_folder}")
   endforeach()
 endif()
-add_subdirectory(mem-alloc)
+add_subdirectory(relaxed-simd)
+add_subdirectory(unsupported-features)
+
+add_subdirectory(exception-handling)
+add_subdirectory(gc)
+add_subdirectory(instruction-metering)
+add_subdirectory(interpreter)
+add_subdirectory(libc-builtin)
+add_subdirectory(libc-wasi/fd-renumber)
+add_subdirectory(libc-wasi/double-fetch)
+add_subdirectory(libc-wasi/fd-readdir)
+add_subdirectory(linear-memory-wasm)
+add_subdirectory(linear-memory-aot)
+add_subdirectory(linear-memory/memory32-sw)
+add_subdirectory(linear-memory/memory32-sw-shared-heap)
+add_subdirectory(linux-perf)
+add_subdirectory(mem-alloc/base)
+add_subdirectory(mem-alloc/gc)
+add_subdirectory(running-modes)
+add_subdirectory(shared-utils)
+add_subdirectory(table/general-32)
+add_subdirectory(table/general-64)
+add_subdirectory(thread/pthread)
+add_subdirectory(thread/wasi-thread)
+add_subdirectory(wasm-application/base)
+add_subdirectory(wasm-c-api/base)
+add_subdirectory(wasm-c-api/dump-call-stack)
+add_subdirectory(wasm-vm)
 
 if(FULL_TEST)
   message(STATUS "FULL_TEST=ON: include llm-enhanced-test")
@@ -145,30 +175,21 @@ else()
   message(STATUS "FULL_TEST=OFF: exclude llm-enhanced-test")
 endif()
 
-if(WAMR_BUILD_TARGET STREQUAL "X86_64")
+if(WAMR_BUILD_TARGET STREQUAL "X86_64" OR
+   WAMR_BUILD_TARGET STREQUAL "AARCH64")
   add_subdirectory(aot-stack-frame)
 
   # should enable 32-bit llvm when X86_32
-  add_subdirectory (aot)
-  add_subdirectory (custom-section)
-  add_subdirectory (compilation)
+  add_subdirectory(aot)
+  add_subdirectory(custom-section)
+  add_subdirectory(compilation)
+  add_subdirectory(memory64/atomic)
+  add_subdirectory(memory64/base)
+  add_subdirectory(runtime-common)
+  add_subdirectory(shared-heap)
 
-  add_subdirectory (memory64)
-  add_subdirectory (shared-heap)
-
-  # HW_BOUND_CHECK is not supported on X86_32
-  add_subdirectory (runtime-common)
+  add_subdirectory(linear-memory/memory32-hw)
+  add_subdirectory(linear-memory/memory32-hw-shared-heap)
+  add_subdirectory(linear-memory/memory64-sw)
+  add_subdirectory(linear-memory/memory64-sw-shared-heap)
 endif()
-
-if(WAMR_BUILD_TARGET STREQUAL "AARCH64")
-  add_subdirectory(aot-stack-frame)
-
-  add_subdirectory (aot)
-  add_subdirectory (custom-section)
-  add_subdirectory (compilation)
-
-  add_subdirectory (memory64)
-  add_subdirectory (shared-heap)
-
-  add_subdirectory (runtime-common)
-endif ()

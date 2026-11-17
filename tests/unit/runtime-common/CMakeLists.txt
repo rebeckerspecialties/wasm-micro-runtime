@@ -1,71 +1,74 @@
 # Copyright (C) 2019 Intel Corporation.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-cmake_minimum_required(VERSION 3.14)
+wamr_unit_test_suite_run_modes(runtime-common MODES classic-interp aot)
+if(NOT WAMR_UNIT_TEST_SUITE_ENABLED)
+  return()
+endif()
 
-project(test-runtime-common)
-
-add_definitions(-DRUN_ON_LINUX)
-
-set (WAMR_BUILD_AOT 1)
-set (WAMR_BUILD_FAST_INTERP 0)
-set (WAMR_BUILD_INTERP 1)
-set (WAMR_BUILD_JIT 0)
-set (WAMR_BUILD_LIBC_WASI 0)
-set (WAMR_BUILD_LIBC_BUILTIN 1)
-set (WAMR_BUILD_APP_FRAMEWORK 0)
-set (WAMR_BUILD_MULTI_MODULE 1)
+set(WAMR_BUILD_MULTI_MODULE 1)
 
 include(../unit_common.cmake)
 
-find_package(LLVM REQUIRED CONFIG)
-include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
-add_definitions(${LLVM_DEFINITIONS})
-
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+include_directories(${IWASM_DIR}/aot)
 
 file(GLOB_RECURSE source_all ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
 
-set(UNIT_SOURCE ${source_all})
-
 set(unit_test_sources
-  ${UNIT_SOURCE}
+  ${source_all}
   ${WAMR_RUNTIME_LIB_SOURCE}
   ${UNCOMMON_SHARED_SOURCE}
 )
 
 add_executable(runtime_common_test ${unit_test_sources})
-
-# Enable deterministic failure injection for the POSIX thread-start
-# handshake regression. The seam is compiled out of product builds.
-if(NOT WAMR_BUILD_PLATFORM STREQUAL "windows")
-  target_compile_definitions(runtime_common_test
-    PRIVATE WAMR_POSIX_THREAD_START_TEST=1)
-endif()
-
 target_link_libraries(runtime_common_test ${LLVM_AVAILABLE_LIBS} gtest_main)
 
-# Ensure that aot compiled is completed before linear_memory_test_aot is built
-add_custom_command(OUTPUT ${CMAKE_CURRENT_LIST_DIR}/wasm-apps/main.aot
-  COMMAND ./build_aot.sh
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/build_aot.sh
-  COMMENT "Executing script to compile aot files"
-  VERBATIM
+# main.wasm has no .wat/.c source to compile it from; main.aot is generated
+# from it with wamrc at build time, because an AOT file is tied to both the
+# target arch and the AOT format version, so it cannot be checked in.  Both
+# are read relative to the test working directory.
+wamr_unit_test_copy_wasm_files(runtime_common_test
+  FILES ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps/main.wasm
+  DEST_DIR ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-add_custom_target(
-  BuildAot ALL
-  DEPENDS ${CMAKE_CURRENT_LIST_DIR}/wasm-apps/main.aot
+# module_malloc.wasm exports malloc/free for the wasm_runtime_module_malloc()
+# and wasm_runtime_module_free() guest-offset tests.
+wamr_unit_test_compile_wat_to_wasm(
+  TARGET runtime_common_test
+  SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps/module_malloc.wat
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/module_malloc.wasm
 )
 
-add_dependencies(runtime_common_test BuildAot)
-
-add_custom_command(TARGET runtime_common_test POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy
-    ${CMAKE_CURRENT_LIST_DIR}/wasm-apps/main.wasm ${CMAKE_CURRENT_LIST_DIR}/wasm-apps/main.aot
-    ${CMAKE_CURRENT_BINARY_DIR}
-  COMMENT "Copy main.wasm and main.aot to the directory: build/runtime-common."
+# module_malloc_offset.wasm takes its offset from guest memory instead of the
+# size argument, and can grow the memory inside malloc.
+wamr_unit_test_compile_wat_to_wasm(
+  TARGET runtime_common_test
+  SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps/module_malloc_offset.wat
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/module_malloc_offset.wasm
 )
+
+if(WAMR_BUILD_AOT)
+  wamr_unit_test_compile_wasm_to_aot(
+    TARGET runtime_common_test
+    INPUT ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps/main.wasm
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/main.aot
+  )
+
+  # module_malloc.aot is the same module as module_malloc.wasm, compiled
+  # with wamrc.
+  wamr_unit_test_compile_wasm_to_aot(
+    TARGET runtime_common_test
+    INPUT ${CMAKE_CURRENT_BINARY_DIR}/module_malloc.wasm
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/module_malloc.aot
+  )
+
+  wamr_unit_test_compile_wasm_to_aot(
+    TARGET runtime_common_test
+    INPUT ${CMAKE_CURRENT_BINARY_DIR}/module_malloc_offset.wasm
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/module_malloc_offset.aot
+  )
+endif()
 
 gtest_discover_tests(runtime_common_test)

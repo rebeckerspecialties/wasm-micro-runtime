@@ -1492,7 +1492,8 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     wasm_exec_env_set_cur_frame(exec_env, prev_frame);
 }
 
-#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0 \
+    || WASM_ENABLE_C_API_CORE_LINKING != 0
 static void
 wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                WASMExecEnv *exec_env,
@@ -1545,6 +1546,12 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
     WASMExecEnv *sub_module_exec_env = NULL;
     uintptr_t aux_stack_origin_boundary = 0;
     uintptr_t aux_stack_origin_bottom = 0;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if (cur_func->c_api_owner != module_inst) {
+        sub_module_inst = cur_func->c_api_owner;
+        sub_func_inst = cur_func;
+    }
+#endif
 
 #if WASM_ENABLE_COMPONENT_MODEL != 0
     /* Raw and synthetic host imports already receive the canonical core ABI
@@ -2076,6 +2083,7 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
        this function */
     prev_frame->ip = NULL;
 
+    wasm_set_exception(sub_module_inst, NULL);
     /* Call the resolved function without another import-to-import bytecode
        entry.  Native imports still run with their defining module selected. */
     if (sub_func_inst->is_import_func) {
@@ -2591,14 +2599,23 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     }
                     fidx = wasm_func_obj_get_func_idx_bound(func_obj);
 #endif
+#if WASM_ENABLE_C_API_CORE_LINKING == 0
                     if (__builtin_expect(
                             fidx >= module->e->function_count, 0)) {
                         wasm_set_exception(module, "unknown function");
                         goto got_exception;
                     }
+#endif
 
-                    /* Non-imported tables keep module-relative indexes. */
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+                    cur_func = wasm_c_api_resolve_ref(module, fidx);
+                    if (!cur_func) {
+                        wasm_set_exception(module, "unknown function");
+                        goto got_exception;
+                    }
+#else
                     cur_func = module->e->functions + fidx;
+#endif
                 }
                 /* clang-format on */
 
@@ -3242,7 +3259,11 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 func_idx = read_uint32(frame_ip);
 
 #if WASM_ENABLE_GC == 0
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+                PUSH_I32(wasm_c_api_function_ref(module, func_idx));
+#else
                 PUSH_I32(func_idx);
+#endif
 #else
                 SYNC_ALL_TO_FRAME();
                 if (!(gc_obj = wasm_create_func_obj(module, func_idx, true,
@@ -6530,7 +6551,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         bh_assert(elem_idx < module->module->table_seg_count);
 
                         tbl_idx = read_uint32(frame_ip);
-                        bh_assert(tbl_idx < module->module->table_count);
+                        bh_assert(tbl_idx < module->table_count);
 
                         tbl_inst = wasm_get_table_inst(module, tbl_idx);
 
@@ -6575,6 +6596,10 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_GC == 0
                             table_elems[i] = (table_elem_type_t)init_values[i]
                                                  .u.unary.v.ref_index;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+                            table_elems[i] = wasm_c_api_function_ref(
+                                module, (uint32)table_elems[i]);
+#endif
 #else
                             if (init_values[i].u.unary.v.ref_index
                                 != UINT32_MAX) {
@@ -6651,14 +6676,10 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         /* if s >= d, copy from front to back */
                         /* if s < d, copy from back to front */
                         /* merge all together */
-                        bh_memmove_s((uint8 *)dst_tbl_inst
-                                         + offsetof(WASMTableInstance, elems)
-                                         + d * sizeof(table_elem_type_t),
+                        bh_memmove_s(dst_tbl_inst->elems + d,
                                      (uint32)((dst_tbl_inst->cur_size - d)
                                               * sizeof(table_elem_type_t)),
-                                     (uint8 *)src_tbl_inst
-                                         + offsetof(WASMTableInstance, elems)
-                                         + s * sizeof(table_elem_type_t),
+                                     src_tbl_inst->elems + s,
                                      (uint32)(n * sizeof(table_elem_type_t)));
                         break;
                     }
@@ -9155,7 +9176,8 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         WASMInterpFrame *outs_area = wasm_exec_env_wasm_stack_top(exec_env);
         int i;
 
-#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0 \
+    || WASM_ENABLE_C_API_CORE_LINKING != 0
         if (cur_func->is_import_func) {
             outs_area->lp = outs_area->operand
                             + (cur_func->import_func_inst
@@ -9349,9 +9371,18 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         }
         else
 #endif
-            if (cur_func->is_import_func) {
-#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
-            if (cur_func->import_func_inst) {
+        if (cur_func->is_import_func
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+            || cur_func->c_api_owner != module
+#endif
+        ) {
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_C_API_CORE_LINKING != 0 \
+    || WASM_ENABLE_COMPONENT_MODEL != 0
+            if (cur_func->import_func_inst
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+                || cur_func->c_api_owner != module
+#endif
+            ) {
                 wasm_interp_call_func_import(module, exec_env, cur_func,
                                              prev_frame);
             }
@@ -9402,8 +9433,8 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_GC != 0
             /* area of frame_ref */
             all_cell_num += (cell_num_of_local_stack + 3) / 4;
-            /* cells occupied by locals, POP_REF should not clear frame_ref for
-             * these cells */
+            /* cells occupied by locals, POP_REF should not clear frame_ref
+             * for these cells */
             local_cell_num =
                 cur_func->param_cell_num + cur_func->local_cell_num;
 #endif
@@ -9706,9 +9737,18 @@ wasm_interp_call_wasm(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
     }
 #endif
 
-    if (function->is_import_func) {
-#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_COMPONENT_MODEL != 0
-        if (function->import_module_inst) {
+    if (function->is_import_func
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+        || function->c_api_owner != module_inst
+#endif
+    ) {
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_C_API_CORE_LINKING != 0 \
+    || WASM_ENABLE_COMPONENT_MODEL != 0
+        if (function->import_module_inst
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+            || function->c_api_owner != module_inst
+#endif
+        ) {
             LOG_DEBUG("it is a function of a sub module");
             wasm_interp_call_func_import(module_inst, exec_env, function,
                                          frame);

@@ -681,12 +681,20 @@ calloc_wrapper(wasm_exec_env_t exec_env, uint32 nmemb, uint32 size)
 }
 
 static uint32
-realloc_wrapper(wasm_exec_env_t exec_env, uint32 ptr, uint32 new_size)
+realloc_wrapper(wasm_exec_env_t exec_env, void *ptr, uint32 new_size)
 {
     uint64 ret_offset = 0;
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
 
-    ret_offset = wasm_runtime_module_realloc(module_inst, ptr, new_size, NULL);
+    /* ptr is a guest address: the signature's '*' converts it to a native
+       address, convert it back to the app offset here.  The AOT compiler
+       may hand us the address without checking it when hardware bounds
+       checks are enabled, so validate it again; NULL means "no block" */
+    if (ptr && !validate_native_addr(ptr, (uint64)1))
+        return 0;
+
+    ret_offset = wasm_runtime_module_realloc(
+        module_inst, addr_native_to_app(ptr), new_size, NULL);
     bh_assert(ret_offset < UINT32_MAX);
     return (uint32)ret_offset;
 }
@@ -724,15 +732,20 @@ strtol_wrapper(wasm_exec_env_t exec_env, const char *nptr, char **endptr,
                int32 base)
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
-    int32 num = 0;
+    char *endptr_native = NULL;
+    int32 num;
 
     /* nptr has been checked by runtime */
+    num = (int32)strtol(nptr, &endptr_native, base);
+
+    /* guest offset 0 is NULL: no validation, no write-back */
+    if ((void *)endptr == addr_app_to_native(0))
+        return num;
+
     if (!validate_native_addr(endptr, (uint64)sizeof(uint32)))
         return 0;
 
-    num = (int32)strtol(nptr, endptr, base);
-    *(uint32 *)endptr = (uint32)addr_native_to_app(*endptr);
-
+    *(uint32 *)endptr = (uint32)addr_native_to_app(endptr_native);
     return num;
 }
 
@@ -741,15 +754,20 @@ strtoul_wrapper(wasm_exec_env_t exec_env, const char *nptr, char **endptr,
                 int32 base)
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
-    uint32 num = 0;
+    char *endptr_native = NULL;
+    uint32 num;
 
     /* nptr has been checked by runtime */
+    num = (uint32)strtoul(nptr, &endptr_native, base);
+
+    /* guest offset 0 is NULL: no validation, no write-back */
+    if ((void *)endptr == addr_app_to_native(0))
+        return num;
+
     if (!validate_native_addr(endptr, (uint64)sizeof(uint32)))
         return 0;
 
-    num = (uint32)strtoul(nptr, endptr, base);
-    *(uint32 *)endptr = (uint32)addr_native_to_app(*endptr);
-
+    *(uint32 *)endptr = (uint32)addr_native_to_app(endptr_native);
     return num;
 }
 
@@ -1062,7 +1080,7 @@ static NativeSymbol native_symbols_libc_builtin[] = {
     REG_NATIVE_FUNC(strncmp, "(**~)i"),
     REG_NATIVE_FUNC(strncpy, "(**~)i"),
     REG_NATIVE_FUNC(malloc, "(i)i"),
-    REG_NATIVE_FUNC(realloc, "(ii)i"),
+    REG_NATIVE_FUNC(realloc, "(*i)i"),
     REG_NATIVE_FUNC(calloc, "(ii)i"),
     REG_NATIVE_FUNC(strdup, "($)i"),
     /* clang may introduce __strdup */

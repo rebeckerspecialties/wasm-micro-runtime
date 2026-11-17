@@ -637,6 +637,11 @@ struct InstantiationArgs2 {
     void *native_fd_quota_attachment;
     wasm_native_fd_quota_reserve_callback_t native_fd_quota_reserve;
     wasm_native_fd_quota_release_callback_t native_fd_quota_release;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    /* Private, synchronous construction input; never retained by an instance.
+     */
+    struct WASMCApiCoreImports *c_api_imports;
+#endif
 #if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_LIBC_WASI_P2 != 0
     WASIArguments wasi;
 #endif
@@ -854,6 +859,13 @@ wasm_runtime_lookup_function(WASMModuleInstanceCommon *const module_inst,
 WASMFuncType *
 wasm_runtime_get_function_type(const WASMFunctionInstanceCommon *function,
                                uint32 module_type);
+
+/* Internal API: function instance of table 0 element elem_index, or NULL if
+   the index is out of range, the element is null or it is not a function
+   reference */
+WASMFunctionInstanceCommon *
+wasm_runtime_get_table_func_inst(WASMModuleInstanceCommon *const module_inst,
+                                 uint32 elem_index);
 
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN uint32

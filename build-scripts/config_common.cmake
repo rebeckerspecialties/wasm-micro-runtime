@@ -111,7 +111,12 @@ if (WAMR_BUILD_JIT EQUAL 1)
   if (WAMR_BUILD_PLATFORM STREQUAL "windows" AND MSVC)
     add_compile_options($<$<CONFIG:Debug>:/MD>)
   endif()
+endif()
 
+# Only the LLVM JIT needs an LLVM build.  Other running modes get the LLVM
+# headers when the build is there, and do not fail when it is not.
+if (WAMR_BUILD_JIT EQUAL 1 OR DEFINED LLVM_DIR
+    OR EXISTS "${WAMR_ROOT_DIR}/core/deps/llvm/build")
   # Resolve LLVM_DIR and load the LLVM package; its zlib/zstd
   # dependencies are handled by find_package(LLVM) itself.  Shared with
   # the unit tests (see llvm_env.cmake).
@@ -119,7 +124,10 @@ if (WAMR_BUILD_JIT EQUAL 1)
 
   message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
   message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+endif ()
 
+# Only link LLVM when building the JIT
+if (WAMR_BUILD_JIT EQUAL 1)
   # Disable -Wredundant-move when building LLVM JIT
   include(CheckCXXCompilerFlag)
   if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -270,6 +278,16 @@ endif ()
 
 if (NOT DEFINED WAMR_BUILD_GC)
   set (WAMR_BUILD_GC 0)
+endif ()
+
+if (WAMR_BUILD_C_API_CORE_LINKING EQUAL 1)
+  if (NOT WAMR_BUILD_FAST_INTERP EQUAL 1 OR WAMR_BUILD_AOT EQUAL 1 OR
+      WAMR_BUILD_JIT EQUAL 1 OR WAMR_BUILD_FAST_JIT EQUAL 1 OR
+      WAMR_BUILD_MULTI_MODULE EQUAL 1 OR WAMR_BUILD_GC EQUAL 1 OR
+      WAMR_BUILD_TAIL_CALL EQUAL 1)
+    message(FATAL_ERROR "C API core linking requires the non-GC fast interpreter without AOT/JIT, tail calls or the module-name linker")
+  endif ()
+  add_definitions(-DWASM_ENABLE_C_API_CORE_LINKING=1)
 endif ()
 
 if (NOT DEFINED WAMR_BUILD_MEMORY64)
@@ -915,6 +933,9 @@ else ()
 endif ()
 if (WAMR_BUILD_ALLOC_WITH_USAGE EQUAL 1)
   add_definitions(-DWASM_MEM_ALLOC_WITH_USAGE=1)
+  if (NOT WAMR_DISABLE_HW_BOUND_CHECK EQUAL 1)
+    message (WARNING "WAMR_BUILD_ALLOC_WITH_USAGE must be used with WAMR_DISABLE_HW_BOUND_CHECK=1, see doc/build_wamr.md")
+  endif ()
 endif()
 if (NOT WAMR_BUILD_SANITIZER STREQUAL "")
   message ("     Sanitizer ${WAMR_BUILD_SANITIZER} enabled")

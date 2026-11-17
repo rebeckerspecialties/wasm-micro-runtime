@@ -267,8 +267,7 @@ destroy_runtime_managed_shared_heap(WASMSharedHeap *heap)
 }
 
 static bool
-create_runtime_managed_shared_heap(WASMSharedHeap *heap,
-                                   uint64 heap_struct_size)
+create_runtime_managed_shared_heap(WASMSharedHeap *heap)
 {
     uint64 map_size;
 
@@ -293,7 +292,8 @@ create_runtime_managed_shared_heap(WASMSharedHeap *heap,
         goto fail1;
     }
     if (!mem_allocator_create_with_struct_and_pool(
-            heap->heap_handle, heap_struct_size, heap->base_addr, heap->size)) {
+            heap->heap_handle, mem_allocator_get_heap_struct_size(),
+            heap->base_addr, heap->size)) {
         LOG_WARNING("init share heap failed");
         goto fail2;
     }
@@ -357,7 +357,7 @@ wasm_runtime_create_shared_heap(SharedHeapInitArgs *init_args)
                     heap->base_addr, size);
     }
     else {
-        if (!create_runtime_managed_shared_heap(heap, heap_struct_size)) {
+        if (!create_runtime_managed_shared_heap(heap)) {
             goto fail2;
         }
     }
@@ -469,7 +469,6 @@ wasm_runtime_unchain_shared_heaps(WASMSharedHeap *head, bool entire_chain)
 bool
 wasm_runtime_reset_shared_heap_chain(WASMSharedHeap *shared_heap)
 {
-    uint64 heap_struct_size = sizeof(WASMSharedHeap);
     WASMSharedHeap *cur;
 
     if (!shared_heap) {
@@ -486,7 +485,7 @@ wasm_runtime_reset_shared_heap_chain(WASMSharedHeap *shared_heap)
         if (cur->heap_handle) {
             destroy_runtime_managed_shared_heap(cur);
 
-            if (!create_runtime_managed_shared_heap(cur, heap_struct_size)) {
+            if (!create_runtime_managed_shared_heap(cur)) {
                 os_mutex_unlock(&shared_heap_list_lock);
                 return false;
             }

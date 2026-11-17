@@ -14,6 +14,7 @@
 #include "../common/component-model/wasm_component_canonical.h"
 #include "../common/component-model/wasm_component_host_resource.h"
 #endif
+#include "../interpreter/wasm.h"
 #if WASM_ENABLE_SHARED_MEMORY != 0
 #include "../common/wasm_shared_memory.h"
 #endif
@@ -3137,7 +3138,24 @@ aot_module_malloc_internal(AOTModuleInstance *module_inst,
                                         retain_func, size, &offset)) {
             return 0;
         }
-        addr = offset ? (uint8 *)memory_inst->memory_data + offset : NULL;
+
+        if (!offset) {
+            LOG_WARNING("warning: allocate %" PRIu64 " bytes memory failed",
+                        size);
+            aot_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
+            return 0;
+        }
+
+        memory_inst = aot_get_default_memory(module_inst);
+        if (offset > memory_inst->memory_data_size
+            || size > memory_inst->memory_data_size - offset) {
+            LOG_ERROR("error: malloc returned offset %" PRIu64
+                      " out of linear memory of size %" PRIu64,
+                      offset, memory_inst->memory_data_size);
+            aot_set_exception_with_id(module_inst, EXCE_OUT_OF_MEMORY);
+            return 0;
+        }
+        addr = memory_inst->memory_data + offset;
     }
 
     if (!addr) {
@@ -3175,10 +3193,24 @@ aot_module_realloc_internal(AOTModuleInstance *module_inst,
     }
 
     if (memory_inst->heap_handle) {
-        addr = mem_allocator_realloc(
-            memory_inst->heap_handle,
-            (uint32)ptr ? memory_inst->memory_data + (uint32)ptr : NULL,
-            (uint32)size);
+        addr = ptr ? memory_inst->memory_data + (uint32)ptr : NULL;
+
+        /* Only realloc a block that lives in the app heap: the guest may
+           pass an arbitrary offset, and the heap may have moved on grow */
+        if (addr) {
+            uint8 *heap_data, *heap_data_end;
+
+            SHARED_MEMORY_LOCK(memory_inst);
+            heap_data = memory_inst->heap_data;
+            heap_data_end = memory_inst->heap_data_end;
+            SHARED_MEMORY_UNLOCK(memory_inst);
+
+            if (!(heap_data <= addr && addr < heap_data_end))
+                return 0;
+        }
+
+        addr =
+            mem_allocator_realloc(memory_inst->heap_handle, addr, (uint32)size);
     }
 
     /* Only support realloc in WAMR's app heap */
@@ -3435,7 +3467,7 @@ aot_call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 table_elem_idx,
     }
 
     tbl_elem_val = ((table_elem_type_t *)tbl_inst->elems)[table_elem_idx];
-    if (tbl_elem_val == NULL_REF) {
+    if (is_table_elem_null(tbl_elem_val)) {
         aot_set_exception_with_id(module_inst, EXCE_UNINITIALIZED_ELEMENT);
         goto fail;
     }
