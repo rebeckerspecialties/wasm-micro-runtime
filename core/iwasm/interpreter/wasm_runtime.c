@@ -980,10 +980,18 @@ tables_deinstantiate(WASMModuleInstance *module_inst)
     if (module_inst->tables) {
 #if WASM_ENABLE_C_API_CORE_LINKING != 0
         uint32 i;
-        for (i = module_inst->e->c_api_borrowed_tables;
+        uint32 borrowed = module_inst->e->c_api_borrowed_tables;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (borrowed < module_inst->prelinked_import_table_count)
+            borrowed = module_inst->prelinked_import_table_count;
+#endif
+        for (i = borrowed;
              i < module_inst->table_count; i++) {
             WASMTableInstance *table = module_inst->tables[i];
             if (table) {
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+                wasm_runtime_free(table->component_func_refs);
+#endif
                 wasm_runtime_free(table->elems);
                 wasm_runtime_free(table);
             }
@@ -1034,6 +1042,13 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
     (void)first_table;
     if (!tables)
         return NULL;
+#if WASM_ENABLE_MULTI_MODULE != 0
+    if (module->import_table_count
+        && !(module_inst->e->table_insts_linked = runtime_malloc(
+                 (uint64)module->import_table_count * sizeof(*tables),
+                 error_buf, error_buf_size)))
+        goto fail_core_tables;
+#endif
     for (i = 0; i < count; i++) {
         WASMTableType *type;
         WASMTableInstance *table;
@@ -1042,6 +1057,16 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
             tables[i] = bindings->tables[i];
             continue;
         }
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        if (prelinked_imports && i < module->import_table_count) {
+            table = prelinked_imports->table_instance[i];
+            if (!component_table_enable_func_refs(table, error_buf,
+                                                  error_buf_size))
+                goto fail_core_tables;
+            tables[i] = table;
+            continue;
+        }
+#endif
         type = i < module->import_table_count
                    ? &module->import_tables[i].u.table.table_type
                    : &module->tables[i - module->import_table_count].table_type;
@@ -1053,6 +1078,28 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
         table->c_api_has_max = !!(type->flags & MAX_TABLE_SIZE_FLAG);
         table->cur_size = table->c_api_capacity = type->init_size;
         table->max_size = type->max_size;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+        table->has_max = table->c_api_has_max;
+        table->module_instance = module_inst;
+#endif
+#if WASM_ENABLE_MULTI_MODULE != 0
+        if (!bindings && i < module->import_table_count
+            && module->import_tables[i].u.table.import_module) {
+            const WASMTableImport *import = &module->import_tables[i].u.table;
+            WASMModuleInstance *owner =
+                get_sub_module_inst(module_inst, import->import_module);
+            WASMTableInstance *linked =
+                owner ? wasm_lookup_table(owner, import->field_name) : NULL;
+            if (!linked) {
+                set_error_buf(error_buf, error_buf_size, "unknown table");
+                goto fail_core_tables;
+            }
+            module_inst->e->table_insts_linked[i] = linked;
+            table->cur_size = linked->cur_size;
+            table->max_size = linked->max_size;
+            continue;
+        }
+#endif
         size = (uint64)table->cur_size * sizeof(table_elem_type_t);
         if (size) {
             if (!(table->elems =
@@ -1063,7 +1110,12 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
     }
     return tables;
 fail_core_tables:
-    for (i = module_inst->e->c_api_borrowed_tables; i < count; i++) {
+    i = module_inst->e->c_api_borrowed_tables;
+#if WASM_ENABLE_COMPONENT_MODEL != 0
+    if (i < module_inst->prelinked_import_table_count)
+        i = module_inst->prelinked_import_table_count;
+#endif
+    for (; i < count; i++) {
         if (tables[i]) {
             wasm_runtime_free(tables[i]->elems);
             wasm_runtime_free(tables[i]);

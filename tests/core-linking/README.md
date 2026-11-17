@@ -12,12 +12,19 @@ native accesses on AArch64; the table cases expose those existing diagnostics.
 imports per instance, without mutating reusable module metadata or caller-owned
 external wrappers. The profile supports interpreter-exported, non-shared
 wasm32 memories, tables, guest functions and host callbacks. Global imports
-still fail closed. Tail-call, GC, AOT/JIT and module-name-linker combinations
+still fail closed. Tail-call, GC and AOT/JIT combinations
 are rejected at configuration time; this is not a claim of support for all
 WAMR feature combinations. Function counts are bounded by the existing C API's
 16-bit function-wrapper index representation.
 The normal C API import enumeration order is retained. This is a core linking
 facility, not a Component Model parser, scheduler, or WASI implementation.
+
+The integration branch can also build `-DWAMR_TEST_LEGACY_LINKING=ON` with
+the old component and module-name linkers enabled. C API modules still use
+explicit imports, never name-registry resolution. This lane runs the same
+core-linking tests plus legacy borrowed-table identity/provenance, mutations
+and both destruction orders. It preserves the old product path during parity;
+it is not an upstream dependency on the Airbus component implementation.
 
 The store owns instantiated objects until store deletion, as in the existing
 C API. Callback environment ownership is shared by function copies and retained

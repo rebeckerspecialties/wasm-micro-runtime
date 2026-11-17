@@ -2881,6 +2881,10 @@ wasm_module_new_internal(wasm_store_t *store, wasm_byte_vec_t *binary,
     }
 
     args->wasm_binary_freeable = !args->clone_wasm_binary;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    /* Explicit C API imports must not consult the legacy name resolver. */
+    args->no_resolve = true;
+#endif
     module_ex->module_comm_rt = wasm_runtime_load_ex(
         (uint8 *)module_ex->binary->data, (uint32)module_ex->binary->size, args,
         error_buf, (uint32)sizeof(error_buf));
@@ -5072,20 +5076,24 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index, wasm_ref_t *ref)
 #endif
     {
 #if WASM_ENABLE_C_API_CORE_LINKING != 0
-        if (ref) {
-            WASMModuleInstance *owner = (WASMModuleInstance *)ref->inst_comm_rt;
-            if (ref->store != table->store || !owner
-                || owner->module_type != Wasm_Module_Bytecode
-                || owner->e->c_api_domain
-                       != ((WASMModuleInstance *)table->inst_comm_rt)
-                              ->e->c_api_domain
-                || ref->ref_idx_rt >= owner->e->function_count)
-                return false;
-            *p_ref_idx = wasm_c_api_function_ref(owner, ref->ref_idx_rt);
+        if (((WASMModuleInstance *)table->inst_comm_rt)->e->c_api_domain) {
+            if (ref) {
+                WASMModuleInstance *owner = (WASMModuleInstance *)ref->inst_comm_rt;
+                if (ref->store != table->store || !owner
+                    || owner->module_type != Wasm_Module_Bytecode
+                    || owner->e->c_api_domain
+                           != ((WASMModuleInstance *)table->inst_comm_rt)
+                                  ->e->c_api_domain
+                    || ref->ref_idx_rt >= owner->e->function_count)
+                    goto done;
+                *p_ref_idx = wasm_c_api_function_ref(owner, ref->ref_idx_rt);
+            }
+            else
+                *p_ref_idx = NULL_REF;
+            result = true;
+            goto done;
         }
-        else
-            *p_ref_idx = NULL_REF;
-#else
+#endif
         if (ref) {
             if (NULL_REF != ref->ref_idx_rt) {
 #if WASM_ENABLE_COMPONENT_MODEL != 0 && WASM_ENABLE_INTERP != 0
@@ -5130,7 +5138,6 @@ wasm_table_set(wasm_table_t *table, wasm_table_size_t index, wasm_ref_t *ref)
             }
 #endif
         }
-#endif
     }
 
     result = true;
