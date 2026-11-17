@@ -7,6 +7,8 @@ static void
 c_api_core_imports_destroy(WASMCApiCoreImports *bindings)
 {
     wasm_runtime_free(bindings->memories);
+    wasm_runtime_free(bindings->tables);
+    wasm_runtime_free(bindings->guest_functions);
     wasm_runtime_free(bindings->functions);
     wasm_runtime_free(bindings->callbacks);
     memset(bindings, 0, sizeof(*bindings));
@@ -18,7 +20,7 @@ c_api_core_imports_prepare(wasm_store_t *store, const WASMModule *module,
                            WASMCApiCoreImports *bindings, char *error,
                            uint32 error_size)
 {
-    uint32 i, function_index = 0, memory_index = 0;
+    uint32 i, function_index = 0, memory_index = 0, table_index = 0;
     uint64 count = (uint64)module->import_function_count
                    + module->import_memory_count + module->import_table_count
                    + module->import_global_count;
@@ -29,9 +31,16 @@ c_api_core_imports_prepare(wasm_store_t *store, const WASMModule *module,
         goto fail;                                  \
     } while (0)
 
-    if (module->import_table_count || module->import_global_count)
-        LINK_ERROR(
-            "core-linking profile: table/global imports not supported yet");
+    if (module->import_global_count)
+        LINK_ERROR("core-linking profile: global imports not supported yet");
+    /* Public C API function wrappers currently use 16-bit indices. */
+    if ((uint64)module->import_function_count + module->function_count
+        > UINT16_MAX)
+        LINK_ERROR("core-linking C API function index limit");
+    if (!store->link_domain
+        && !(store->link_domain = malloc_internal(sizeof(*store->link_domain))))
+        LINK_ERROR("core reference domain allocation failed");
+    bindings->domain = store->link_domain;
     if (count != (imports ? imports->num_elems : 0)
         || (count && !imports->data))
         LINK_ERROR("core import count mismatch");
@@ -39,10 +48,16 @@ c_api_core_imports_prepare(wasm_store_t *store, const WASMModule *module,
         && !(bindings->memories = malloc_internal(
                  (uint64)module->import_memory_count * sizeof(void *))))
         LINK_ERROR("core memory binding allocation failed");
+    if (module->import_table_count
+        && !(bindings->tables = malloc_internal(
+                 (uint64)module->import_table_count * sizeof(void *))))
+        LINK_ERROR("core table binding allocation failed");
     if (module->import_function_count
         && (!(bindings->functions =
                   malloc_internal((uint64)module->import_function_count
                                   * sizeof(WASMFunctionImport)))
+            || !(bindings->guest_functions = malloc_internal(
+                     (uint64)module->import_function_count * sizeof(void *)))
             || !(bindings->callbacks =
                      malloc_internal((uint64)module->import_function_count
                                      * sizeof(CApiFuncImport)))))
@@ -55,7 +70,10 @@ c_api_core_imports_prepare(wasm_store_t *store, const WASMModule *module,
         /* Match wasm_module_imports' established C API ordering. */
         if (external->kind
             != (i < module->import_function_count ? WASM_EXTERN_FUNC
-                                                  : WASM_EXTERN_MEMORY))
+                : i < module->import_function_count
+                            + module->import_memory_count
+                    ? WASM_EXTERN_MEMORY
+                    : WASM_EXTERN_TABLE))
             LINK_ERROR("core import kind mismatch");
         if (external->kind == WASM_EXTERN_FUNC) {
             wasm_func_t *function = wasm_extern_as_func(external);
@@ -66,9 +84,17 @@ c_api_core_imports_prepare(wasm_store_t *store, const WASMModule *module,
                 || !wasm_functype_same_internal(function->type,
                                                 target->func_type))
                 LINK_ERROR("core function import type mismatch");
-            if (function->inst_comm_rt)
-                LINK_ERROR("core-linking profile: guest function import not "
-                           "supported yet");
+            if (function->inst_comm_rt) {
+                WASMModuleInstance *owner =
+                    (WASMModuleInstance *)function->inst_comm_rt;
+                if (owner->module_type != Wasm_Module_Bytecode
+                    || owner->e->c_api_domain != bindings->domain
+                    || function->func_idx_rt >= owner->e->function_count)
+                    LINK_ERROR("foreign core function domain");
+                bindings->guest_functions[function_index - 1] =
+                    &owner->e->functions[function->func_idx_rt];
+                continue;
+            }
             target->call_conv_wasm_c_api = true;
             target->func_ptr_linked = function->with_env
                                           ? (void *)function->u.cb_env.cb
@@ -102,6 +128,51 @@ c_api_core_imports_prepare(wasm_store_t *store, const WASMModule *module,
                 LINK_ERROR("core memory import type mismatch");
             bindings->memories[memory_index++] = actual;
         }
+        else if (external->kind == WASM_EXTERN_TABLE) {
+            wasm_table_t *table = wasm_extern_as_table(external);
+            WASMModuleInstance *owner =
+                (WASMModuleInstance *)table->inst_comm_rt;
+            WASMTableType *expected =
+                &module->import_tables[table_index].u.table.table_type;
+            WASMTableInstance *actual;
+            if (!owner || owner->module_type != Wasm_Module_Bytecode
+                || owner->e->c_api_domain != bindings->domain
+                || table->table_idx_rt >= owner->table_count)
+                LINK_ERROR("foreign core table domain");
+            actual = owner->tables[table->table_idx_rt];
+            if (actual->elem_type != expected->elem_type || actual->is_table64
+                || (expected->flags & (TABLE64_FLAG | SHARED_TABLE_FLAG))
+                || actual->cur_size < expected->init_size
+                || ((expected->flags & MAX_TABLE_SIZE_FLAG)
+                    && (!actual->c_api_has_max
+                        || actual->max_size > expected->max_size)))
+                LINK_ERROR("core table import type mismatch");
+            bindings->tables[table_index++] = actual;
+        }
+    }
+    {
+        WASMCApiLinkDomain *domain = bindings->domain;
+        uint64 needed = (uint64)domain->count + module->import_function_count
+                        + module->function_count;
+        if (needed > UINT32_MAX / sizeof(void *))
+            LINK_ERROR("core function reference limit");
+        if (needed > domain->capacity) {
+            uint64 capacity = (uint64)domain->capacity * 2;
+            WASMFunctionInstance **functions;
+            if (capacity < needed)
+                capacity = needed;
+            if (capacity > UINT32_MAX / sizeof(void *))
+                capacity = needed;
+            functions = wasm_runtime_realloc(
+                domain->functions, (uint32)(capacity * sizeof(void *)));
+            if (!functions)
+                LINK_ERROR("core function reference allocation failed");
+            memset(functions + domain->capacity, 0,
+                   (size_t)(capacity - domain->capacity) * sizeof(void *));
+            domain->functions = functions;
+            domain->capacity = (uint32)capacity;
+        }
+        bindings->reference_base = domain->count;
     }
     return true;
 fail:

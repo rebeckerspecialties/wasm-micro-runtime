@@ -37,6 +37,9 @@ struct wasm_store_t {
     wasm_module_vec_t *modules;
     wasm_instance_vec_t *instances;
     Vector *foreigns;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    struct WASMCApiLinkDomain *link_domain;
+#endif
 };
 
 #if WASM_ENABLE_C_API_CORE_LINKING != 0

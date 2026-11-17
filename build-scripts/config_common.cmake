@@ -274,8 +274,9 @@ endif ()
 if (WAMR_BUILD_C_API_CORE_LINKING EQUAL 1)
   if (NOT WAMR_BUILD_FAST_INTERP EQUAL 1 OR WAMR_BUILD_AOT EQUAL 1 OR
       WAMR_BUILD_JIT EQUAL 1 OR WAMR_BUILD_FAST_JIT EQUAL 1 OR
-      WAMR_BUILD_MULTI_MODULE EQUAL 1 OR WAMR_BUILD_GC EQUAL 1)
-    message(FATAL_ERROR "C API core linking requires the non-GC fast interpreter without AOT/JIT or the module-name linker")
+      WAMR_BUILD_MULTI_MODULE EQUAL 1 OR WAMR_BUILD_GC EQUAL 1 OR
+      WAMR_BUILD_TAIL_CALL EQUAL 1)
+    message(FATAL_ERROR "C API core linking requires the non-GC fast interpreter without AOT/JIT, tail calls or the module-name linker")
   endif ()
   add_definitions(-DWASM_ENABLE_C_API_CORE_LINKING=1)
 endif ()

@@ -180,6 +180,9 @@ struct WASMTableInstance {
     uint8 elem_type;
     uint8 is_table64;
     uint8 __padding__[6];
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    bool c_api_has_max;
+#endif
     union {
 #if WASM_ENABLE_GC != 0
         WASMRefType *elem_ref_type;
@@ -191,7 +194,12 @@ struct WASMTableInstance {
     /* Maximum size */
     uint32 max_size;
     /* Table elements */
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    uint32 c_api_capacity;
+    table_elem_type_t *elems;
+#else
     table_elem_type_t elems[1];
+#endif
 };
 
 struct WASMGlobalInstance {
@@ -240,9 +248,13 @@ struct WASMFunctionInstance {
         WASMFunctionImport *func_import;
         WASMFunction *func;
     } u;
-#if WASM_ENABLE_MULTI_MODULE != 0
+#if WASM_ENABLE_MULTI_MODULE != 0 || WASM_ENABLE_C_API_CORE_LINKING != 0
     WASMModuleInstance *import_module_inst;
     WASMFunctionInstance *import_func_inst;
+#endif
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    WASMModuleInstance *c_api_owner;
+    uint32 c_api_ref;
 #endif
 #if WASM_ENABLE_PERF_PROFILING != 0
     /* total execution time */
@@ -316,11 +328,24 @@ typedef struct CApiFuncImport {
 } CApiFuncImport;
 
 #if WASM_ENABLE_C_API_CORE_LINKING != 0
+typedef struct WASMCApiLinkDomain {
+    WASMFunctionInstance **functions;
+    uint32 count;
+    uint32 capacity;
+} WASMCApiLinkDomain;
+
 /* Arrays are validated by the C API before core instantiation starts. */
 typedef struct WASMCApiCoreImports {
     WASMMemoryInstance **memories;
+    WASMTableInstance **tables;
+    WASMFunctionInstance **guest_functions;
     WASMFunctionImport *functions;
     CApiFuncImport *callbacks;
+    WASMCApiLinkDomain *domain;
+    uint32 reference_base;
+    /* Failed instantiations can publish references through active segments.
+       The store retains their objects, even though no instance is returned. */
+    WASMModuleInstance *failed_instance;
 } WASMCApiCoreImports;
 #endif
 
@@ -362,6 +387,9 @@ typedef struct WASMModuleInstanceExtra {
     /* Import metadata belongs to this instance, not the reusable module. */
     WASMFunctionImport *c_api_function_imports;
     uint32 c_api_borrowed_memories;
+    uint32 c_api_borrowed_tables;
+    WASMCApiLinkDomain *c_api_domain;
+    uint32 c_api_reference_base;
 #endif
 
     uint32 global_count;
@@ -504,6 +532,37 @@ struct WASMModuleInstance {
 
 struct WASMInterpFrame;
 typedef struct WASMInterpFrame WASMRuntimeFrame;
+
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+static inline uint32
+wasm_c_api_function_ref(WASMModuleInstance *instance, uint32 index)
+{
+    return index == UINT32_MAX || !instance->e->c_api_domain
+               ? index
+               : instance->e->functions[index].c_api_ref;
+}
+
+static inline WASMFunctionInstance *
+wasm_c_api_resolve_ref(WASMModuleInstance *instance, uint32 reference)
+{
+    WASMCApiLinkDomain *domain = instance->e->c_api_domain;
+    if (domain)
+        return reference < domain->count ? domain->functions[reference] : NULL;
+    return reference < instance->e->function_count
+               ? &instance->e->functions[reference]
+               : NULL;
+}
+
+static inline bool
+wasm_c_api_function_type_equal(const WASMFuncType *left,
+                               const WASMFuncType *right)
+{
+    return left->param_count == right->param_count
+           && left->result_count == right->result_count
+           && !memcmp(left->types, right->types,
+                      left->param_count + left->result_count);
+}
+#endif
 
 #if WASM_ENABLE_MULTI_MODULE != 0
 typedef struct WASMSubModInstNode {

@@ -30,7 +30,7 @@ include(${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
 add_library(vmlib STATIC ${WAMR_RUNTIME_LIB_SOURCE})
 target_link_libraries(vmlib PUBLIC m pthread)
 find_program(WAT2WASM wat2wasm REQUIRED)
-foreach(fixture memory-owner memory-user start-import)
+foreach(fixture memory-owner memory-user start-import table-owner table-fixup table-trap)
   add_custom_command(OUTPUT ${fixture}.wasm
     COMMAND ${WAT2WASM} ${CMAKE_CURRENT_SOURCE_DIR}/${fixture}.wat -o ${fixture}.wasm
     DEPENDS ${fixture}.wat VERBATIM)
