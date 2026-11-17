@@ -6078,11 +6078,50 @@ wasm_instance_new_with_args(wasm_store_t *store, const wasm_module_t *module,
                                           &inst_args);
 }
 
+bool
+wasm_store_set_instance_lifecycle(
+    wasm_store_t *store, void *attachment,
+    bool (*created)(void *, WASMModuleInstanceCommon *),
+    void (*retiring)(void *, WASMModuleInstanceCommon *))
+{
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if (!store || store->instances->num_elems || (!!created != !!retiring))
+        return false;
+    if (!store->link_domain
+        && !(store->link_domain = malloc_internal(sizeof(*store->link_domain))))
+        return false;
+    store->link_domain->lifecycle_attachment = attachment;
+    store->link_domain->created = created;
+    store->link_domain->retiring = retiring;
+    return true;
+#else
+    (void)store;
+    (void)attachment;
+    (void)created;
+    (void)retiring;
+    return false;
+#endif
+}
+
 wasm_instance_t *
 wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
                                const wasm_extern_vec_t *imports,
                                own wasm_trap_t **trap,
                                const InstantiationArgs *inst_args)
+{
+    struct InstantiationArgs2 args;
+    if (!inst_args)
+        return NULL;
+    wasm_runtime_instantiation_args_set_defaults(&args);
+    args.v1 = *inst_args;
+    return wasm_instance_new_with_args_ex2(store, module, imports, trap, &args);
+}
+
+wasm_instance_t *
+wasm_instance_new_with_args_ex2(wasm_store_t *store, const wasm_module_t *module,
+                               const wasm_extern_vec_t *imports,
+                               own wasm_trap_t **trap,
+                               const struct InstantiationArgs2 *inst_args)
 {
     WASMAllocationQuotaScope scope;
     char sub_error_buf[128] = { 0 };
@@ -6102,7 +6141,7 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
 
     bh_assert(singleton_engine);
 
-    if (!module)
+    if (!store || !module || !inst_args)
         return NULL;
     if (!*module
         || !wasm_allocation_quota_scope_enter_for_allocation(&scope, *module)) {
@@ -6138,8 +6177,7 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
             goto failed;
         }
     }
-    wasm_runtime_instantiation_args_set_defaults(&core_args);
-    core_args.v1 = *inst_args;
+    core_args = *inst_args;
     core_args.c_api_imports = &bindings;
     /* Reserve ownership before active segments or start functions can publish
        references. A failed instantiation does not undo store side effects. */
@@ -6187,7 +6225,7 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
      * will do the linking result check at the end of wasm_runtime_instantiate
      */
 
-    instance->inst_comm_rt = wasm_runtime_instantiate_ex(
+    instance->inst_comm_rt = wasm_runtime_instantiate_ex2(
         *module, inst_args, sub_error_buf, sizeof(sub_error_buf));
     if (!instance->inst_comm_rt) {
         goto failed;

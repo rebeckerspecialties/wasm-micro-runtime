@@ -41,3 +41,15 @@ type mismatch, passive initialization, growth/re-export visibility, C API
 reference transfer, and calling a function published by a trapping start.
 They also cover table.get/set, table.fill, table.copy, growth failure and
 separate instantiations of the same table-owning module.
+
+# Instance policy
+
+`instance_policy_test` passes the existing opaque `InstantiationArgs2` through
+the C API and checks aggregate initial/grown page accounting and refunds. A
+store-local lifecycle observer admits each runtime identity before its start
+function, and retracts it before destruction. The host owns the interrupt
+mutex, thread and policy; no scheduler is added to WAMR. Twenty spinning-start
+iterations keep an interrupter alive across store teardown to exercise the
+retirement fence. Rejected admission has no retirement callback; a failed start
+may be retained by the store until deletion because its references can have
+escaped into an imported table.

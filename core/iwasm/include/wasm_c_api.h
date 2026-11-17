@@ -691,6 +691,28 @@ WASM_API_EXTERN own wasm_instance_t* wasm_instance_new_with_args_ex(
 
 WASM_API_EXTERN void wasm_instance_exports(const wasm_instance_t*, own wasm_extern_vec_t* out);
 
+// Pass the existing opaque runtime settings without discarding quotas or host
+// state. Settings are copied for this synchronous instantiation.
+struct InstantiationArgs2;
+WASM_API_EXTERN own wasm_instance_t* wasm_instance_new_with_args_ex2(
+  wasm_store_t*, const wasm_module_t*, const wasm_extern_vec_t *imports,
+  own wasm_trap_t** trap, const struct InstantiationArgs2 *inst_args
+);
+
+// Optional core-linking observer, configured before the first instance.
+// Callbacks run on the store owner and must not reenter the store or Wasm.
+// created publishes the runtime identity before any start code; false rejects
+// instantiation without a matching retiring call. retiring retracts a published
+// identity before destruction, including failed starts. Embedders synchronize
+// external interrupts with retiring and retain attachment until store deletion.
+// Returns false with core linking disabled or an incomplete callback pair.
+struct WASMModuleInstanceCommon;
+WASM_API_EXTERN bool wasm_store_set_instance_lifecycle(
+  wasm_store_t*, void *attachment,
+  bool (*created)(void *, struct WASMModuleInstanceCommon *),
+  void (*retiring)(void *, struct WASMModuleInstanceCommon *)
+);
+
 // Return total wasm functions' execution time in ms
 WASM_API_EXTERN double wasm_instance_sum_wasm_exec_time(const wasm_instance_t*);
 // Return execution time in ms of a given wasm function with

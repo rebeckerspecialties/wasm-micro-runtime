@@ -442,6 +442,9 @@ typedef struct WASMCApiLinkDomain {
     WASMFunctionInstance **functions;
     uint32 count;
     uint32 capacity;
+    void *lifecycle_attachment;
+    bool (*created)(void *, struct WASMModuleInstanceCommon *);
+    void (*retiring)(void *, struct WASMModuleInstanceCommon *);
 } WASMCApiLinkDomain;
 
 /* Arrays are validated by the C API before core instantiation starts. */
@@ -499,6 +502,7 @@ typedef struct WASMModuleInstanceExtra {
     uint32 c_api_borrowed_memories;
     uint32 c_api_borrowed_tables;
     WASMCApiLinkDomain *c_api_domain;
+    bool c_api_lifecycle_published;
     uint32 c_api_reference_base;
 #endif
 

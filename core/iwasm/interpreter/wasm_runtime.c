@@ -3246,6 +3246,16 @@ wasm_instantiate_internal(WASMModule *module, WASMModuleInstance *parent,
         module_inst->e->c_api_borrowed_memories = module->import_memory_count;
         module_inst->e->c_api_borrowed_tables = module->import_table_count;
         module_inst->e->c_api_domain = args->c_api_imports->domain;
+        if (module_inst->e->c_api_domain->created) {
+            if (!module_inst->e->c_api_domain->created(
+                    module_inst->e->c_api_domain->lifecycle_attachment,
+                    (WASMModuleInstanceCommon *)module_inst)) {
+                set_error_buf(error_buf, error_buf_size,
+                              "instance lifecycle admission rejected");
+                goto fail;
+            }
+            module_inst->e->c_api_lifecycle_published = true;
+        }
         module_inst->e->c_api_reference_base =
             args->c_api_imports->reference_base;
         if (imports_size) {
@@ -3261,9 +3271,6 @@ wasm_instantiate_internal(WASMModule *module, WASMModuleInstance *parent,
         }
     }
 #endif
-    wasm_runtime_set_custom_data_internal(
-        (WASMModuleInstanceCommon *)module_inst, args->custom_data);
-
 #if WASM_ENABLE_MULTI_MODULE != 0
     module_inst->e->sub_module_inst_list =
         &module_inst->e->sub_module_inst_list_head;
@@ -4243,6 +4250,15 @@ wasm_deinstantiate(WASMModuleInstance *module_inst, bool is_sub_inst)
 {
     if (!module_inst)
         return;
+
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if (module_inst->e->c_api_lifecycle_published) {
+        WASMCApiLinkDomain *domain = module_inst->e->c_api_domain;
+        module_inst->e->c_api_lifecycle_published = false;
+        domain->retiring(domain->lifecycle_attachment,
+                         (WASMModuleInstanceCommon *)module_inst);
+    }
+#endif
 
     if (module_inst->exec_env_singleton) {
         /* wasm_exec_env_destroy will call
