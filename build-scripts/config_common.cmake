@@ -271,6 +271,15 @@ if (NOT DEFINED WAMR_BUILD_GC)
   set (WAMR_BUILD_GC 0)
 endif ()
 
+if (WAMR_BUILD_C_API_CORE_LINKING EQUAL 1)
+  if (NOT WAMR_BUILD_FAST_INTERP EQUAL 1 OR WAMR_BUILD_AOT EQUAL 1 OR
+      WAMR_BUILD_JIT EQUAL 1 OR WAMR_BUILD_FAST_JIT EQUAL 1 OR
+      WAMR_BUILD_MULTI_MODULE EQUAL 1 OR WAMR_BUILD_GC EQUAL 1)
+    message(FATAL_ERROR "C API core linking requires the non-GC fast interpreter without AOT/JIT or the module-name linker")
+  endif ()
+  add_definitions(-DWASM_ENABLE_C_API_CORE_LINKING=1)
+endif ()
+
 if (NOT DEFINED WAMR_BUILD_MEMORY64)
   set (WAMR_BUILD_MEMORY64 0)
 endif ()

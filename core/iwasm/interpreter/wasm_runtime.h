@@ -113,6 +113,9 @@ typedef struct WASMSharedHeap {
 struct WASMMemoryInstance {
     /* Module type */
     uint32 module_type;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    bool c_api_has_max;
+#endif
 
     /* Whether the memory is shared */
     uint8 is_shared_memory;
@@ -312,6 +315,15 @@ typedef struct CApiFuncImport {
     void *env_arg;
 } CApiFuncImport;
 
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+/* Arrays are validated by the C API before core instantiation starts. */
+typedef struct WASMCApiCoreImports {
+    WASMMemoryInstance **memories;
+    WASMFunctionImport *functions;
+    CApiFuncImport *callbacks;
+} WASMCApiCoreImports;
+#endif
+
 /* The common part of WASMModuleInstanceExtra and AOTModuleInstanceExtra */
 typedef struct WASMModuleInstanceExtraCommon {
 #if WASM_ENABLE_MODULE_INST_CONTEXT != 0
@@ -345,6 +357,12 @@ typedef struct WASMModuleInstanceExtra {
 
     WASMGlobalInstance *globals;
     WASMFunctionInstance *functions;
+
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    /* Import metadata belongs to this instance, not the reusable module. */
+    WASMFunctionImport *c_api_function_imports;
+    uint32 c_api_borrowed_memories;
+#endif
 
     uint32 global_count;
     uint32 function_count;

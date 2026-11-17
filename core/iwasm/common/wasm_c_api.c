@@ -3084,6 +3084,14 @@ wasm_func_new_with_env_basic(wasm_store_t *store, const wasm_functype_t *type,
     func->u.cb_env.cb = callback;
     func->u.cb_env.env = env;
     func->u.cb_env.finalizer = finalizer;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if (!(func->callback_owner =
+              malloc_internal(sizeof(*func->callback_owner))))
+        goto failed;
+    func->callback_owner->references = 1;
+    func->callback_owner->env = env;
+    func->callback_owner->finalizer = finalizer;
+#endif
 
     if (!(func->type = wasm_functype_copy(type))) {
         goto failed;
@@ -3226,6 +3234,13 @@ wasm_func_delete(wasm_func_t *func)
         func->type = NULL;
     }
 
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if (func->callback_owner && --func->callback_owner->references == 0) {
+        if (func->callback_owner->finalizer)
+            func->callback_owner->finalizer(func->callback_owner->env);
+        wasm_runtime_free(func->callback_owner);
+    }
+#else
     if (func->with_env) {
         if (func->u.cb_env.finalizer) {
             func->u.cb_env.finalizer(func->u.cb_env.env);
@@ -3233,6 +3248,7 @@ wasm_func_delete(wasm_func_t *func)
             func->u.cb_env.env = NULL;
         }
     }
+#endif
 
     DELETE_HOST_INFO(func)
 
@@ -3248,6 +3264,23 @@ wasm_func_copy(const wasm_func_t *func)
         return NULL;
     }
 
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if (func->callback_owner && func->callback_owner->references == UINT32_MAX)
+        return NULL;
+    if (!(cloned = malloc_internal(sizeof(*cloned))))
+        return NULL;
+    cloned->store = func->store;
+    cloned->kind = func->kind;
+    cloned->with_env = func->with_env;
+    cloned->u = func->u;
+    cloned->param_count = func->param_count;
+    cloned->result_count = func->result_count;
+    cloned->callback_owner = func->callback_owner;
+    if (cloned->callback_owner)
+        cloned->callback_owner->references++;
+    if (!(cloned->type = wasm_functype_copy(func->type)))
+        goto failed;
+#else
     if (!(cloned =
               func->with_env
                   ? wasm_func_new_with_env_basic(
@@ -3256,6 +3289,7 @@ wasm_func_copy(const wasm_func_t *func)
                   : wasm_func_new_basic(func->store, func->type, func->u.cb))) {
         goto failed;
     }
+#endif
 
     cloned->func_idx_rt = func->func_idx_rt;
     cloned->inst_comm_rt = func->inst_comm_rt;
@@ -4947,6 +4981,10 @@ failed:
     return false;
 }
 
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+#include "wasm_c_api_linking.inc"
+#endif
+
 wasm_instance_t *
 wasm_instance_new(wasm_store_t *store, const wasm_module_t *module,
                   const wasm_extern_vec_t *imports, own wasm_trap_t **trap)
@@ -4981,6 +5019,10 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
     uint32 i = 0, import_func_count = 0;
     uint64 total_size;
     bool build_exported = false;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    WASMCApiCoreImports bindings = { 0 };
+    struct InstantiationArgs2 core_args;
+#endif
 
     bh_assert(singleton_engine);
 
@@ -5000,6 +5042,35 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
         goto failed;
     }
 
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if ((*module)->module_type != Wasm_Module_Bytecode
+        || !c_api_core_imports_prepare(store, MODULE_INTERP(module), imports,
+                                       &bindings, sub_error_buf,
+                                       sizeof(sub_error_buf)))
+        goto failed;
+    if (imports && imports->num_elems) {
+        wasm_extern_vec_copy(&instance->retained_imports, imports);
+        if (instance->retained_imports.num_elems != imports->num_elems) {
+            c_api_core_imports_destroy(&bindings);
+            snprintf(sub_error_buf, sizeof(sub_error_buf),
+                     "Failed to retain core imports");
+            goto failed;
+        }
+    }
+    wasm_runtime_instantiation_args_set_defaults(&core_args);
+    core_args.v1 = *inst_args;
+    core_args.c_api_imports = &bindings;
+    instance->inst_comm_rt = wasm_runtime_instantiate_ex2(
+        *module, &core_args, sub_error_buf, sizeof(sub_error_buf));
+    c_api_core_imports_destroy(&bindings);
+    if (!instance->inst_comm_rt)
+        goto failed;
+    if (!wasm_runtime_create_exec_env_singleton(instance->inst_comm_rt)) {
+        snprintf(sub_error_buf, sizeof(sub_error_buf),
+                 "Failed to create exec env singleton");
+        goto failed;
+    }
+#else
     /* executes the instantiate-time linking if provided */
     if (imports) {
         if (!do_link(instance, module, imports)) {
@@ -5110,6 +5181,8 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
         }
     }
 
+#endif /* WASM_ENABLE_C_API_CORE_LINKING */
+
     /* build the exports list */
 #if WASM_ENABLE_INTERP != 0
     if (instance->inst_comm_rt->module_type == Wasm_Module_Bytecode) {
@@ -5203,6 +5276,9 @@ wasm_instance_delete_internal(wasm_instance_t *instance)
         wasm_runtime_deinstantiate(instance->inst_comm_rt);
         instance->inst_comm_rt = NULL;
     }
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    wasm_extern_vec_delete(&instance->retained_imports);
+#endif
     wasm_runtime_free(instance);
 }
 

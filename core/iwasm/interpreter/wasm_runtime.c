@@ -240,6 +240,10 @@ memories_deinstantiate(WASMModuleInstance *module_inst,
     uint32 i;
     if (memories) {
         for (i = 0; i < count; i++) {
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+            if (i < module_inst->e->c_api_borrowed_memories)
+                continue;
+#endif
             if (memories[i]) {
 #if WASM_ENABLE_MULTI_MODULE != 0
                 WASMModule *module = module_inst->module;
@@ -288,6 +292,9 @@ memory_instantiate(WASMModuleInstance *module_inst, WASMModuleInstance *parent,
     uint8 *global_addr;
 
     bool is_shared_memory = false;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    memory->c_api_has_max = (flags & MAX_PAGE_COUNT_FLAG) != 0;
+#endif
 #if WASM_ENABLE_SHARED_MEMORY != 0
     is_shared_memory = flags & SHARED_MEMORY_FLAG ? true : false;
 
@@ -501,8 +508,11 @@ fail1:
 static WASMMemoryInstance **
 memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
                      WASMModuleInstance *parent, uint32 heap_size,
-                     uint32 max_memory_pages, char *error_buf,
-                     uint32 error_buf_size)
+                     uint32 max_memory_pages,
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+                     const WASMCApiCoreImports *c_api_imports,
+#endif
+                     char *error_buf, uint32 error_buf_size)
 {
     WASMImport *import;
     uint32 mem_index = 0, i,
@@ -521,6 +531,12 @@ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
     /* instantiate memories from import section */
     import = module->import_memories;
     for (i = 0; i < module->import_memory_count; i++, import++, memory++) {
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+        if (c_api_imports) {
+            memories[mem_index++] = c_api_imports->memories[i];
+            continue;
+        }
+#endif
         uint32 num_bytes_per_page =
             import->u.memory.mem_type.num_bytes_per_page;
         uint32 init_page_count = import->u.memory.mem_type.init_page_count;
@@ -825,6 +841,11 @@ functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
         }
 #endif /* WASM_ENABLE_MULTI_MODULE */
         function->u.func_import = &import->u.function;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+        if (module_inst->e->c_api_function_imports)
+            function->u.func_import =
+                &module_inst->e->c_api_function_imports[i];
+#endif
         function->param_cell_num = import->u.function.func_type->param_cell_num;
         function->ret_cell_num = import->u.function.func_type->ret_cell_num;
         function->param_count =
@@ -1981,6 +2002,10 @@ check_linked_symbol(WASMModuleInstance *module_inst, char *error_buf,
     for (i = 0; i < module->import_function_count; i++) {
         WASMFunctionImport *func =
             &((module->import_functions + i)->u.function);
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+        if (module_inst->e->c_api_function_imports)
+            func = &module_inst->e->c_api_function_imports[i];
+#endif
         if (!func->func_ptr_linked
 #if WASM_ENABLE_MULTI_MODULE != 0
             && !func->import_func_linked
@@ -2025,6 +2050,10 @@ check_linked_symbol(WASMModuleInstance *module_inst, char *error_buf,
 
     for (i = 0; i < module->import_memory_count; i++) {
         WASMMemoryImport *memory = &((module->import_memories + i)->u.memory);
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+        if (i < module_inst->e->c_api_borrowed_memories)
+            continue;
+#endif
 
         if (!wasm_runtime_is_built_in_module(memory->module_name)
 #if WASM_ENABLE_MULTI_MODULE != 0
@@ -2522,14 +2551,34 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
     module_inst->module = module;
     module_inst->e =
         (WASMModuleInstanceExtra *)((uint8 *)module_inst + extra_info_offset);
-    wasm_runtime_set_custom_data_internal(
-        (WASMModuleInstanceCommon *)module_inst, args->custom_data);
 #if WASM_ENABLE_THREAD_MGR != 0
     if (os_mutex_init(&module_inst->e->common.exception_lock) != 0) {
         wasm_runtime_free(module_inst);
         return NULL;
     }
 #endif
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    if (args->c_api_imports) {
+        uint64 imports_size =
+            (uint64)module->import_function_count * sizeof(WASMFunctionImport);
+        uint64 callbacks_size =
+            (uint64)module->import_function_count * sizeof(CApiFuncImport);
+        module_inst->e->c_api_borrowed_memories = module->import_memory_count;
+        if (imports_size) {
+            if (!(module_inst->e->c_api_function_imports =
+                      runtime_malloc(imports_size, error_buf, error_buf_size))
+                || !(module_inst->c_api_func_imports = runtime_malloc(
+                         callbacks_size, error_buf, error_buf_size)))
+                goto fail;
+            memcpy(module_inst->e->c_api_function_imports,
+                   args->c_api_imports->functions, (size_t)imports_size);
+            memcpy(module_inst->c_api_func_imports,
+                   args->c_api_imports->callbacks, (size_t)callbacks_size);
+        }
+    }
+#endif
+    wasm_runtime_set_custom_data_internal(
+        (WASMModuleInstanceCommon *)module_inst, args->custom_data);
 
 #if WASM_ENABLE_MULTI_MODULE != 0
     module_inst->e->sub_module_inst_list =
@@ -2650,6 +2699,9 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
     if ((module_inst->memory_count > 0
          && !(module_inst->memories = memories_instantiate(
                   module, module_inst, parent, heap_size, max_memory_pages,
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+                  args->c_api_imports,
+#endif
                   error_buf, error_buf_size)))
         || (module_inst->table_count > 0
             && !(module_inst->tables =
@@ -3343,7 +3395,9 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
 
     if (module->start_function != (uint32)-1) {
         /* TODO: fix start function can be import function issue */
+#if WASM_ENABLE_C_API_CORE_LINKING == 0
         if (module->start_function >= module->import_function_count)
+#endif
             module_inst->e->start_function =
                 &module_inst->e->functions[module->start_function];
     }
@@ -3467,6 +3521,9 @@ wasm_deinstantiate(WASMModuleInstance *module_inst, bool is_sub_inst)
 
     tables_deinstantiate(module_inst);
     functions_deinstantiate(module_inst->e->functions);
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    wasm_runtime_free(module_inst->e->c_api_function_imports);
+#endif
 #if WASM_ENABLE_TAGS != 0
     tags_deinstantiate(module_inst->e->tags, module_inst->e->import_tag_ptrs);
 #endif

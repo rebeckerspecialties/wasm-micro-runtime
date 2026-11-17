@@ -80,6 +80,11 @@
 #define WASM_ENABLE_INTERP 0
 #endif
 
+/* Experimental, instance-local Wasm C API import binding. */
+#ifndef WASM_ENABLE_C_API_CORE_LINKING
+#define WASM_ENABLE_C_API_CORE_LINKING 0
+#endif
+
 #ifndef WASM_ENABLE_AOT
 #define WASM_ENABLE_AOT 0
 #endif

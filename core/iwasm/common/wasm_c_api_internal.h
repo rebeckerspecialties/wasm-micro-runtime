@@ -39,6 +39,14 @@ struct wasm_store_t {
     Vector *foreigns;
 };
 
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+struct wasm_callback_owner {
+    uint32 references;
+    void *env;
+    void (*finalizer)(void *);
+};
+#endif
+
 /* Type Representations */
 struct wasm_valtype_t {
     wasm_valkind_t kind;
@@ -134,6 +142,9 @@ struct wasm_func_t {
     uint16 result_count;
 
     bool with_env;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    struct wasm_callback_owner *callback_owner;
+#endif
     union {
         wasm_func_callback_t cb;
         struct callback_ext {
@@ -214,6 +225,9 @@ struct wasm_instance_t {
     wasm_extern_vec_t *exports;
     struct wasm_host_info host_info;
     WASMModuleInstanceCommon *inst_comm_rt;
+#if WASM_ENABLE_C_API_CORE_LINKING != 0
+    wasm_extern_vec_t retained_imports;
+#endif
 };
 
 wasm_ref_t *

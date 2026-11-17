@@ -1,0 +1,12 @@
+(module
+  (import "host" "value" (func $value (result i32)))
+  (import "owner" "memory" (memory 1 3))
+  (export "memory" (memory 0))
+  (data (i32.const 8) "linked")
+  (func $start i32.const 0 call $value i32.store)
+  (start $start)
+  (func (export "read") (param i32) (result i32)
+    local.get 0 i32.load8_u)
+  (func (export "grow") (param i32) (result i32)
+    local.get 0 memory.grow)
+  (func (export "value") (result i32) call $value))
