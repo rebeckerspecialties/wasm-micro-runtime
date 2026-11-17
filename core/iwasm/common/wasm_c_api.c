@@ -2154,7 +2154,7 @@ wasm_ref_delete(own wasm_ref_t *ref)
     wasm_allocation_quota_scope_leave(&scope);
 }
 
-#define WASM_DEFINE_REF_BASE(name)                                          \
+#define WASM_DEFINE_REF_SAME(name)                                          \
     bool wasm_##name##_same(const wasm_##name##_t *o1,                      \
                             const wasm_##name##_t *o2)                      \
     {                                                                       \
@@ -2163,8 +2163,9 @@ wasm_ref_delete(own wasm_ref_t *ref)
                : (o1->kind != o2->kind)                                     \
                    ? false                                                  \
                    : o1->name##_idx_rt == o2->name##_idx_rt;                \
-    }                                                                       \
-                                                                            \
+    }
+
+#define WASM_DEFINE_REF_BASE(name)                                          \
     void *wasm_##name##_get_host_info(const wasm_##name##_t *obj)           \
     {                                                                       \
         return obj ? obj->host_info.info : NULL;                            \
@@ -2231,11 +2232,33 @@ wasm_ref_delete(own wasm_ref_t *ref)
     }
 
 WASM_DEFINE_REF_BASE(ref)
+WASM_DEFINE_REF_SAME(ref)
+WASM_DEFINE_REF_SAME(foreign)
+WASM_DEFINE_REF_SAME(func)
+WASM_DEFINE_REF_SAME(global)
+WASM_DEFINE_REF_SAME(table)
 WASM_DEFINE_REF(foreign)
 WASM_DEFINE_REF(func)
 WASM_DEFINE_REF(global)
 WASM_DEFINE_REF(memory)
 WASM_DEFINE_REF(table)
+
+bool
+wasm_memory_same(const wasm_memory_t *left, const wasm_memory_t *right)
+{
+    if (left == right)
+        return true;
+    if (!left || !right || left->store != right->store
+        || !left->inst_comm_rt || !right->inst_comm_rt)
+        return false;
+    /* Re-exported/imported memories have distinct wrapper and instance/index
+       pairs. Conversely, index zero in two instances need not be the same
+       memory. Compare the runtime objects, never the relocatable data base. */
+    wasm_memory_inst_t memory = wasm_runtime_get_memory(
+        left->inst_comm_rt, left->memory_idx_rt);
+    return memory && memory == wasm_runtime_get_memory(
+        right->inst_comm_rt, right->memory_idx_rt);
+}
 
 static wasm_frame_t *
 wasm_frame_new(wasm_instance_t *instance, size_t module_offset,

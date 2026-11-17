@@ -207,6 +207,22 @@ main(void)
     assert(call(owner_exports.data[2], 1, true) == 2);
     assert(wasm_memory_size(wasm_extern_as_memory(user_exports.data[0])) == 3);
     assert(call(user_exports.data[2], 1, true) == -1);
+    assert(wasm_memory_same(wasm_extern_as_memory(items[1]),
+                            wasm_extern_as_memory(user_exports.data[0])));
+    {
+        wasm_extern_vec_t separate_exports;
+        wasm_instance_t *separate = wasm_instance_new_with_args(
+            store, owner_module, &empty, &trap, 65536, 0);
+        assert(separate && !trap);
+        wasm_instance_exports(separate, &separate_exports);
+        wasm_memory_t *original = wasm_extern_as_memory(items[1]);
+        wasm_memory_t *copy = wasm_memory_copy(original);
+        assert(copy && wasm_memory_same(original, copy));
+        assert(!wasm_memory_same(original,
+                                wasm_extern_as_memory(separate_exports.data[0])));
+        wasm_memory_delete(copy);
+        wasm_extern_vec_delete(&separate_exports);
+    }
     items[0] = wasm_func_as_extern(other);
     second = wasm_instance_new_with_args(store, user_module, &imports, &trap,
                                          65536, 0);
