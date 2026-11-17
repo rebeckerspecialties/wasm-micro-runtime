@@ -1,0 +1,13 @@
+(module
+  (type $f (func (result i32)))
+  (table (export "table") 5 32 funcref)
+  (func $own (export "own") (result i32) i32.const 11)
+  (elem (i32.const 0) $own)
+  (func (export "call") (param i32) (result i32)
+    local.get 0 call_indirect (type $f))
+  (func (export "copy") (param i32 i32)
+    local.get 0 local.get 1 table.get table.set)
+  (func (export "grow") (param i32) (result i32)
+    ref.null func local.get 0 table.grow)
+  (func (export "bulk-copy") (param i32 i32 i32)
+    local.get 0 local.get 1 local.get 2 table.copy))
