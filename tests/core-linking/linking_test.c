@@ -68,7 +68,7 @@ call(wasm_extern_t *external, int argument, bool has_argument)
 }
 
 static void
-call_void(wasm_extern_t *external, uint32 count, int a, int b, int c)
+call_void(wasm_extern_t *external, uint32_t count, int a, int b, int c)
 {
     wasm_val_t data[] = { WASM_I32_VAL(a), WASM_I32_VAL(b), WASM_I32_VAL(c) };
     wasm_val_vec_t args = WASM_ARRAY_VEC(data), results = WASM_EMPTY_VEC;
