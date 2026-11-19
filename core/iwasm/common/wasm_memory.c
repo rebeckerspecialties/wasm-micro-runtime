@@ -2535,6 +2535,8 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
     page_quota_reserved = true;
 
 #if WASM_ENABLE_SHARED_HEAP != 0
+    /* TODO: module is NULL when called from wasm_memory_enlarge(), which
+       crashes in get_shared_heap(); guard it or pass the module instance */
     shared_heap = get_shared_heap(module);
     if (shared_heap) {
         if (memory->is_memory64

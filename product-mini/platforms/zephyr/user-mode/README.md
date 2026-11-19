@@ -11,7 +11,8 @@ and `native_sim` / QEMU usage.
 
 The WebAssembly module is not checked in: [wasm-app/main.c](./wasm-app/main.c)
 is compiled with the wasi-sdk during the build and the resulting
-`test_wasm.wasm` is turned into the `test_wasm.h` that `src/wamr_lib.c` embeds.
+`test_wasm.wasm` is turned into the `test_wasm.h` that `src/wamr_lib.c` embeds
+by the [shared guest helper](../cmake/wasm_app.cmake).
 Building the sample therefore requires a wasi-sdk; it is looked up in
 `/opt/wasi-sdk` and `/opt/wasi-sdk-*`, set `WASISDK_ROOT` (or `WASI_SDK_DIR`)
 if it lives elsewhere.
@@ -56,6 +57,22 @@ K_APPMEM_PARTITION_DEFINE(wamr_partition);
 ```
 
 When creating a Zephyr thread, set the thread option to `K_USER` and the timeout to `K_FOREVER`. This can ensure that the `wamr_partition` is granted access to the thread before starting it with `k_thread_start`.
+
+### Synchronization resources
+
+`WAMR_ZEPHYR_SYNC_POOL_DEFINE(wamr_sync, 2, 0)` declares two mutex slots for
+the EMS global WAMR heap and this instance's application heap. EMS uses these
+locks even without guest multithreading. Including the separate management
+mutex, the pool has **three native `k_mutex` objects and no `k_condvar` objects**.
+Its storage stays outside WAMR's application-memory partition; supervisor code
+prepares/grants it to the suspended user thread before starting it.
+
+To omit conditions, use literal `0`, or set both `condvars = NULL` and
+`condvar_count = 0` in a manual descriptor; `os_cond_init()` then returns
+`BHT_ERROR`. This budget is configuration-specific: more heaps or threading may
+need more slots. Exhaustion propagates an initialization error through WAMR;
+there is no fallback allocation. See the
+[multithreaded sample](../user-mode-multi-thread/README.md) for larger pools.
 
 ### Advantage of using WAMR runtime in Zephyr user mode thread
 

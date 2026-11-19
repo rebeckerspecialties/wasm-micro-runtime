@@ -409,38 +409,30 @@ os_sem_unlink(const char *name)
 static void
 msec_nsec_to_abstime(struct timespec *ts, uint64 usec)
 {
-    struct timeval tv;
-    time_t tv_sec_new;
-    long int tv_nsec_new;
+    struct timespec now;
+    uint64 add_sec = usec / 1000000;
+    long add_nsec = (long)(usec % 1000000) * 1000;
+    long nsec;
 
-    gettimeofday(&tv, NULL);
+    clock_gettime(CLOCK_REALTIME, &now);
 
-    tv_sec_new = (time_t)(tv.tv_sec + usec / 1000000);
-    if (tv_sec_new >= tv.tv_sec) {
-        ts->tv_sec = tv_sec_new;
+    /* now.tv_nsec and add_nsec are both < 1e9, so the sum cannot overflow */
+    nsec = now.tv_nsec + add_nsec;
+    if (nsec >= 1000000000L) {
+        nsec -= 1000000000L;
+        add_sec++;
     }
-    else {
-        /* integer overflow */
+
+    if (add_sec > (uint64)BH_TIME_T_MAX - (uint64)now.tv_sec) {
         ts->tv_sec = BH_TIME_T_MAX;
+        ts->tv_nsec = 0;
         os_printf("Warning: os_cond_reltimedwait exceeds limit, "
                   "set to max timeout instead\n");
+        return;
     }
 
-    tv_nsec_new = (long int)(tv.tv_usec * 1000 + (usec % 1000000) * 1000);
-    if (tv.tv_usec * 1000 >= tv.tv_usec && tv_nsec_new >= tv.tv_usec * 1000) {
-        ts->tv_nsec = tv_nsec_new;
-    }
-    else {
-        /* integer overflow */
-        ts->tv_nsec = LONG_MAX;
-        os_printf("Warning: os_cond_reltimedwait exceeds limit, "
-                  "set to max timeout instead\n");
-    }
-
-    if (ts->tv_nsec >= 1000000000L && ts->tv_sec < BH_TIME_T_MAX) {
-        ts->tv_sec++;
-        ts->tv_nsec -= 1000000000L;
-    }
+    ts->tv_sec = now.tv_sec + (time_t)add_sec;
+    ts->tv_nsec = nsec;
 }
 
 int
@@ -845,6 +837,11 @@ os_thread_signal_init(os_signal_handler handler)
     memset(&prev_sig_act_SIGBUS, 0, sizeof(struct sigaction));
 
     /* Install signal handler */
+    /* TODO: every thread's init re-installs signal_callback and saves the
+     * current action as "previous". A second init then stores signal_callback
+     * itself, so an unhandled SIGSEGV/SIGBUS forwards to itself and recurses.
+     * Install once per process, or skip saving when the current handler is
+     * already signal_callback. */
     sig_act.sa_sigaction = signal_callback;
     sig_act.sa_flags = SA_SIGINFO | SA_NODEFER;
 #if WASM_DISABLE_STACK_HW_BOUND_CHECK == 0
