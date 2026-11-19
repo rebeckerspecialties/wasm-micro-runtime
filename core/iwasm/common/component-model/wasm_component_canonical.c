@@ -33,19 +33,9 @@ typedef struct CanonicalResourceTransferContext {
     uint32_t depth;
 } CanonicalResourceTransferContext;
 
-#if defined(os_thread_local_attribute)
-static os_thread_local_attribute CanonicalResourceTransferContext
-    current_resource_transfer_context;
-#elif defined(_MSC_VER)
-static __declspec(thread)
-    CanonicalResourceTransferContext current_resource_transfer_context;
-#elif defined(__GNUC__) || defined(__clang__)
-static __thread CanonicalResourceTransferContext
-    current_resource_transfer_context;
-#else
-static _Thread_local CanonicalResourceTransferContext
-    current_resource_transfer_context;
-#endif
+#include "../wasm_owner_tls.h"
+
+static WASM_OWNER_TLS CanonicalResourceTransferContext current_resource_transfer_context;
 
 static const void *
 canonical_resource_transfer_unwind_target(void)

@@ -40,30 +40,11 @@ struct WASMAllocationQuotaToken {
     wasm_allocation_quota_attachment_release_callback_t attachment_release;
 };
 
-#if defined(os_thread_local_attribute)
-static os_thread_local_attribute WASMAllocationQuotaToken
-    *current_allocation_quota;
-static os_thread_local_attribute WASMAllocationQuotaThreadLease
-    *current_allocation_quota_thread_lease;
-static os_thread_local_attribute WASMAllocationQuotaScope
-    *current_allocation_quota_scope;
-#elif defined(_MSC_VER)
-static __declspec(thread) WASMAllocationQuotaToken *current_allocation_quota;
-static __declspec(thread)
-    WASMAllocationQuotaThreadLease *current_allocation_quota_thread_lease;
-static __declspec(thread)
-    WASMAllocationQuotaScope *current_allocation_quota_scope;
-#elif defined(__GNUC__) || defined(__clang__)
-static __thread WASMAllocationQuotaToken *current_allocation_quota;
-static __thread WASMAllocationQuotaThreadLease
-    *current_allocation_quota_thread_lease;
-static __thread WASMAllocationQuotaScope *current_allocation_quota_scope;
-#else
-static _Thread_local WASMAllocationQuotaToken *current_allocation_quota;
-static _Thread_local WASMAllocationQuotaThreadLease
-    *current_allocation_quota_thread_lease;
-static _Thread_local WASMAllocationQuotaScope *current_allocation_quota_scope;
-#endif
+#include "wasm_owner_tls.h"
+
+static WASM_OWNER_TLS WASMAllocationQuotaToken *current_allocation_quota;
+static WASM_OWNER_TLS WASMAllocationQuotaThreadLease *current_allocation_quota_thread_lease;
+static WASM_OWNER_TLS WASMAllocationQuotaScope *current_allocation_quota_scope;
 #endif /* WASM_ENABLE_ALLOCATION_QUOTA != 0 */
 
 #if WASM_ENABLE_SHARED_HEAP != 0

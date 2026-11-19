@@ -63,17 +63,9 @@ typedef struct HostResourcePinContext {
     uint32_t depth;
 } HostResourcePinContext;
 
-#if defined(os_thread_local_attribute)
-static os_thread_local_attribute HostResourcePinContext
-    current_host_resource_pin_context;
-#elif defined(_MSC_VER)
-static __declspec(thread)
-    HostResourcePinContext current_host_resource_pin_context;
-#elif defined(__GNUC__) || defined(__clang__)
-static __thread HostResourcePinContext current_host_resource_pin_context;
-#else
-static _Thread_local HostResourcePinContext current_host_resource_pin_context;
-#endif
+#include "../wasm_owner_tls.h"
+
+static WASM_OWNER_TLS HostResourcePinContext current_host_resource_pin_context;
 
 typedef struct HostResourceCloseContext {
     HostResource *destroy_list;
